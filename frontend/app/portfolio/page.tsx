@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
-import { api } from "@/lib/api";
+import { api, type Portfolio } from "@/lib/api";
 import { fmtMoney, fmtNumber, fmtPercent, fmtPrice, changeColor, fmtDate } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import { Plus, Trash2, Briefcase, TrendingUp, Wallet, RefreshCw, X } from "lucide-react";
@@ -77,8 +77,14 @@ export default function PortfolioPage() {
   );
 }
 
-function PortfolioAggregateView({ portfolio, isLoading, onClose }: any) {
-  return (
+function PortfolioAggregateView({
+  portfolio, isLoading, onClose,
+}: {
+  portfolio: Portfolio | undefined;
+  isLoading: boolean;
+  onClose: (id: number) => void;
+}) {
+	return (
     <>
       {portfolio && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
