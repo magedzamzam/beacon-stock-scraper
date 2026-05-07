@@ -237,7 +237,7 @@ export interface ImportRowLog {
 export interface ImportExecuteRequest {
   import_id: string;
   table_name: string;
-  mode: "insert_only" | "upsert" | "update_only";
+  mode: "update" | "insert";
   column_mapping: Record<string, string>;
   match_columns: string[];
   ignore_blank_values?: boolean;
