@@ -115,7 +115,7 @@ export interface PriceHistoryPoint {
 
 export interface NewsItem {
   id: number;
-  news_date: string;
+  news_date: string | null;
   headline: string;
   source_code: string | null;
   url: string | null;
@@ -198,66 +198,6 @@ export interface AuthResponse {
   user: User;
 }
 
-// ===== CSV import (admin) =====
-export interface ImportTableColumn {
-  name: string;
-  type: string;
-  nullable: boolean;
-  primary_key: boolean;
-  unique: boolean;
-  foreign_key: string | null;
-  default: string | null;
-}
-
-export interface ImportTable {
-  name: string;
-  label: string;
-  primary_key: string[];
-  unique_constraints: string[][];
-  suggested_match_columns: string[];
-  columns: ImportTableColumn[];
-}
-
-export interface ImportPreview {
-  import_id: string;
-  filename: string;
-  encoding: string;
-  delimiter: string;
-  row_count: number;
-  headers: string[];
-  sample_rows: Array<{ row_number: number; values: Record<string, string | null> }>;
-}
-
-export interface ImportRowLog {
-  row_number: number;
-  action: "inserted" | "updated" | "skipped" | "error";
-  message: string;
-}
-
-export interface ImportExecuteRequest {
-  import_id: string;
-  table_name: string;
-  mode: "update" | "insert";
-  column_mapping: Record<string, string>;
-  match_columns: string[];
-  ignore_blank_values?: boolean;
-}
-
-export interface ImportExecuteResult {
-  import_id: string;
-  table_name: string;
-  mode: string;
-  encoding: string;
-  delimiter: string;
-  processed: number;
-  inserted: number;
-  updated: number;
-  skipped: number;
-  errors: number;
-  row_logs: ImportRowLog[];
-  finished_at: string;
-}
-
 // ---------------- Endpoints ----------------
 export const api = {
   // auth
@@ -338,28 +278,33 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) },
     ),
 
+  // csv import
+  adminImportCatalog: () => request<ImportCatalog>("/admin/imports/catalog"),
+  adminImportPreview: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return request<ImportPreview>("/admin/imports/preview", { method: "POST", body: form });
+  },
+  adminImportExecute: (payload: ImportExecuteRequest) =>
+    request<ImportExecuteResult>("/admin/imports/execute", { method: "POST", body: JSON.stringify(payload) }),
+
   // ===== Brokers / accounts =====
   listBrokers: () =>
-    request<Array<{ id: number; code: string; name: string; kind: "automated" | "manual"; docs_url: string | null;
-                    credential_schema: Array<{ key: string; label: string; type: string; required?: boolean; default?: any }> }>>(
-      "/accounts/brokers",
-    ),
+    request<BrokerInfo[]>("/accounts/brokers"),
 
   listAccounts: () =>
-    request<Array<{ id: number; broker_code: string; broker_name: string; broker_kind: "automated" | "manual";
-                    label: string; currency: string | null; is_active: boolean;
-                    last_connect_status: string | null; last_connect_error: string | null;
-                    last_connect_at: string | null; display_metadata: Record<string, any> }>>(
-      "/accounts",
-    ),
+    request<TradingAccountSummary[]>("/accounts"),
 
-  createAccount: (body: { broker_code: string; label: string; currency?: string;
-                          credentials?: Record<string, any>; display_metadata?: Record<string, any> }) =>
-    request<any>("/accounts", { method: "POST", body: JSON.stringify(body) }),
+  createAccount: (body: {
+    broker_code: string; label: string; currency?: string;
+    credentials?: Record<string, any>; display_metadata?: Record<string, any>;
+  }) => request<TradingAccountSummary>("/accounts", { method: "POST", body: JSON.stringify(body) }),
 
-  deleteAccount: (id: number) => request<any>(`/accounts/${id}`, { method: "DELETE" }),
+  deleteAccount: (id: number) =>
+    request<{ deleted: number }>(`/accounts/${id}`, { method: "DELETE" }),
 
-  testAccount: (id: number) => request<{ ok: boolean; message: string }>(`/accounts/${id}/test`, { method: "POST" }),
+  testAccount: (id: number) =>
+    request<{ ok: boolean; message: string }>(`/accounts/${id}/test`, { method: "POST" }),
 
   accountInfo: (id: number) =>
     request<{ account_id: string; balance: string | null; available: string | null; currency: string | null }>(
@@ -367,7 +312,7 @@ export const api = {
     ),
 
   accountPositions: (id: number, refresh = false) =>
-    request<Array<any>>(`/accounts/${id}/positions${refresh ? "?refresh=true" : ""}`),
+    request<any[]>(`/accounts/${id}/positions${refresh ? "?refresh=true" : ""}`),
 
   // ===== Orders =====
   placeOrder: (body: {
@@ -377,51 +322,140 @@ export const api = {
   }) => request<any>("/orders", { method: "POST", body: JSON.stringify(body) }),
 
   listOrders: (account_id?: number) =>
-    request<Array<any>>(`/orders${account_id ? `?account_id=${account_id}` : ""}`),
+    request<any[]>(`/orders${account_id ? `?account_id=${account_id}` : ""}`),
 
-  cancelOrder: (id: number) => request<any>(`/orders/${id}`, { method: "DELETE" }),
+  cancelOrder: (id: number) =>
+    request<any>(`/orders/${id}`, { method: "DELETE" }),
 
   // ===== Instruments (admin maps stock <-> broker symbol) =====
   instrumentsForStock: (stock_id: number) =>
-    request<Array<{ broker_code: string; broker_name: string; broker_symbol: string;
-                    instrument_type: string | null; currency: string | null; min_qty: string | null }>>(
-      `/instruments/by-stock/${stock_id}`,
-    ),
+    request<BrokerInstrumentMapping[]>(`/instruments/by-stock/${stock_id}`),
 
   upsertInstrument: (body: {
     broker_code: string; broker_symbol: string; stock_id?: number;
     broker_name?: string; instrument_type?: string; currency?: string;
     min_qty?: number; is_tradeable?: boolean;
-  }) => request<any>("/instruments", { method: "POST", body: JSON.stringify(body) }),
+  }) => request<{ ok: boolean }>("/instruments", { method: "POST", body: JSON.stringify(body) }),
 
   deleteInstrument: (broker_code: string, broker_symbol: string) =>
-    request<any>(`/instruments/${broker_code}/${encodeURIComponent(broker_symbol)}`, { method: "DELETE" }),
+    request<{ deleted: number }>(
+      `/instruments/${broker_code}/${encodeURIComponent(broker_symbol)}`,
+      { method: "DELETE" },
+    ),
 
   searchBrokerInstruments: (broker_code: string, q: string) =>
-    request<Array<{ broker_symbol: string; name: string; instrument_type: string | null;
-                    currency: string | null; min_qty: string | null }>>(
-      `/instruments/search/${broker_code}?q=${encodeURIComponent(q)}`,
-    ),
-  // ===== CSV import (admin) =====
-  adminImportCatalog: () =>
-    request<ImportTable[]>("/admin/import/catalog").then((tables) => ({ tables })),
-
-  adminImportPreview: async (file: File): Promise<ImportPreview> => {
-    const fd = new FormData();
-    fd.append("file", file);
-    const token = localStorage.getItem("token");
-    const r = await fetch(`${API_BASE}/admin/import/preview`, {
-      method: "POST",
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-      body: fd,
-    });
-    if (!r.ok) throw new Error(await r.text());
-    return r.json();
-  },
-
-  adminImportExecute: (payload: ImportExecuteRequest) =>
-    request<ImportExecuteResult>("/admin/import/execute", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    }),
+    request<Array<{
+      broker_symbol: string; name: string; instrument_type: string | null;
+      currency: string | null; min_qty: string | null;
+    }>>(`/instruments/search/${broker_code}?q=${encodeURIComponent(q)}`),
 };
+
+// ===== Broker types =====
+export interface BrokerCredentialField {
+  key: string;
+  label: string;
+  type: string;
+  required?: boolean;
+  default?: any;
+}
+
+export interface BrokerInfo {
+  id: number;
+  code: string;
+  name: string;
+  kind: "automated" | "manual";
+  docs_url: string | null;
+  credential_schema: BrokerCredentialField[];
+}
+
+export interface TradingAccountSummary {
+  id: number;
+  broker_code: string;
+  broker_name: string;
+  broker_kind: "automated" | "manual";
+  label: string;
+  currency: string | null;
+  is_active: boolean;
+  last_connect_status: string | null;
+  last_connect_error: string | null;
+  last_connect_at: string | null;
+  display_metadata: Record<string, any>;
+}
+
+export interface BrokerInstrumentMapping {
+  broker_code: string;
+  broker_name: string;
+  broker_symbol: string;
+  instrument_type: string | null;
+  currency: string | null;
+  min_qty: string | null;
+}
+
+
+export interface ImportTableColumn {
+  name: string;
+  type: string;
+  nullable: boolean;
+  primary_key: boolean;
+  unique: boolean;
+  foreign_key: string | null;
+  default: string | null;
+}
+
+export interface ImportTable {
+  name: string;
+  label: string;
+  primary_key: string[];
+  unique_constraints: string[][];
+  suggested_match_columns: string[];
+  columns: ImportTableColumn[];
+}
+
+export interface ImportCatalog {
+  tables: ImportTable[];
+}
+
+export interface ImportPreviewRow {
+  row_number: number;
+  values: Record<string, string | null>;
+}
+
+export interface ImportPreview {
+  import_id: string;
+  filename: string;
+  encoding: string;
+  delimiter: string;
+  row_count: number;
+  headers: string[];
+  sample_rows: ImportPreviewRow[];
+}
+
+export interface ImportExecuteRequest {
+  import_id: string;
+  table_name: string;
+  mode: "update" | "insert";
+  column_mapping: Record<string, string>;
+  match_columns: string[];
+  ignore_blank_values?: boolean;
+}
+
+export interface ImportRowLog {
+  row_number: number;
+  action: string;
+  message: string;
+}
+
+export interface ImportExecuteResult {
+  import_id: string;
+  table_name: string;
+  mode: string;
+  encoding: string;
+  delimiter: string;
+  processed: number;
+  inserted: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  row_logs: ImportRowLog[];
+  finished_at: string;
+}

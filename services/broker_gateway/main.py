@@ -1,31 +1,4 @@
-"""broker_gateway — the only service that decrypts broker credentials and
-talks to broker APIs.
-
-Why a separate service
-----------------------
-* Secrets isolation: BROKER_SECRET_KEY is mounted only here.
-* Failure isolation: a Capital.com outage stalls this service, not the api.
-* Different rate-limit / retry posture than the rest of the stack.
-* Future home for WebSocket position streams and webhook receivers.
-
-The api service calls broker_gateway over the internal Docker network. It is
-NOT exposed via nginx — only services on beacon-net can reach it.
-
-Endpoints
----------
-GET  /healthz                          liveness
-POST /accounts/{id}/test               test a connection (decrypt + healthcheck)
-GET  /accounts/{id}/info               account balance / currency
-GET  /accounts/{id}/positions          live positions, refreshes snapshot table
-GET  /accounts/{id}/orders             open orders
-POST /accounts/{id}/orders             place an order
-DELETE /accounts/{id}/orders/{ref}     cancel an order
-GET  /brokers/{id}/search?q=...        instrument search
-
-Auth: this service trusts its caller. Internal traffic only — no JWT check
-here. The api service is responsible for verifying the user owns the account
-before forwarding to us.
-"""
+"""broker_gateway — only service that decrypts broker credentials and talks to broker APIs."""
 from __future__ import annotations
 
 import logging
@@ -36,11 +9,10 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from shared.db import (
-    Broker, BrokerOrder as BrokerOrderRow, BrokerPositionSnapshot,
-    SessionLocal, TradingAccount,
+    Broker, BrokerInstrument, BrokerOrder as BrokerOrderRow,
+    BrokerPositionSnapshot, SessionLocal, TradingAccount,
 )
 from brokers.adapter_base import BrokerAdapter
 from brokers.crypto import decrypt_credentials, CryptoIntegrityError, CryptoConfigError
@@ -57,9 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 app = FastAPI(title="Beacon Broker Gateway", version="1.0.0")
 
 
-# ----- helpers -------------------------------------------------------------
 def _build_adapter(account_id: int) -> tuple[TradingAccount, Broker, BrokerAdapter]:
-    """Load the account, decrypt its credentials, instantiate the adapter."""
     with SessionLocal() as session:
         acct = session.get(TradingAccount, account_id)
         if acct is None or not acct.is_active:
@@ -95,7 +65,6 @@ def _broker_error_to_status(exc: BrokerError) -> int:
 
 
 def _record_connect_status(account_id: int, ok: bool, message: Optional[str]) -> None:
-    """Persist the latest connection status onto the trading_accounts row."""
     with SessionLocal() as session:
         acct = session.get(TradingAccount, account_id)
         if acct is None:
@@ -106,7 +75,6 @@ def _record_connect_status(account_id: int, ok: bool, message: Optional[str]) ->
         session.commit()
 
 
-# ----- API models ----------------------------------------------------------
 class PlaceOrderIn(BaseModel):
     broker_symbol: str = Field(..., min_length=1, max_length=64)
     side: OrderSide
@@ -115,15 +83,11 @@ class PlaceOrderIn(BaseModel):
     limit_price: Optional[Decimal] = None
     stop_loss: Optional[Decimal] = None
     take_profit: Optional[Decimal] = None
-    # When the api forwards a manual-account order, it includes user_id and
-    # stock_id so we can write the audit row. For automated orders, the api
-    # will write the audit row itself after we return.
     user_id: int
     stock_id: Optional[int] = None
     notes: Optional[str] = None
 
 
-# ----- endpoints -----------------------------------------------------------
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -131,12 +95,10 @@ def healthz():
 
 @app.post("/accounts/{account_id}/test")
 async def test_connection(account_id: int):
-    """Round-trip the broker once and store the result on the account row."""
     _, _, adapter = _build_adapter(account_id)
     try:
         result = await adapter.healthcheck()
-        _record_connect_status(account_id, ok=bool(result.get("ok")),
-                                message=result.get("message"))
+        _record_connect_status(account_id, ok=bool(result.get("ok")), message=result.get("message"))
         return result
     finally:
         await adapter.aclose()
@@ -163,7 +125,6 @@ async def account_info(account_id: int):
 
 @app.get("/accounts/{account_id}/positions")
 async def list_positions(account_id: int):
-    """Pull live positions and refresh broker_positions_snapshot."""
     acct, _, adapter = _build_adapter(account_id)
     try:
         positions = await adapter.list_positions()
@@ -173,13 +134,10 @@ async def list_positions(account_id: int):
     finally:
         await adapter.aclose()
 
-    # Refresh snapshot rows
     with SessionLocal() as session:
-        # Wipe stale rows for this account first, then insert fresh
         session.query(BrokerPositionSnapshot).filter(
             BrokerPositionSnapshot.account_id == account_id
         ).delete()
-        from shared.db import BrokerInstrument
         for p in positions:
             mapping = session.execute(
                 select(BrokerInstrument.stock_id)
@@ -187,30 +145,22 @@ async def list_positions(account_id: int):
                        BrokerInstrument.broker_symbol == p.broker_symbol)
             ).scalar_one_or_none()
             session.add(BrokerPositionSnapshot(
-                account_id=account_id,
-                stock_id=mapping,
-                broker_symbol=p.broker_symbol,
-                quantity=p.quantity,
-                avg_open_price=p.avg_open_price,
-                current_price=p.current_price,
-                unrealized_pl=p.unrealized_pl,
-                unrealized_pl_pct=p.unrealized_pl_pct,
-                currency=p.currency,
-                direction=p.direction.value,
-                raw=p.raw,
+                account_id=account_id, stock_id=mapping,
+                broker_symbol=p.broker_symbol, quantity=p.quantity,
+                avg_open_price=p.avg_open_price, current_price=p.current_price,
+                unrealized_pl=p.unrealized_pl, unrealized_pl_pct=p.unrealized_pl_pct,
+                currency=p.currency, direction=p.direction.value, raw=p.raw,
                 fetched_at=datetime.utcnow(),
             ))
         session.commit()
         _record_connect_status(account_id, ok=True, message=None)
 
     return [{
-        "broker_symbol": p.broker_symbol,
-        "quantity": str(p.quantity),
+        "broker_symbol": p.broker_symbol, "quantity": str(p.quantity),
         "avg_open_price": str(p.avg_open_price) if p.avg_open_price else None,
         "current_price": str(p.current_price) if p.current_price else None,
         "unrealized_pl": str(p.unrealized_pl) if p.unrealized_pl else None,
-        "currency": p.currency,
-        "direction": p.direction.value,
+        "currency": p.currency, "direction": p.direction.value,
     } for p in positions]
 
 
@@ -227,8 +177,7 @@ async def list_orders(account_id: int):
             "limit_price": str(o.limit_price) if o.limit_price else None,
             "stop_loss": str(o.stop_loss) if o.stop_loss else None,
             "take_profit": str(o.take_profit) if o.take_profit else None,
-            "status": o.status.value,
-            "currency": o.currency,
+            "status": o.status.value, "currency": o.currency,
         } for o in orders]
     except BrokerError as exc:
         raise HTTPException(_broker_error_to_status(exc), str(exc))
@@ -238,7 +187,6 @@ async def list_orders(account_id: int):
 
 @app.post("/accounts/{account_id}/orders")
 async def place_order(account_id: int, body: PlaceOrderIn):
-    """Place an order through the adapter. Writes an audit row in broker_orders."""
     acct, _, adapter = _build_adapter(account_id)
     req = PlaceOrderRequest(
         broker_symbol=body.broker_symbol, side=body.side, order_type=body.order_type,
@@ -248,7 +196,6 @@ async def place_order(account_id: int, body: PlaceOrderIn):
     try:
         result = await adapter.place_order(req)
     except BrokerError as exc:
-        # Audit the failed attempt so the user can see it in their order log.
         with SessionLocal() as session:
             session.add(BrokerOrderRow(
                 account_id=account_id, user_id=body.user_id, stock_id=body.stock_id,
@@ -263,7 +210,6 @@ async def place_order(account_id: int, body: PlaceOrderIn):
     finally:
         await adapter.aclose()
 
-    # Persist successful attempt
     with SessionLocal() as session:
         row = BrokerOrderRow(
             account_id=account_id, user_id=body.user_id, stock_id=body.stock_id,
@@ -294,7 +240,6 @@ async def cancel_order(account_id: int, ref: str):
     _, _, adapter = _build_adapter(account_id)
     try:
         ok = await adapter.cancel_order(ref)
-        # Update local row
         with SessionLocal() as session:
             row = session.execute(
                 select(BrokerOrderRow).where(BrokerOrderRow.broker_order_ref == ref)
@@ -312,9 +257,6 @@ async def cancel_order(account_id: int, ref: str):
 
 @app.get("/brokers/{broker_id}/search")
 async def search_instruments(broker_id: int, q: str):
-    """Admin-side: search a broker's instrument catalog so they can map epics
-    to our stocks. Requires ANY active account on the broker — we re-use that
-    account's credentials to query the broker's catalog."""
     if not q or len(q) < 1:
         raise HTTPException(400, "q is required")
     with SessionLocal() as session:

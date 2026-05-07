@@ -1,14 +1,4 @@
-"""/accounts/* — user-owned trading account management.
-
-End users:
-  * list their own accounts
-  * add accounts (Capital.com, Thndr, manual_generic)
-  * test the connection (forwards to broker_gateway)
-  * delete their accounts
-
-We never let a user see another user's accounts. The credentials_encrypted
-column never crosses the wire — only metadata + connection status.
-"""
+"""/accounts/* — user-owned trading account management."""
 from __future__ import annotations
 
 import os
@@ -35,10 +25,7 @@ class TradingAccountIn(BaseModel):
     broker_code: str = Field(..., min_length=1, max_length=32)
     label: str = Field(..., min_length=1, max_length=120)
     currency: Optional[str] = Field(None, max_length=8)
-    # credentials is a free-form dict; the broker's credential_schema dictates
-    # which keys are required. Validation happens server-side against the schema.
     credentials: dict[str, Any] = Field(default_factory=dict)
-    # display_metadata is for non-secret fields (e.g. Thndr account ID display)
     display_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -78,7 +65,6 @@ def _to_out(acct: TradingAccount, broker: Broker) -> TradingAccountOut:
 
 
 def _validate_credentials(broker: Broker, creds: dict) -> None:
-    """Check that all required credential fields are present and non-empty."""
     schema = broker.credential_schema or []
     missing: list[str] = []
     for field in schema:
@@ -93,9 +79,10 @@ def _validate_credentials(broker: Broker, creds: dict) -> None:
 
 
 @router.get("/brokers", response_model=list[BrokerOut])
-def list_brokers(db: Session = Depends(get_db)):
-    """All enabled brokers — used by the 'add account' wizard."""
-    rows = db.execute(select(Broker).where(Broker.is_enabled.is_(True)).order_by(Broker.name)).scalars().all()
+def list_brokers(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    rows = db.execute(
+        select(Broker).where(Broker.is_enabled.is_(True)).order_by(Broker.name)
+    ).scalars().all()
     return [BrokerOut(
         id=b.id, code=b.code, name=b.name, kind=b.kind,
         docs_url=b.docs_url, credential_schema=b.credential_schema or [],
@@ -119,12 +106,13 @@ def create_account(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    broker = db.execute(select(Broker).where(Broker.code == body.broker_code, Broker.is_enabled.is_(True))).scalar_one_or_none()
+    broker = db.execute(
+        select(Broker).where(Broker.code == body.broker_code, Broker.is_enabled.is_(True))
+    ).scalar_one_or_none()
     if broker is None:
         raise HTTPException(404, f"Unknown broker '{body.broker_code}'")
     _validate_credentials(broker, body.credentials)
 
-    # Encrypt credentials only for automated brokers; manual ones store no secrets.
     cipher: Optional[bytes] = None
     nonce: Optional[bytes] = None
     if broker.kind == "automated":

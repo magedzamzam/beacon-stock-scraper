@@ -1,14 +1,8 @@
-"""/orders and /instruments — order placement and broker symbol mapping.
+"""/orders, /accounts/{id}/positions, /instruments routers.
 
 Orders flow:
-  Manual account   -> we write directly to broker_orders (no gateway call).
-  Automated account -> we forward to broker_gateway, which talks to the
-                       broker, then writes to broker_orders.
-
-Instrument mapping:
-  Admins map (broker, broker_symbol) -> stocks.id so the UI knows whether a
-  given stock is tradeable on a given account, and which broker symbol to
-  send when placing the order.
+  Manual account   -> we write directly to broker_orders.
+  Automated account -> we forward to broker_gateway, which writes to broker_orders.
 """
 from __future__ import annotations
 
@@ -57,14 +51,6 @@ class PlaceOrderIn(BaseModel):
 def _resolve_broker_symbol(db: Session, account: TradingAccount,
                            stock_id: Optional[int],
                            explicit: Optional[str]) -> Optional[str]:
-    """Pick the broker symbol for an order.
-
-    Priority:
-      1) explicit value on the request (lets manual users record symbols
-         we don't have a mapping for)
-      2) BrokerInstrument mapping for (account.broker_id, stock_id)
-    Returns None if neither resolves.
-    """
     if explicit:
         return explicit
     if stock_id is None:
@@ -85,8 +71,6 @@ async def place_order(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Place an order. Routes to broker_gateway for automated accounts;
-    records directly for manual accounts."""
     acct = db.get(TradingAccount, body.account_id)
     if acct is None or acct.user_id != user.id or not acct.is_active:
         raise HTTPException(404, "Account not found")
@@ -102,7 +86,6 @@ async def place_order(
             "Ask an admin to map it, or pick a different account."
         )
 
-    # ---- Manual: just record it as FILLED ----
     if broker.kind == "manual":
         if body.order_type != "MARKET" and body.limit_price is None:
             raise HTTPException(400, "limit_price is required for LIMIT/STOP orders")
@@ -113,10 +96,8 @@ async def place_order(
             broker_symbol=broker_symbol or "", side=body.side, order_type=body.order_type,
             quantity=body.quantity, limit_price=body.limit_price,
             stop_loss=body.stop_loss, take_profit=body.take_profit,
-            currency=acct.currency,
-            status="FILLED",
-            fill_price=body.limit_price,
-            fill_quantity=body.quantity,
+            currency=acct.currency, status="FILLED",
+            fill_price=body.limit_price, fill_quantity=body.quantity,
             placed_at=datetime.utcnow(), filled_at=datetime.utcnow(),
             notes=body.notes,
         )
@@ -125,7 +106,6 @@ async def place_order(
         db.refresh(row)
         return {"id": row.id, "status": row.status, "manual": True}
 
-    # ---- Automated: forward to broker_gateway ----
     payload = {
         "broker_symbol": broker_symbol,
         "side": body.side, "order_type": body.order_type,
@@ -181,7 +161,6 @@ async def cancel_order(order_id: int, user: User = Depends(get_current_user), db
     if row.status not in ("PENDING", "WORKING"):
         raise HTTPException(400, f"Cannot cancel order in status {row.status}")
     if not row.broker_order_ref:
-        # Manual order — just mark cancelled locally.
         row.status = "CANCELLED"
         db.commit()
         return {"cancelled": True, "manual": True}
@@ -196,7 +175,7 @@ async def cancel_order(order_id: int, user: User = Depends(get_current_user), db
 
 
 # =============================================================================
-# Live positions (per account)
+# Live positions per account
 # =============================================================================
 positions_router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -208,13 +187,6 @@ async def get_positions(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return positions for an account.
-
-    For automated accounts: returns the broker_positions_snapshot rows, refreshing
-    them via broker_gateway if older than _POSITION_TTL_S (or if refresh=True).
-    For manual accounts: returns rows from portfolio_positions (the legacy table)
-    where account_id matches.
-    """
     acct = db.get(TradingAccount, account_id)
     if acct is None or acct.user_id != user.id:
         raise HTTPException(404, "Account not found")
@@ -236,7 +208,6 @@ async def get_positions(
             "broker_symbol": s.ticker,
         } for (p, s, e) in rows]
 
-    # ---- Automated: refresh snapshot if stale ----
     needs_refresh = refresh
     if not needs_refresh:
         latest = db.execute(
@@ -254,10 +225,7 @@ async def get_positions(
     if needs_refresh:
         try:
             async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.get(f"{_GATEWAY_URL}/accounts/{account_id}/positions")
-                if r.status_code >= 400:
-                    # Don't fail the request — fall back to whatever we have cached
-                    pass
+                await client.get(f"{_GATEWAY_URL}/accounts/{account_id}/positions")
         except httpx.RequestError:
             pass
 
@@ -309,8 +277,6 @@ class InstrumentMapIn(BaseModel):
 @instruments_router.get("/by-stock/{stock_id}")
 def list_for_stock(stock_id: int, db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
-    """List broker mappings for a stock — used by the place-order modal to know
-    which accounts can trade this stock."""
     rows = db.execute(
         select(BrokerInstrument, Broker)
         .join(Broker, BrokerInstrument.broker_id == Broker.id)
@@ -330,7 +296,6 @@ def upsert_instrument(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Admin: create or update a broker symbol mapping."""
     _require_admin(user)
     broker = db.execute(select(Broker).where(Broker.code == body.broker_code)).scalar_one_or_none()
     if broker is None:
@@ -384,8 +349,6 @@ async def search_instruments(
     broker_code: str, q: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
-    """Admin: live-search the broker's catalog by free-text. Useful when
-    you don't know the exact epic for a stock."""
     _require_admin(user)
     broker = db.execute(select(Broker).where(Broker.code == broker_code)).scalar_one_or_none()
     if broker is None:

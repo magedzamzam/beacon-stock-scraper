@@ -187,7 +187,9 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
 
     blurb = extract_company_blurb(overview_html or statistics_html or "")
     news = extract_news(overview_html or "")
-
+    for item in news:
+        item["news_date"] = today
+        
     market = build_market_daily(pairs)
     valuation = build_valuation(pairs)
     financials = build_financials_ttm(pairs)

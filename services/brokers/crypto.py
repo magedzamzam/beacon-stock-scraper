@@ -1,16 +1,8 @@
 """AES-256-GCM credential encryption.
 
-The key (32 raw bytes, base64-encoded) is read from the BROKER_SECRET_KEY env
-var. Only the broker_gateway container needs it set; api should never read
-plaintext credentials so it doesn't need the key.
-
-We pin to AES-GCM (authenticated encryption) so tampered ciphertext fails
-loudly on decrypt. Each row gets a fresh 12-byte nonce stored alongside the
-ciphertext in trading_accounts.credentials_nonce.
-
-Format:
-  ciphertext = AES-GCM(key, nonce, json.dumps(creds).encode())
-  on disk: nonce kept in credentials_nonce, ciphertext in credentials_encrypted
+Key from BROKER_SECRET_KEY env var (base64-encoded 32 bytes). Only the
+broker_gateway container needs the key for decryption; the api container
+uses encrypt_credentials() but never decrypts.
 """
 from __future__ import annotations
 
@@ -23,16 +15,12 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-_KEY_BYTES_LEN = 32   # AES-256
+_KEY_BYTES_LEN = 32
 _NONCE_BYTES_LEN = 12
 
 
-class CryptoConfigError(RuntimeError):
-    pass
-
-
-class CryptoIntegrityError(RuntimeError):
-    pass
+class CryptoConfigError(RuntimeError): ...
+class CryptoIntegrityError(RuntimeError): ...
 
 
 def _load_key() -> bytes:
@@ -54,7 +42,6 @@ def _load_key() -> bytes:
 
 
 def encrypt_credentials(creds: dict) -> tuple[bytes, bytes]:
-    """Encrypt a credentials dict. Returns (ciphertext, nonce)."""
     key = _load_key()
     nonce = os.urandom(_NONCE_BYTES_LEN)
     plain = json.dumps(creds, separators=(",", ":")).encode("utf-8")
@@ -63,7 +50,6 @@ def encrypt_credentials(creds: dict) -> tuple[bytes, bytes]:
 
 
 def decrypt_credentials(ciphertext: Optional[bytes], nonce: Optional[bytes]) -> dict:
-    """Decrypt a credentials blob. Returns {} if either input is missing."""
     if not ciphertext or not nonce:
         return {}
     key = _load_key()

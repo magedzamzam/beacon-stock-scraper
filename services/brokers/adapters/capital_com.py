@@ -1,34 +1,13 @@
-"""Capital.com adapter.
+"""Capital.com adapter — async, idiomatic.
 
 Wraps the Capital.com REST API per the v1 documentation:
   https://capital.com/en-ae/trading-platforms/api-development-guide
-
-Auth model
-----------
-Capital.com auth is two-step:
-  1. POST /api/v1/session with {identifier, password} + X-CAP-API-KEY header
-  2. The response carries CST + X-SECURITY-TOKEN headers; subsequent calls
-     send those instead of the password.
-
-Sessions expire (10 min idle, 24h absolute). We lazy-create the session on
-first use and refresh on 401. Sessions are kept on the adapter instance,
-which lives for the duration of one HTTP request to the broker_gateway —
-so we re-auth roughly once per gateway request. Cheaper than maintaining
-a thread-safe session pool, and the latency cost (~150 ms) is fine for
-an interactive-only flow.
-
-Hosts
------
-  Live: api-capital.backend-capital.com
-  Demo: demo-api-capital.backend-capital.com
-The credentials_schema includes ``is_demo`` so the user can pick. We swap
-the host accordingly in ``_host``.
 """
 from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -46,7 +25,6 @@ _DEFAULT_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 
 def _map_status(capital_status: str) -> OrderStatus:
-    """Map Capital.com status strings to our normalized enum."""
     s = (capital_status or "").upper()
     if s in ("ACCEPTED", "FILLED", "EXECUTED"):
         return OrderStatus.FILLED
@@ -62,16 +40,13 @@ def _map_status(capital_status: str) -> OrderStatus:
 class CapitalComAdapter(BrokerAdapter):
     is_automated = True
 
-    def __init__(self, credentials: Optional[dict] = None,
-                 display_metadata: Optional[dict] = None,
-                 base_url: Optional[str] = None):
+    def __init__(self, credentials=None, display_metadata=None, base_url=None):
         super().__init__(credentials, display_metadata, base_url)
         self._cst: Optional[str] = None
         self._sec_token: Optional[str] = None
         self._client: Optional[httpx.AsyncClient] = None
         self._session_lock = asyncio.Lock()
 
-    # ----- low-level helpers -----
     @property
     def _host(self) -> str:
         if self.base_url:
@@ -95,7 +70,6 @@ class CapitalComAdapter(BrokerAdapter):
             self._client = None
 
     async def _ensure_session(self) -> None:
-        """Create or refresh the Capital.com session. Thread-safe via lock."""
         if self._cst and self._sec_token:
             return
         async with self._session_lock:
@@ -135,17 +109,11 @@ class CapitalComAdapter(BrokerAdapter):
             "Content-Type": "application/json",
         }
 
-    async def _request(self, method: str, path: str,
-                       json: Optional[dict] = None,
-                       params: Optional[dict] = None,
-                       _retry_on_401: bool = True) -> Any:
-        """Authenticated request with one auto-retry on 401."""
+    async def _request(self, method, path, json=None, params=None, _retry_on_401=True):
         await self._ensure_session()
         client = await self._get_client()
         try:
-            resp = await client.request(
-                method, path, json=json, params=params, headers=self._auth_headers(),
-            )
+            resp = await client.request(method, path, json=json, params=params, headers=self._auth_headers())
         except httpx.RequestError as exc:
             raise NetworkError(f"Capital.com network error: {exc}") from exc
 
@@ -158,7 +126,6 @@ class CapitalComAdapter(BrokerAdapter):
         if resp.status_code == 429:
             raise RateLimitError("Capital.com rate-limited")
         if resp.status_code >= 400:
-            # Surface the broker's error body — usually JSON like {"errorCode":"..."}
             try:
                 detail = resp.json()
             except Exception:
@@ -172,12 +139,12 @@ class CapitalComAdapter(BrokerAdapter):
         except ValueError:
             return resp.text
 
-    # ----- public adapter interface -----
     async def healthcheck(self) -> dict:
         try:
             info = await self.get_account_info()
             return {"ok": True, "message": f"connected as {info.account_id}",
-                    "currency": info.currency, "balance": str(info.balance) if info.balance is not None else None}
+                    "currency": info.currency,
+                    "balance": str(info.balance) if info.balance is not None else None}
         except AuthError as e:
             return {"ok": False, "message": f"auth failed: {e}"}
         except BrokerError as e:
@@ -185,7 +152,6 @@ class CapitalComAdapter(BrokerAdapter):
 
     async def get_account_info(self) -> AccountInfo:
         data = await self._request("GET", "/api/v1/accounts")
-        # Schema: {"accounts": [{"accountId":..., "balance":{"balance","available","currency"}, ...}]}
         accounts = data.get("accounts") or []
         if not accounts:
             raise NotFoundError("Capital.com returned no accounts")
@@ -212,7 +178,7 @@ class CapitalComAdapter(BrokerAdapter):
                 avg_open_price=to_dec(pos.get("level")),
                 current_price=to_dec(mkt.get("bid") if direction == "BUY" else mkt.get("offer")),
                 unrealized_pl=to_dec(pos.get("upl") or pos.get("profit")),
-                unrealized_pl_pct=None,  # Capital.com doesn't return % directly; gateway can compute
+                unrealized_pl_pct=None,
                 currency=pos.get("currency") or mkt.get("currency"),
                 direction=Direction.LONG if direction == "BUY" else Direction.SHORT,
                 raw=p,
@@ -220,7 +186,6 @@ class CapitalComAdapter(BrokerAdapter):
         return out
 
     async def list_orders(self, status: Optional[OrderStatus] = None) -> List[BrokerOrder]:
-        # Capital.com working orders are at /workingorders
         data = await self._request("GET", "/api/v1/workingorders")
         out: List[BrokerOrder] = []
         for w in data.get("workingOrders", []):
@@ -232,8 +197,7 @@ class CapitalComAdapter(BrokerAdapter):
             out.append(BrokerOrder(
                 broker_order_ref=str(wo.get("dealId") or ""),
                 broker_symbol=str(wo.get("epic") or mkt.get("epic") or ""),
-                side=side,
-                order_type=ot,
+                side=side, order_type=ot,
                 quantity=to_dec(wo.get("orderSize")) or Decimal("0"),
                 limit_price=to_dec(wo.get("orderLevel")),
                 stop_loss=to_dec(wo.get("stopLevel")),
@@ -247,17 +211,10 @@ class CapitalComAdapter(BrokerAdapter):
         return out
 
     async def place_order(self, req: PlaceOrderRequest) -> BrokerOrder:
-        # Capital.com differentiates market (positions) vs limit/stop (workingorders).
         if req.order_type == OrderType.MARKET:
-            payload = {
-                "epic": req.broker_symbol,
-                "direction": req.side.value,
-                "size": float(req.quantity),
-            }
-            if req.stop_loss is not None:
-                payload["stopLevel"] = float(req.stop_loss)
-            if req.take_profit is not None:
-                payload["profitLevel"] = float(req.take_profit)
+            payload = {"epic": req.broker_symbol, "direction": req.side.value, "size": float(req.quantity)}
+            if req.stop_loss is not None: payload["stopLevel"] = float(req.stop_loss)
+            if req.take_profit is not None: payload["profitLevel"] = float(req.take_profit)
             data = await self._request("POST", "/api/v1/positions", json=payload)
         else:
             ot = "LIMIT" if req.order_type == OrderType.LIMIT else "STOP"
@@ -265,19 +222,13 @@ class CapitalComAdapter(BrokerAdapter):
             if level is None:
                 raise BrokerError("limit_price is required for LIMIT/STOP orders")
             payload = {
-                "epic": req.broker_symbol,
-                "direction": req.side.value,
-                "size": float(req.quantity),
-                "type": ot,
-                "level": float(level),
+                "epic": req.broker_symbol, "direction": req.side.value, "size": float(req.quantity),
+                "type": ot, "level": float(level),
             }
-            if req.stop_loss is not None:
-                payload["stopLevel"] = float(req.stop_loss)
-            if req.take_profit is not None:
-                payload["profitLevel"] = float(req.take_profit)
+            if req.stop_loss is not None: payload["stopLevel"] = float(req.stop_loss)
+            if req.take_profit is not None: payload["profitLevel"] = float(req.take_profit)
             data = await self._request("POST", "/api/v1/workingorders", json=payload)
 
-        # Both endpoints return {"dealReference": "..."}; we fetch confirmation.
         deal_ref = data.get("dealReference")
         if not deal_ref:
             raise BrokerError(f"Capital.com place_order missing dealReference: {data}")
@@ -287,8 +238,7 @@ class CapitalComAdapter(BrokerAdapter):
         return BrokerOrder(
             broker_order_ref=str(confirm.get("dealId") or deal_ref),
             broker_symbol=str(confirm.get("epic") or req.broker_symbol),
-            side=req.side,
-            order_type=req.order_type,
+            side=req.side, order_type=req.order_type,
             quantity=to_dec(confirm.get("size")) or req.quantity,
             limit_price=req.limit_price,
             stop_loss=to_dec(confirm.get("stopLevel") or req.stop_loss),
@@ -302,7 +252,6 @@ class CapitalComAdapter(BrokerAdapter):
         )
 
     async def cancel_order(self, broker_order_ref: str) -> bool:
-        # DELETE /workingorders/{dealId} — Capital.com replies with a deal reference
         try:
             data = await self._request("DELETE", f"/api/v1/workingorders/{broker_order_ref}")
             ref = data.get("dealReference")

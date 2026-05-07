@@ -25,8 +25,7 @@ export default function ProfilePage() {
           <div>
             <h2 className="text-lg font-semibold">Trading accounts</h2>
             <p className="text-xs text-ink-muted">
-              Connect brokers (Capital.com) for automated trading, or add manual
-              accounts (Thndr, others) to track positions and trades.
+              Connect brokers (Capital.com) for automated trading, or add manual accounts (Thndr, others) to track positions and trades.
             </p>
           </div>
           <button className="btn-primary" onClick={() => setShowAdd(true)}>
@@ -46,8 +45,12 @@ export default function ProfilePage() {
         </div>
       </section>
 
-      {showAdd && <AddAccountModal onClose={() => setShowAdd(false)}
-                                   onSaved={() => { mutate("accounts"); setShowAdd(false); }} />}
+      {showAdd && (
+        <AddAccountModal
+          onClose={() => setShowAdd(false)}
+          onSaved={() => { mutate("accounts"); setShowAdd(false); }}
+        />
+      )}
     </div>
   );
 }
@@ -95,9 +98,7 @@ function AccountCard({ acct }: { acct: any }) {
           </div>
           <div className="text-xs text-ink-dim mt-0.5">
             {acct.currency || "—"}
-            {acct.last_connect_at && (
-              <> · last checked {fmtDate(acct.last_connect_at)}</>
-            )}
+            {acct.last_connect_at && (<> · last checked {fmtDate(acct.last_connect_at)}</>)}
             {acct.last_connect_status === "error" && acct.last_connect_error && (
               <> · <span className="text-verdict-avoid">{acct.last_connect_error}</span></>
             )}
@@ -119,7 +120,7 @@ function AccountCard({ acct }: { acct: any }) {
 
 
 function AddAccountModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
-  const { data: brokers } = useSWR("brokers", () => api.listBrokers());
+  const { data: brokers, isLoading: brokersLoading, error: brokersError } = useSWR("brokers", () => api.listBrokers());
   const [step, setStep] = useState<"pick" | "fill">("pick");
   const [chosen, setChosen] = useState<any | null>(null);
   const [label, setLabel] = useState("");
@@ -150,12 +151,8 @@ function AddAccountModal({ onClose, onSaved }: { onClose: () => void; onSaved: (
     }
   }
 
-  function setCredField(key: string, val: any) {
-    setCreds({ ...creds, [key]: val });
-  }
-  function setMetaField(key: string, val: any) {
-    setDisplayMeta({ ...displayMeta, [key]: val });
-  }
+  function setCredField(key: string, val: any) { setCreds({ ...creds, [key]: val }); }
+  function setMetaField(key: string, val: any) { setDisplayMeta({ ...displayMeta, [key]: val }); }
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
@@ -164,6 +161,20 @@ function AddAccountModal({ onClose, onSaved }: { onClose: () => void; onSaved: (
           <>
             <h3 className="font-semibold mb-3">Add a trading account</h3>
             <p className="text-xs text-ink-dim mb-4">Pick the broker. Automated brokers will need credentials in the next step.</p>
+
+            {brokersLoading && <div className="text-sm text-ink-muted py-4">Loading brokers…</div>}
+            {brokersError && (
+              <div className="text-sm text-verdict-avoid py-4">
+                Failed to load brokers: {String(brokersError.message || brokersError)}
+              </div>
+            )}
+            {!brokersLoading && !brokersError && brokers?.length === 0 && (
+              <div className="text-sm text-verdict-avoid py-4">
+                No brokers available. Run the database migration{" "}
+                <code className="px-1 rounded bg-bg-elevated">db/migrations/002_brokers.sql</code>.
+              </div>
+            )}
+
             <div className="grid gap-2">
               {brokers?.map(b => (
                 <button key={b.id} className="rounded-lg bg-bg-subtle hover:bg-bg-elevated p-3 text-left transition-colors"
@@ -247,7 +258,10 @@ function AddAccountModal({ onClose, onSaved }: { onClose: () => void; onSaved: (
             </div>
 
             <div className="flex gap-2 justify-end mt-4">
-              <button className="btn-ghost" onClick={() => { setStep("pick"); setChosen(null); setCreds({}); setDisplayMeta({}); }}>Back</button>
+              <button className="btn-ghost"
+                      onClick={() => { setStep("pick"); setChosen(null); setCreds({}); setDisplayMeta({}); }}>
+                Back
+              </button>
               <button className="btn-primary" onClick={submit} disabled={submitting}>
                 {submitting ? "Saving…" : "Save account"}
               </button>

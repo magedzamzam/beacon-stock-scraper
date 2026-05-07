@@ -1,12 +1,4 @@
-"""Manual broker adapter — Thndr, "Other (manual)", anything we don't connect to.
-
-We model these as adapters too so the gateway has one uniform interface.
-For manual accounts every read returns empty (the broker_gateway doesn't
-talk to Thndr's API), and every "place_order" call should be intercepted
-upstream — manual orders are written directly to broker_orders by the API
-service. This adapter exists to satisfy the contract and make sure the
-gateway never crashes if it's invoked on a manual account by mistake.
-"""
+"""Manual broker adapter — Thndr et al. No-op for the gateway."""
 from __future__ import annotations
 
 from typing import List, Optional

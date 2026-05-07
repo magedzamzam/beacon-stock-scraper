@@ -1,10 +1,4 @@
-"""Cross-cutting types for broker adapters.
-
-Each adapter takes typed inputs and returns typed outputs so the gateway
-layer never has to peek inside broker-specific shapes. If a broker's API
-returns extra detail we want to keep around, we stash it in the ``raw``
-field of BrokerPosition / BrokerOrder.
-"""
+"""Cross-cutting types for broker adapters."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -27,7 +21,7 @@ class OrderType(str, Enum):
 
 class OrderStatus(str, Enum):
     PENDING = "PENDING"
-    WORKING = "WORKING"     # accepted, sitting on broker's book (limit orders)
+    WORKING = "WORKING"
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
@@ -40,7 +34,6 @@ class Direction(str, Enum):
 
 @dataclass
 class PlaceOrderRequest:
-    """What the gateway hands an adapter to place an order."""
     broker_symbol: str
     side: OrderSide
     order_type: OrderType
@@ -48,13 +41,11 @@ class PlaceOrderRequest:
     limit_price: Optional[Decimal] = None
     stop_loss: Optional[Decimal] = None
     take_profit: Optional[Decimal] = None
-    # Optional adapter-specific extras (e.g. force_open for Capital.com)
     extras: dict = field(default_factory=dict)
 
 
 @dataclass
 class BrokerOrder:
-    """An order as reported by a broker (or as we recorded it for manual)."""
     broker_order_ref: Optional[str]
     broker_symbol: str
     side: OrderSide
@@ -75,7 +66,6 @@ class BrokerOrder:
 
 @dataclass
 class BrokerPosition:
-    """A single open position as the broker reports it."""
     broker_symbol: str
     quantity: Decimal
     avg_open_price: Optional[Decimal]
@@ -89,7 +79,6 @@ class BrokerPosition:
 
 @dataclass
 class BrokerInstrument:
-    """An instrument the broker offers, found via search/lookup."""
     broker_symbol: str
     name: str
     instrument_type: Optional[str]
@@ -99,7 +88,6 @@ class BrokerInstrument:
 
 @dataclass
 class AccountInfo:
-    """Light-weight account info returned by the broker."""
     account_id: str
     balance: Optional[Decimal]
     available: Optional[Decimal]
@@ -107,28 +95,14 @@ class AccountInfo:
     raw: Optional[dict] = None
 
 
-class BrokerError(Exception):
-    """Base class for adapter-side errors. Subclasses indicate cause."""
-
-
-class AuthError(BrokerError):
-    """Credentials rejected (401, expired session, etc.)."""
-
-
-class NotFoundError(BrokerError):
-    """Symbol or order id not found."""
-
-
-class RateLimitError(BrokerError):
-    """Broker is rate-limiting us. Caller should back off."""
-
-
-class NetworkError(BrokerError):
-    """Connection issue, timeout, DNS failure, etc."""
+class BrokerError(Exception): ...
+class AuthError(BrokerError): ...
+class NotFoundError(BrokerError): ...
+class RateLimitError(BrokerError): ...
+class NetworkError(BrokerError): ...
 
 
 def to_dec(x: Any) -> Optional[Decimal]:
-    """Best-effort conversion to Decimal, or None for missing/garbage values."""
     if x is None or x == "":
         return None
     try:

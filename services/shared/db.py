@@ -209,8 +209,7 @@ class PortfolioPosition(Base):
     entry_date: Mapped[Optional[date]] = mapped_column(Date)
     notes: Mapped[Optional[str]] = mapped_column(Text)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
-    # Optional FK to the manual trading account this position belongs to.
-    # NULL = legacy / unattached (positions created before broker integration).
+    # Optional FK to a manual trading account. NULL = legacy / unattached.
     account_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("trading_accounts.id", ondelete="SET NULL"), nullable=True
     )
@@ -301,22 +300,26 @@ class StockLatestSnapshot(Base):
     verdict: Mapped[Optional[str]] = mapped_column(String(16))
     last_updated: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+class StockCorporateAction(Base):
+    __tablename__ = "stock_corporate_actions"
 
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"))
+    action_date: Mapped[date] = mapped_column(Date, nullable=False)
+    action_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    details: Mapped[Optional[str]] = mapped_column(Text)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
 # ============================================================================
 # Broker integration (migration 002)
 # ============================================================================
 class Broker(Base):
-    """Registry of broker types we know how to talk to.
-
-    Each row represents a *kind* of broker, not a user's account. The pair
-    ``kind`` + ``adapter_class`` tells the BrokerService which Python adapter
-    to use for any account of this type.
-    """
+    """Registry of broker types. Each row = a kind of broker, not a user account."""
     __tablename__ = "brokers"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    kind: Mapped[str] = mapped_column(String(16), nullable=False)            # 'automated' | 'manual'
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
     adapter_class: Mapped[str] = mapped_column(String(120), nullable=False)
     base_url: Mapped[Optional[str]] = mapped_column(String(255))
     docs_url: Mapped[Optional[str]] = mapped_column(String(255))
@@ -326,12 +329,6 @@ class Broker(Base):
 
 
 class TradingAccount(Base):
-    """A user's account at a specific broker.
-
-    Credentials for *automated* accounts are encrypted at rest with AES-GCM.
-    The encryption key lives only in the broker_gateway container's env;
-    this class just stores ciphertext + nonce.
-    """
     __tablename__ = "trading_accounts"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"))
@@ -351,12 +348,6 @@ class TradingAccount(Base):
 
 
 class BrokerInstrument(Base):
-    """Mapping from a broker-native symbol to (optionally) a stock in our DB.
-
-    The same broker can have stock_id NULL for instruments we don't track
-    (gold, FX, indices). In those cases the row is still useful: the user can
-    place orders against them, we just don't have screening data.
-    """
     __tablename__ = "broker_instruments"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     broker_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("brokers.id", ondelete="CASCADE"))
@@ -373,20 +364,14 @@ class BrokerInstrument(Base):
 
 
 class BrokerOrder(Base):
-    """Canonical audit log for every order, automated or manual.
-
-    For automated accounts, broker_order_ref ties back to the broker's deal
-    reference. For manual accounts, broker_order_ref stays NULL and status
-    goes straight to FILLED on creation (the user is recording history).
-    """
     __tablename__ = "broker_orders"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     account_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("trading_accounts.id", ondelete="CASCADE"))
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"))
     stock_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="SET NULL"))
     broker_symbol: Mapped[Optional[str]] = mapped_column(String(64))
-    side: Mapped[str] = mapped_column(String(8), nullable=False)            # BUY | SELL
-    order_type: Mapped[str] = mapped_column(String(8), nullable=False)      # MARKET | LIMIT | STOP
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(8), nullable=False)
     quantity: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
     limit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     stop_loss: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
@@ -406,12 +391,6 @@ class BrokerOrder(Base):
 
 
 class BrokerPositionSnapshot(Base):
-    """Last-known broker-reported positions for one automated account.
-
-    Refreshed on demand (max once per ``BROKER_POSITION_TTL_S`` seconds, default
-    60) when the user opens the portfolio page. Manual accounts don't snapshot —
-    portfolio_positions is the source of truth there.
-    """
     __tablename__ = "broker_positions_snapshot"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     account_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("trading_accounts.id", ondelete="CASCADE"))

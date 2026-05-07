@@ -458,15 +458,6 @@ function Sub({ label, value, invert = false }: { label: string; value: number; i
 
 /* ============================================================================
    PlaceOrderModal — order placement for any account, manual or automated.
-
-   Behaviour:
-     1. Loads the user's accounts and the broker mappings for this stock.
-     2. Per account, decides whether the stock is tradeable:
-          - Manual accounts are always tradeable (user can record any trade).
-          - Automated accounts only if there's a broker_instrument mapping.
-     3. Shows MARKET / LIMIT / STOP picker; LIMIT/STOP require a price.
-     4. On submit, calls /orders. The API decides whether to forward to
-        broker_gateway (automated) or just record the row (manual).
    ============================================================================ */
 function PlaceOrderModal({
   stockId, ticker, companyName, currency, lastClose, onClose, onSaved,
@@ -493,12 +484,8 @@ function PlaceOrderModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Pre-default a price for LIMIT/STOP from the last close so users don't start blank.
   const defaultPrice = lastClose ? String(lastClose) : "";
 
-  // Build the per-account "tradeable here?" map.
-  // For automated accounts: tradeable iff a broker_instruments row exists.
-  // For manual accounts: always tradeable (we record whatever the user types).
   const tradeableMap = new Map<number, { tradeable: boolean; brokerSymbol: string | null }>();
   (accounts || []).forEach(acct => {
     if (acct.broker_kind === "manual") {
@@ -529,8 +516,7 @@ function PlaceOrderModal({
         account_id: Number(accountId),
         stock_id: stockId,
         broker_symbol: selectedTradeable?.brokerSymbol || undefined,
-        side,
-        order_type: orderType,
+        side, order_type: orderType,
         quantity: Number(quantity),
         limit_price: limitPrice ? Number(limitPrice) : undefined,
         stop_loss: stopLoss ? Number(stopLoss) : undefined,
@@ -552,7 +538,6 @@ function PlaceOrderModal({
         <p className="text-xs text-ink-dim mb-4">{companyName}</p>
 
         <div className="space-y-3">
-          {/* Account picker */}
           <div>
             <label className="label">Account</label>
             {!accounts?.length ? (
@@ -586,7 +571,6 @@ function PlaceOrderModal({
             )}
           </div>
 
-          {/* Side */}
           <div>
             <label className="label">Side</label>
             <div className="grid grid-cols-2 gap-2 mt-1">
@@ -599,7 +583,6 @@ function PlaceOrderModal({
             </div>
           </div>
 
-          {/* Order type */}
           <div>
             <label className="label">Order type</label>
             <div className="grid grid-cols-3 gap-2 mt-1">
@@ -614,7 +597,6 @@ function PlaceOrderModal({
             </div>
           </div>
 
-          {/* Quantity + price */}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="label">Quantity</label>
@@ -630,7 +612,6 @@ function PlaceOrderModal({
             )}
           </div>
 
-          {/* Optional SL/TP */}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="label">Stop loss (optional)</label>
@@ -667,10 +648,6 @@ function PlaceOrderModal({
 
 /* ============================================================================
    InstrumentMapModal — admin: map this stock to a broker symbol.
-
-   Lists existing mappings plus an "Add" form. For automated brokers, an
-   inline search box queries the broker's catalog so the admin doesn't have
-   to know the epic by heart.
    ============================================================================ */
 function InstrumentMapModal({
   stockId, ticker, companyName, onClose,
@@ -741,7 +718,6 @@ function InstrumentMapModal({
           Map this stock to a broker's instrument so users can place orders on it.
         </p>
 
-        {/* Existing mappings */}
         <div className="mb-5">
           <div className="text-xs uppercase tracking-wider text-ink-dim mb-2">Current mappings</div>
           {existing?.length === 0 ? (
@@ -764,7 +740,6 @@ function InstrumentMapModal({
           )}
         </div>
 
-        {/* Add form */}
         <div className="border-t border-border pt-4">
           <div className="text-xs uppercase tracking-wider text-ink-dim mb-2">Add mapping</div>
           <div className="space-y-3">
