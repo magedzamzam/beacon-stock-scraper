@@ -145,7 +145,10 @@ def override_stock(
     stock = db.execute(
         select(Stock)
         .join(Exchange, Stock.exchange_id == Exchange.id)
-        .where(Exchange.code == exchange.lower(), Stock.ticker == ticker.upper())
+        .where(
+            func.lower(Exchange.code) == exchange.lower(),
+            func.upper(Stock.ticker) == ticker.upper(),
+        )
     ).scalar_one_or_none()
     if not stock:
         raise HTTPException(404, "Stock not found")
