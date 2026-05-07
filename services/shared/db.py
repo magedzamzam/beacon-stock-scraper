@@ -303,10 +303,7 @@ class StockCorporateAction(Base):
     stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"))
     action_date: Mapped[date] = mapped_column(Date, nullable=False)
     action_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text)
-    ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
-    cash_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
-    currency: Mapped[Optional[str]] = mapped_column(String(10))
+    details: Mapped[Optional[str]] = mapped_column(Text)
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     
 # ---------- Engine factory ----------
