@@ -115,7 +115,7 @@ export interface PriceHistoryPoint {
 
 export interface NewsItem {
   id: number;
-  news_date: string;
+  news_date: string | null;
   headline: string;
   source_code: string | null;
   url: string | null;
@@ -277,4 +277,83 @@ export const api = {
       `/admin/stocks/${exchange}/${ticker}/override`,
       { method: "POST", body: JSON.stringify(payload) },
     ),
+
+  // csv import
+  adminImportCatalog: () => request<ImportCatalog>("/admin/imports/catalog"),
+  adminImportPreview: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return request<ImportPreview>("/admin/imports/preview", { method: "POST", body: form });
+  },
+  adminImportExecute: (payload: ImportExecuteRequest) =>
+    request<ImportExecuteResult>("/admin/imports/execute", { method: "POST", body: JSON.stringify(payload) }),
 };
+
+
+export interface ImportTableColumn {
+  name: string;
+  type: string;
+  nullable: boolean;
+  primary_key: boolean;
+  unique: boolean;
+  foreign_key: string | null;
+  default: string | null;
+}
+
+export interface ImportTable {
+  name: string;
+  label: string;
+  primary_key: string[];
+  unique_constraints: string[][];
+  suggested_match_columns: string[];
+  columns: ImportTableColumn[];
+}
+
+export interface ImportCatalog {
+  tables: ImportTable[];
+}
+
+export interface ImportPreviewRow {
+  row_number: number;
+  values: Record<string, string | null>;
+}
+
+export interface ImportPreview {
+  import_id: string;
+  filename: string;
+  encoding: string;
+  delimiter: string;
+  row_count: number;
+  headers: string[];
+  sample_rows: ImportPreviewRow[];
+}
+
+export interface ImportExecuteRequest {
+  import_id: string;
+  table_name: string;
+  mode: "update" | "insert";
+  column_mapping: Record<string, string>;
+  match_columns: string[];
+  ignore_blank_values?: boolean;
+}
+
+export interface ImportRowLog {
+  row_number: number;
+  action: string;
+  message: string;
+}
+
+export interface ImportExecuteResult {
+  import_id: string;
+  table_name: string;
+  mode: string;
+  encoding: string;
+  delimiter: string;
+  processed: number;
+  inserted: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  row_logs: ImportRowLog[];
+  finished_at: string;
+}

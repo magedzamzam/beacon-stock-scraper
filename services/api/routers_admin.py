@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -18,7 +18,11 @@ from shared.db import (
     StockLatestSnapshot, StockMarketDaily, StockRecommendation, User,
 )
 from .auth import get_current_user, get_db
-from .schemas import AdminStatusOut, ScrapeRunOut
+from .import_tool import build_import_catalog, build_preview, execute_import, save_upload_preview
+from .schemas import (
+    AdminStatusOut, ImportCatalogOut, ImportExecuteOut, ImportExecuteRequest, ImportPreviewOut,
+    ScrapeRunOut,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -290,6 +294,42 @@ def override_stock(
         "changes": changes,
         "rescored": rescored,
     }
+
+
+# ---------------------------------------------------------------------------
+# CSV Import Tool
+# ---------------------------------------------------------------------------
+@router.get("/imports/catalog", response_model=ImportCatalogOut)
+def import_catalog(_: User = Depends(require_admin)):
+    return {"tables": build_import_catalog()}
+
+
+@router.post("/imports/preview", response_model=ImportPreviewOut)
+async def import_preview(
+    file: UploadFile = File(...),
+    _: User = Depends(require_admin),
+):
+    saved = save_upload_preview(file)
+    preview = build_preview(saved["import_id"])
+    preview["filename"] = saved["filename"]
+    return preview
+
+
+@router.post("/imports/execute", response_model=ImportExecuteOut)
+def import_execute(
+    req: ImportExecuteRequest,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return execute_import(
+        db,
+        import_id=req.import_id,
+        table_name=req.table_name,
+        mode=req.mode,
+        column_mapping=req.column_mapping,
+        match_columns=req.match_columns,
+        ignore_blank_values=req.ignore_blank_values,
+    )
 
 
 def _upsert_snapshot(db: Session, stock_id: int, payload: dict):

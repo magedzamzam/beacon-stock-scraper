@@ -7,7 +7,7 @@ sync.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -201,3 +201,72 @@ class AdminStatusOut(BaseModel):
     open_positions: int
     last_scrape_at: Optional[datetime] = None
     scrape_runs: list[ScrapeRunOut] = []
+
+
+# ---------- CSV Import ----------
+class ImportTableColumnOut(BaseModel):
+    name: str
+    type: str
+    nullable: bool = True
+    primary_key: bool = False
+    unique: bool = False
+    foreign_key: Optional[str] = None
+    default: Optional[str] = None
+
+
+class ImportTableOut(BaseModel):
+    name: str
+    label: str
+    primary_key: list[str] = []
+    unique_constraints: list[list[str]] = []
+    suggested_match_columns: list[str] = []
+    columns: list[ImportTableColumnOut] = []
+
+
+class ImportCatalogOut(BaseModel):
+    tables: list[ImportTableOut] = []
+
+
+class ImportPreviewRowOut(BaseModel):
+    row_number: int
+    values: dict[str, Optional[str]]
+
+
+class ImportPreviewOut(BaseModel):
+    import_id: str
+    filename: str
+    encoding: str
+    delimiter: str
+    row_count: int
+    headers: list[str] = []
+    sample_rows: list[ImportPreviewRowOut] = []
+
+
+class ImportExecuteRequest(BaseModel):
+    import_id: str
+    table_name: str
+    mode: Literal["update", "insert"] = "update"
+    column_mapping: dict[str, str] = {}
+    match_columns: list[str] = []
+    ignore_blank_values: bool = True
+
+
+class ImportRowLogOut(BaseModel):
+    row_number: int
+    action: str
+    message: str
+
+
+class ImportExecuteOut(BaseModel):
+    import_id: str
+    table_name: str
+    mode: str
+    encoding: str
+    delimiter: str
+    processed: int
+    inserted: int
+    updated: int
+    skipped: int
+    errors: int
+    row_logs: list[ImportRowLogOut] = []
+    finished_at: datetime
