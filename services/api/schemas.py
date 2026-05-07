@@ -101,7 +101,7 @@ class PriceHistoryPoint(BaseModel):
 
 class NewsItem(BaseModel):
     id: int
-    news_date: date
+    news_date: Optional[date] = None
     headline: str
     source_code: Optional[str] = None
     url: Optional[str] = None
