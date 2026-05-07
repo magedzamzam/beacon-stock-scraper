@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    background: #0b0f17;
+    color: #e6edf6;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+  }
+  * { border-color: #1f2a3d; }
+}
+
+@layer components {
+  .card {
+    @apply bg-bg-card border border-border rounded-xl shadow-card;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-medium
+           transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary { @apply btn bg-brand text-white hover:bg-brand-dim; }
+  .btn-ghost   { @apply btn bg-bg-elevated text-ink hover:bg-border; }
+  .btn-danger  { @apply btn bg-red-600 text-white hover:bg-red-700; }
+  .input {
+    @apply w-full bg-bg-subtle border border-border rounded-lg px-3 py-2 text-sm text-ink
+           placeholder:text-ink-dim focus:outline-none focus:border-brand;
+  }
+  .label { @apply text-xs uppercase tracking-wide text-ink-muted font-medium; }
+  .badge {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-semibold;
+  }
+  .badge-buy   { @apply badge bg-verdict-buy/15 text-verdict-buy ring-1 ring-verdict-buy/30; }
+  .badge-watch { @apply badge bg-verdict-watch/15 text-verdict-watch ring-1 ring-verdict-watch/30; }
+  .badge-avoid { @apply badge bg-verdict-avoid/15 text-verdict-avoid ring-1 ring-verdict-avoid/30; }
+  .badge-hold  { @apply badge bg-verdict-hold/15 text-verdict-hold ring-1 ring-verdict-hold/30; }
+  .badge-sell  { @apply badge bg-verdict-sell/15 text-verdict-sell ring-1 ring-verdict-sell/30; }
+  .badge-buymore { @apply badge bg-verdict-buymore/15 text-verdict-buymore ring-1 ring-verdict-buymore/30; }
+  .badge-trim  { @apply badge bg-verdict-trim/15 text-verdict-trim ring-1 ring-verdict-trim/30; }
+  .badge-stop  { @apply badge bg-verdict-stop/15 text-verdict-stop ring-1 ring-verdict-stop/30; }
+  .table-row { @apply border-b border-border hover:bg-bg-elevated/40 transition-colors; }
+  .nav-link {
+    @apply flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-ink-muted
+           hover:text-ink hover:bg-bg-elevated transition-colors;
+  }
+  .nav-link-active { @apply text-ink bg-bg-elevated; }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0b0f17; }
+::-webkit-scrollbar-thumb { background: #1f2a3d; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #2a3950; }
