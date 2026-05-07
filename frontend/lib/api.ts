@@ -198,6 +198,66 @@ export interface AuthResponse {
   user: User;
 }
 
+// ===== CSV import (admin) =====
+export interface ImportTableColumn {
+  name: string;
+  type: string;
+  nullable: boolean;
+  primary_key: boolean;
+  unique: boolean;
+  foreign_key: string | null;
+  default: string | null;
+}
+
+export interface ImportTable {
+  name: string;
+  label: string;
+  primary_key: string[];
+  unique_constraints: string[][];
+  suggested_match_columns: string[];
+  columns: ImportTableColumn[];
+}
+
+export interface ImportPreview {
+  import_id: string;
+  filename: string;
+  encoding: string;
+  delimiter: string;
+  row_count: number;
+  headers: string[];
+  sample_rows: Array<{ row_number: number; values: Record<string, string | null> }>;
+}
+
+export interface ImportRowLog {
+  row_number: number;
+  outcome: "inserted" | "updated" | "skipped" | "error";
+  message: string;
+}
+
+export interface ImportExecuteRequest {
+  import_id: string;
+  table_name: string;
+  mode: "insert_only" | "upsert" | "update_only";
+  column_mapping: Record<string, string>;
+  match_columns: string[];
+  ignore_blank_values?: boolean;
+}
+
+export interface ImportExecuteResult {
+  import_id: string;
+  table_name: string;
+  mode: string;
+  encoding: string;
+  delimiter: string;
+  processed: number;
+  inserted: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  row_logs: ImportRowLog[];
+  finished_at: string;
+}
+
 // ---------------- Endpoints ----------------
 export const api = {
   // auth
@@ -342,4 +402,25 @@ export const api = {
                     currency: string | null; min_qty: string | null }>>(
       `/instruments/search/${broker_code}?q=${encodeURIComponent(q)}`,
     ),
+  // ===== CSV import (admin) =====
+  adminImportCatalog: () => request<ImportTable[]>("/admin/import/catalog"),
+
+  adminImportPreview: async (file: File): Promise<ImportPreview> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const token = localStorage.getItem("token");
+    const r = await fetch(`${API_BASE}/admin/import/preview`, {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: fd,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  },
+
+  adminImportExecute: (payload: ImportExecuteRequest) =>
+    request<ImportExecuteResult>("/admin/import/execute", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };
