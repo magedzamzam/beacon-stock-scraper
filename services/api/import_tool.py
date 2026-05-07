@@ -200,11 +200,11 @@ def execute_import(
 
     processed = inserted = updated = skipped = errors = 0
     row_logs: list[dict[str, Any]] = []
-
-    with db.begin():
+    try:
         for row_number, row in enumerate(reader, start=2):
             if not _row_has_content(row):
                 continue
+
             processed += 1
             try:
                 with db.begin_nested():
@@ -218,6 +218,7 @@ def execute_import(
                         match_columns=resolved_match_columns,
                         ignore_blank_values=ignore_blank_values,
                     )
+
                 if outcome == "inserted":
                     inserted += 1
                     message = "Inserted"
@@ -227,12 +228,21 @@ def execute_import(
                 else:
                     skipped += 1
                     message = "Skipped"
+
                 _append_log(row_logs, row_number, outcome, message)
+
             except Exception as exc:
                 errors += 1
                 _append_log(row_logs, row_number, "error", str(exc))
                 if len(row_logs) >= IMPORT_LOG_LIMIT:
                     continue
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+    
 
     return {
         "import_id": import_id,
@@ -249,6 +259,7 @@ def execute_import(
         "finished_at": datetime.utcnow(),
     }
 
+    
 
 def _append_log(logs: list[dict[str, Any]], row_number: int, action: str, message: str) -> None:
     if len(logs) >= IMPORT_LOG_LIMIT:
