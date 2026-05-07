@@ -230,7 +230,7 @@ export interface ImportPreview {
 
 export interface ImportRowLog {
   row_number: number;
-  outcome: "inserted" | "updated" | "skipped" | "error";
+  action: "inserted" | "updated" | "skipped" | "error";
   message: string;
 }
 
