@@ -12,10 +12,6 @@ from .routers_auth import router as auth_router
 from .routers_portfolio import router as portfolio_router
 from .routers_stocks import router as stocks_router
 from .routers_watchlists import router as watchlists_router
-from .routers_accounts import router as accounts_router
-from .routers_orders import (
-    orders_router, positions_router, instruments_router,
-)
 
 log = configure_logging("api")
 settings = get_settings()
@@ -41,8 +37,4 @@ app.include_router(auth_router)
 app.include_router(stocks_router)
 app.include_router(watchlists_router)
 app.include_router(portfolio_router)
-app.include_router(accounts_router)
-app.include_router(orders_router)
-app.include_router(positions_router)
-app.include_router(instruments_router)
 app.include_router(admin_router)
