@@ -19,13 +19,19 @@ Sub-scores
   risk_score        : penalty (high beta, drawdown, low free-float)
 
 Composite = sum(weight_i * sub_score_i) - weight_risk * risk_score
+
+Model version
+-------------
+Bump MODEL_VERSION whenever weights, thresholds, or sub-score logic change so
+historical recommendations stay attributable to the model that produced them.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Optional
 
+
+MODEL_VERSION = "v1.1"
 
 WEIGHTS = {
     "fundamental": 0.20,
@@ -50,6 +56,21 @@ def to_float(x) -> Optional[float]:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _normalise_pct(x: Optional[float]) -> Optional[float]:
+    """Defensive percent-vs-fraction normalisation.
+
+    Many ingestion paths get this wrong: they compute (target - price) / price
+    which yields 0.14 (a fraction), then store it in a column whose downstream
+    consumers expect it to mean "14 percent". When abs(x) <= 1 we treat it as a
+    fraction and multiply by 100. This is safe because no real analyst-upside
+    value is ever between -1% and +1% for a stock anyone screens (and if it is,
+    a single-percent rounding error doesn't change the verdict).
+    """
+    if x is None:
+        return None
+    return x * 100 if -1.0 <= x <= 1.0 else x
 
 
 @dataclass
@@ -118,9 +139,16 @@ def score_fundamental(m: StockMetrics, pros: list[str], cons: list[str]) -> floa
         elif m.revenue_growth_pct < 0: cons.append(f"Revenue declining ({m.revenue_growth_pct:.1f}%)")
 
     if m.net_margin_pct is not None:
-        s = clamp(m.net_margin_pct * 3)  # 33% margin = 100
+        # 33% margin = 100 by default; cap reward when margin > 50% which
+        # almost always indicates a financial / investment company whose net
+        # margin isn't comparable to industrial peers (e.g. WAHA's investment-
+        # gain-driven 65% margin).
+        if m.net_margin_pct > 50:
+            s = 80.0
+        else:
+            s = clamp(m.net_margin_pct * 3)
         parts.append(s)
-        if m.net_margin_pct > 20: pros.append(f"High net margin ({m.net_margin_pct:.1f}%)")
+        if 20 < m.net_margin_pct <= 50: pros.append(f"High net margin ({m.net_margin_pct:.1f}%)")
         elif m.net_margin_pct < 5: cons.append(f"Thin net margin ({m.net_margin_pct:.1f}%)")
 
     if m.roe_pct is not None:
@@ -140,10 +168,15 @@ def score_valuation(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
     parts: list[float] = []
 
     if m.pe_ratio is not None and m.pe_ratio > 0:
-        # PE of 15 ≈ 80, PE of 30 ≈ 50, PE of 60 ≈ 20
-        s = 100 - clamp((m.pe_ratio - 10) * 2)
+        # PE of 15 ≈ 80, PE of 30 ≈ 50, PE of 60 ≈ 20.
+        # Cap "too cheap" reward — PE under ~5 usually indicates one-off
+        # earnings spikes or distress; don't max the score on those.
+        if m.pe_ratio < 5:
+            s = 75.0
+        else:
+            s = 100 - clamp((m.pe_ratio - 10) * 2)
         parts.append(clamp(s))
-        if m.pe_ratio < 12: pros.append(f"Cheap on P/E ({m.pe_ratio:.1f})")
+        if 5 <= m.pe_ratio < 12: pros.append(f"Cheap on P/E ({m.pe_ratio:.1f})")
         elif m.pe_ratio > 35: cons.append(f"Expensive on P/E ({m.pe_ratio:.1f})")
 
     if m.pb_ratio is not None and m.pb_ratio > 0:
@@ -230,12 +263,14 @@ def score_analyst(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         if s >= 75: pros.append(f"Analyst consensus: {m.analyst_rating}")
         elif s <= 25: cons.append(f"Analyst consensus: {m.analyst_rating}")
 
-    if m.analyst_upside_pct is not None:
+    # Auto-correct fraction-vs-percent: incoming 0.14 means "14%", not "0.14%".
+    upside = _normalise_pct(m.analyst_upside_pct)
+    if upside is not None:
         # +30% upside = 95, 0% = 50, -20% = 10
-        s = clamp(50 + m.analyst_upside_pct * 1.5)
+        s = clamp(50 + upside * 1.5)
         parts.append(s)
-        if m.analyst_upside_pct > 20: pros.append(f"Analyst upside +{m.analyst_upside_pct:.1f}%")
-        elif m.analyst_upside_pct < -10: cons.append(f"Analyst downside {m.analyst_upside_pct:.1f}%")
+        if upside > 20: pros.append(f"Analyst upside +{upside:.1f}%")
+        elif upside < -10: cons.append(f"Analyst downside {upside:.1f}%")
 
     if m.analyst_count is not None and m.analyst_count >= 5:
         # boost confidence when many analysts cover the name
@@ -249,11 +284,16 @@ def score_quality(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
     parts: list[float] = []
 
     if m.debt_to_equity is not None:
-        # 0 = 100, 1 = 60, 2 = 30, 3+ = 10
-        s = clamp(100 - m.debt_to_equity * 30)
+        # Negative-equity (insolvency) — deeply punitive.
+        if m.debt_to_equity < 0:
+            s = 5.0
+            cons.append("Negative equity — solvency risk")
+        else:
+            # 0 = 100, 1 = 60, 2 = 30, 3+ = 10
+            s = clamp(100 - m.debt_to_equity * 30)
+            if m.debt_to_equity < 0.3: pros.append(f"Low leverage (D/E {m.debt_to_equity:.2f})")
+            elif m.debt_to_equity > 2: cons.append(f"High leverage (D/E {m.debt_to_equity:.2f})")
         parts.append(s)
-        if m.debt_to_equity < 0.3: pros.append(f"Low leverage (D/E {m.debt_to_equity:.2f})")
-        elif m.debt_to_equity > 2: cons.append(f"High leverage (D/E {m.debt_to_equity:.2f})")
 
     if m.current_ratio is not None:
         # 1.5-3 sweet spot
