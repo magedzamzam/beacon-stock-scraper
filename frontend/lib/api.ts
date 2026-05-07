@@ -403,7 +403,8 @@ export const api = {
       `/instruments/search/${broker_code}?q=${encodeURIComponent(q)}`,
     ),
   // ===== CSV import (admin) =====
-  adminImportCatalog: () => request<ImportTable[]>("/admin/import/catalog"),
+  adminImportCatalog: () =>
+    request<ImportTable[]>("/admin/import/catalog").then((tables) => ({ tables })),
 
   adminImportPreview: async (file: File): Promise<ImportPreview> => {
     const fd = new FormData();
