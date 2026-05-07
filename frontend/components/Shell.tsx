@@ -3,7 +3,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import {
-  LayoutDashboard, Search, Briefcase, Star, Shield, LogOut, LogIn, User as UserIcon, Activity,
+  LayoutDashboard, Search, Briefcase, Star, Shield, LogOut, LogIn, User as UserIcon, Activity, Settings,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-store";
 import { cn } from "@/lib/utils";
@@ -13,6 +13,7 @@ const NAV = [
   { href: "/screener", label: "Screener", icon: Search },
   { href: "/portfolio", label: "Portfolio", icon: Briefcase },
   { href: "/watchlists", label: "Watchlists", icon: Star },
+  { href: "/profile", label: "Profile", icon: Settings },
 ];
 
 export default function Shell({ children }: { children: React.ReactNode }) {
@@ -102,7 +103,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
 
       {/* Mobile bottom nav */}
       <div className="md:hidden fixed bottom-0 inset-x-0 z-40 border-t border-border bg-bg-card">
-        <div className="grid grid-cols-4">
+        <div className="grid grid-cols-5">
           {NAV.map((n) => {
             const Active = pathname === n.href || (n.href !== "/" && pathname?.startsWith(n.href));
             const Icon = n.icon;

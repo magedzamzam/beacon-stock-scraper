@@ -11,7 +11,7 @@ import { useAuth } from "@/lib/auth-store";
 import { fmtNumber, fmtPercent, fmtMoney, fmtPrice, fmtDate, changeColor, sentimentBadgeClass } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import {
-  RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2,
+  RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2, ShoppingCart, Link2,
 } from "lucide-react";
 
 export default function StockDetailPage() {
@@ -20,6 +20,8 @@ export default function StockDetailPage() {
   const ticker = p.ticker.toUpperCase();
   const [refreshing, setRefreshing] = useState(false);
   const [overriding, setOverriding] = useState(false);
+  const [ordering, setOrdering] = useState(false);
+  const [mapping, setMapping] = useState(false);
   const { user } = useAuth();
 
   const { data: stock } = useSWR(["stock", exchange, ticker], () => api.stockDetail(exchange, ticker));
@@ -106,6 +108,11 @@ export default function StockDetailPage() {
               <Settings2 className="size-4" /> Override
             </button>
           )}
+          {user?.is_admin && (
+            <button className="btn-ghost" onClick={() => setMapping(true)}>
+              <Link2 className="size-4" /> Map symbol
+            </button>
+          )}
           <div className="relative group">
             <button className="btn-ghost"><Star className="size-4" /> Watchlist</button>
             <div className="absolute right-0 mt-1 w-56 card p-1.5 hidden group-hover:block z-10">
@@ -118,7 +125,9 @@ export default function StockDetailPage() {
               {!watchlists?.length && <div className="px-3 py-2 text-xs text-ink-muted">No watchlists</div>}
             </div>
           </div>
-          <button className="btn-primary" onClick={addPosition}><Plus className="size-4" /> Add Position</button>
+          <button className="btn-primary" onClick={() => setOrdering(true)}>
+            <ShoppingCart className="size-4" /> Place order
+          </button>
         </div>
       </header>
 
@@ -292,6 +301,27 @@ export default function StockDetailPage() {
           }}
         />
       )}
+
+      {ordering && stock && (
+        <PlaceOrderModal
+          stockId={stock.id}
+          ticker={stock.ticker}
+          companyName={stock.company_name}
+          currency={stock.currency || ""}
+          lastClose={stock.last_close}
+          onClose={() => setOrdering(false)}
+          onSaved={() => { setOrdering(false); }}
+        />
+      )}
+
+      {mapping && stock && user?.is_admin && (
+        <InstrumentMapModal
+          stockId={stock.id}
+          ticker={stock.ticker}
+          companyName={stock.company_name}
+          onClose={() => setMapping(false)}
+        />
+      )}
     </div>
   );
 }
@@ -420,6 +450,381 @@ function Sub({ label, value, invert = false }: { label: string; value: number; i
       </div>
       <div className="mt-1 h-1 bg-bg-elevated rounded overflow-hidden">
         <div className={`h-full ${color}`} style={{ width: `${Math.max(2, Math.min(100, v))}%` }} />
+      </div>
+    </div>
+  );
+}
+
+
+/* ============================================================================
+   PlaceOrderModal — order placement for any account, manual or automated.
+
+   Behaviour:
+     1. Loads the user's accounts and the broker mappings for this stock.
+     2. Per account, decides whether the stock is tradeable:
+          - Manual accounts are always tradeable (user can record any trade).
+          - Automated accounts only if there's a broker_instrument mapping.
+     3. Shows MARKET / LIMIT / STOP picker; LIMIT/STOP require a price.
+     4. On submit, calls /orders. The API decides whether to forward to
+        broker_gateway (automated) or just record the row (manual).
+   ============================================================================ */
+function PlaceOrderModal({
+  stockId, ticker, companyName, currency, lastClose, onClose, onSaved,
+}: {
+  stockId: number;
+  ticker: string;
+  companyName: string;
+  currency: string;
+  lastClose: number | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { data: accounts } = useSWR("accounts", () => api.listAccounts());
+  const { data: instruments } = useSWR(["instruments", stockId], () => api.instrumentsForStock(stockId));
+
+  const [accountId, setAccountId] = useState<number | "">("");
+  const [side, setSide] = useState<"BUY" | "SELL">("BUY");
+  const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "STOP">("MARKET");
+  const [quantity, setQuantity] = useState<string>("");
+  const [limitPrice, setLimitPrice] = useState<string>("");
+  const [stopLoss, setStopLoss] = useState<string>("");
+  const [takeProfit, setTakeProfit] = useState<string>("");
+  const [notes, setNotes] = useState<string>("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Pre-default a price for LIMIT/STOP from the last close so users don't start blank.
+  const defaultPrice = lastClose ? String(lastClose) : "";
+
+  // Build the per-account "tradeable here?" map.
+  // For automated accounts: tradeable iff a broker_instruments row exists.
+  // For manual accounts: always tradeable (we record whatever the user types).
+  const tradeableMap = new Map<number, { tradeable: boolean; brokerSymbol: string | null }>();
+  (accounts || []).forEach(acct => {
+    if (acct.broker_kind === "manual") {
+      tradeableMap.set(acct.id, { tradeable: true, brokerSymbol: null });
+      return;
+    }
+    const match = (instruments || []).find(i => i.broker_code === acct.broker_code);
+    tradeableMap.set(acct.id, {
+      tradeable: !!match,
+      brokerSymbol: match ? match.broker_symbol : null,
+    });
+  });
+
+  const selectedAcct = accounts?.find(a => a.id === accountId);
+  const selectedTradeable = accountId ? tradeableMap.get(Number(accountId)) : null;
+
+  async function submit() {
+    setError(null);
+    if (!accountId) { setError("Pick an account"); return; }
+    if (!quantity || Number(quantity) <= 0) { setError("Quantity must be > 0"); return; }
+    if ((orderType === "LIMIT" || orderType === "STOP") && !limitPrice) {
+      setError(`${orderType} order needs a price`);
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.placeOrder({
+        account_id: Number(accountId),
+        stock_id: stockId,
+        broker_symbol: selectedTradeable?.brokerSymbol || undefined,
+        side,
+        order_type: orderType,
+        quantity: Number(quantity),
+        limit_price: limitPrice ? Number(limitPrice) : undefined,
+        stop_loss: stopLoss ? Number(stopLoss) : undefined,
+        take_profit: takeProfit ? Number(takeProfit) : undefined,
+        notes: notes.trim() || undefined,
+      });
+      onSaved();
+    } catch (e: any) {
+      setError(e.message || "Order failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="card p-5 w-full max-w-md" onClick={e => e.stopPropagation()}>
+        <h3 className="font-semibold mb-1">Place order · {ticker}</h3>
+        <p className="text-xs text-ink-dim mb-4">{companyName}</p>
+
+        <div className="space-y-3">
+          {/* Account picker */}
+          <div>
+            <label className="label">Account</label>
+            {!accounts?.length ? (
+              <div className="text-sm text-ink-muted mt-1">
+                No accounts yet. Add one in <a href="/profile" className="underline">Profile</a>.
+              </div>
+            ) : (
+              <select className="input mt-1" value={accountId}
+                      onChange={e => setAccountId(e.target.value ? Number(e.target.value) : "")}>
+                <option value="">— Select an account —</option>
+                {accounts.map(a => {
+                  const m = tradeableMap.get(a.id);
+                  const ok = m?.tradeable;
+                  return (
+                    <option key={a.id} value={a.id} disabled={!ok}>
+                      {a.label} ({a.broker_name}) {!ok ? "— not tradeable here" : ""}
+                    </option>
+                  );
+                })}
+              </select>
+            )}
+            {selectedAcct && selectedTradeable && (
+              <div className="text-xs text-ink-dim mt-1">
+                {selectedAcct.broker_kind === "manual"
+                  ? "Manual account — this order will be recorded as filled."
+                  : (selectedTradeable.brokerSymbol
+                      ? <>Will route as <code className="px-1 rounded bg-bg-elevated">{selectedTradeable.brokerSymbol}</code> on {selectedAcct.broker_name}.</>
+                      : "This stock isn't mapped to a broker symbol on this account.")
+                }
+              </div>
+            )}
+          </div>
+
+          {/* Side */}
+          <div>
+            <label className="label">Side</label>
+            <div className="grid grid-cols-2 gap-2 mt-1">
+              <button type="button"
+                      className={`btn-ghost justify-center ${side === "BUY" ? "ring-2 ring-verdict-buy" : ""}`}
+                      onClick={() => setSide("BUY")}>BUY</button>
+              <button type="button"
+                      className={`btn-ghost justify-center ${side === "SELL" ? "ring-2 ring-verdict-avoid" : ""}`}
+                      onClick={() => setSide("SELL")}>SELL</button>
+            </div>
+          </div>
+
+          {/* Order type */}
+          <div>
+            <label className="label">Order type</label>
+            <div className="grid grid-cols-3 gap-2 mt-1">
+              {(["MARKET", "LIMIT", "STOP"] as const).map(t => (
+                <button key={t} type="button"
+                        className={`btn-ghost justify-center ${orderType === t ? "ring-2 ring-brand" : ""}`}
+                        onClick={() => {
+                          setOrderType(t);
+                          if (t !== "MARKET" && !limitPrice) setLimitPrice(defaultPrice);
+                        }}>{t}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Quantity + price */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label">Quantity</label>
+              <input type="number" min="0" step="0.0001" className="input mt-1"
+                     value={quantity} onChange={e => setQuantity(e.target.value)} />
+            </div>
+            {orderType !== "MARKET" && (
+              <div>
+                <label className="label">{orderType} price{currency && ` (${currency})`}</label>
+                <input type="number" step="0.0001" className="input mt-1"
+                       value={limitPrice} onChange={e => setLimitPrice(e.target.value)} />
+              </div>
+            )}
+          </div>
+
+          {/* Optional SL/TP */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label">Stop loss (optional)</label>
+              <input type="number" step="0.0001" className="input mt-1"
+                     value={stopLoss} onChange={e => setStopLoss(e.target.value)} />
+            </div>
+            <div>
+              <label className="label">Take profit (optional)</label>
+              <input type="number" step="0.0001" className="input mt-1"
+                     value={takeProfit} onChange={e => setTakeProfit(e.target.value)} />
+            </div>
+          </div>
+
+          <div>
+            <label className="label">Notes (optional)</label>
+            <input type="text" className="input mt-1" maxLength={200}
+                   value={notes} onChange={e => setNotes(e.target.value)} />
+          </div>
+
+          {error && <div className="text-sm text-verdict-avoid">{error}</div>}
+        </div>
+
+        <div className="flex gap-2 justify-end mt-4">
+          <button className="btn-ghost" onClick={onClose} disabled={submitting}>Cancel</button>
+          <button className="btn-primary" onClick={submit} disabled={submitting || !accountId}>
+            {submitting ? "Placing…" : `Place ${side} order`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* ============================================================================
+   InstrumentMapModal — admin: map this stock to a broker symbol.
+
+   Lists existing mappings plus an "Add" form. For automated brokers, an
+   inline search box queries the broker's catalog so the admin doesn't have
+   to know the epic by heart.
+   ============================================================================ */
+function InstrumentMapModal({
+  stockId, ticker, companyName, onClose,
+}: { stockId: number; ticker: string; companyName: string; onClose: () => void }) {
+  const { data: brokers } = useSWR("brokers", () => api.listBrokers());
+  const { data: existing, mutate: refreshExisting } = useSWR(
+    ["instruments", stockId], () => api.instrumentsForStock(stockId),
+  );
+
+  const [brokerCode, setBrokerCode] = useState<string>("");
+  const [symbol, setSymbol] = useState<string>("");
+  const [searchQ, setSearchQ] = useState<string>(companyName.split(" ")[0] || ticker);
+  const [searching, setSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const chosenBroker = brokers?.find(b => b.code === brokerCode);
+
+  async function runSearch() {
+    if (!brokerCode || chosenBroker?.kind !== "automated") {
+      setSearchResults([]);
+      return;
+    }
+    setSearching(true); setError(null);
+    try {
+      const r = await api.searchBrokerInstruments(brokerCode, searchQ);
+      setSearchResults(r);
+    } catch (e: any) {
+      setError(e.message || "Search failed");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function save(useSymbol?: string) {
+    setError(null);
+    const sym = (useSymbol || symbol).trim();
+    if (!brokerCode || !sym) { setError("Broker and symbol are required"); return; }
+    setSubmitting(true);
+    try {
+      await api.upsertInstrument({
+        broker_code: brokerCode,
+        broker_symbol: sym,
+        stock_id: stockId,
+        is_tradeable: true,
+      });
+      setSymbol("");
+      refreshExisting();
+    } catch (e: any) {
+      setError(e.message || "Save failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function remove(broker_code: string, broker_symbol: string) {
+    if (!confirm(`Remove ${broker_code}:${broker_symbol} mapping?`)) return;
+    await api.deleteInstrument(broker_code, broker_symbol);
+    refreshExisting();
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="card p-5 w-full max-w-2xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <h3 className="font-semibold mb-1">Broker symbol mapping · {ticker}</h3>
+        <p className="text-xs text-ink-dim mb-4">
+          Map this stock to a broker's instrument so users can place orders on it.
+        </p>
+
+        {/* Existing mappings */}
+        <div className="mb-5">
+          <div className="text-xs uppercase tracking-wider text-ink-dim mb-2">Current mappings</div>
+          {existing?.length === 0 ? (
+            <div className="text-sm text-ink-muted">No mappings yet — add one below.</div>
+          ) : (
+            <div className="space-y-1">
+              {existing?.map(m => (
+                <div key={`${m.broker_code}-${m.broker_symbol}`}
+                     className="flex items-center justify-between rounded-md bg-bg-subtle px-3 py-2">
+                  <div className="text-sm">
+                    <span className="font-medium">{m.broker_name}</span>
+                    {" → "}
+                    <code className="px-1.5 py-0.5 rounded bg-bg-elevated text-xs">{m.broker_symbol}</code>
+                    {m.currency && <span className="text-ink-dim ml-2 text-xs">{m.currency}</span>}
+                  </div>
+                  <button className="btn-ghost" onClick={() => remove(m.broker_code, m.broker_symbol)}>Remove</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Add form */}
+        <div className="border-t border-border pt-4">
+          <div className="text-xs uppercase tracking-wider text-ink-dim mb-2">Add mapping</div>
+          <div className="space-y-3">
+            <div>
+              <label className="label">Broker</label>
+              <select className="input mt-1" value={brokerCode}
+                      onChange={e => { setBrokerCode(e.target.value); setSearchResults([]); }}>
+                <option value="">— Select broker —</option>
+                {brokers?.map(b => (
+                  <option key={b.code} value={b.code}>{b.name} ({b.kind})</option>
+                ))}
+              </select>
+            </div>
+
+            {chosenBroker?.kind === "automated" && (
+              <div>
+                <label className="label">Search broker catalog</label>
+                <div className="flex gap-2 mt-1">
+                  <input type="text" className="input flex-1" value={searchQ}
+                         onChange={e => setSearchQ(e.target.value)}
+                         placeholder="Company name or ticker" />
+                  <button className="btn-ghost" onClick={runSearch} disabled={searching}>
+                    {searching ? "…" : "Search"}
+                  </button>
+                </div>
+                {searchResults.length > 0 && (
+                  <div className="mt-2 max-h-44 overflow-y-auto rounded-md border border-border">
+                    {searchResults.map(r => (
+                      <button key={r.broker_symbol} type="button"
+                              className="w-full text-left px-3 py-2 text-sm hover:bg-bg-elevated border-b border-border last:border-0"
+                              onClick={() => save(r.broker_symbol)}
+                              disabled={submitting}>
+                        <div className="flex items-center justify-between">
+                          <span><code className="text-xs px-1 rounded bg-bg-elevated">{r.broker_symbol}</code> · {r.name}</span>
+                          <span className="text-xs text-ink-dim">{r.instrument_type} {r.currency && `· ${r.currency}`}</span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div>
+              <label className="label">Or enter symbol manually</label>
+              <div className="flex gap-2 mt-1">
+                <input type="text" className="input flex-1" value={symbol}
+                       onChange={e => setSymbol(e.target.value)}
+                       placeholder="e.g. AAPL, GOLD" />
+                <button className="btn-primary" onClick={() => save()} disabled={submitting}>Save</button>
+              </div>
+            </div>
+
+            {error && <div className="text-sm text-verdict-avoid">{error}</div>}
+          </div>
+        </div>
+
+        <div className="flex justify-end mt-5">
+          <button className="btn-ghost" onClick={onClose}>Close</button>
+        </div>
       </div>
     </div>
   );

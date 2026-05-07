@@ -8,6 +8,7 @@ COPY services/api/requirements.txt /app/api/requirements.txt
 RUN pip install -r /app/api/requirements.txt
 
 COPY services/shared /app/shared
+COPY services/brokers /app/brokers
 COPY services/api /app/api
 
 ENV PYTHONPATH=/app

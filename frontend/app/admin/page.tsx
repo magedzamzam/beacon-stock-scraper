@@ -5,7 +5,6 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-store";
 import { fmtDate } from "@/lib/utils";
 import { RefreshCw, PlayCircle, Brain, Briefcase, Database } from "lucide-react";
-import AdminCsvImportTool from "@/components/AdminCsvImportTool";
 
 export default function AdminPage() {
   const { user } = useAuth();
@@ -60,8 +59,6 @@ export default function AdminPage() {
           The scheduler runs the full pipeline daily at 11:00 Asia/Dubai. Use these for manual reruns.
         </p>
       </div>
-
-      <AdminCsvImportTool />
 
       <div className="card overflow-hidden">
         <div className="px-4 py-3 border-b border-border font-medium text-sm">Recent scrape runs</div>
