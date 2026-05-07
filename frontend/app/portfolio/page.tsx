@@ -3,7 +3,7 @@ import Link from "next/link";
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
 import { api } from "@/lib/api";
-import { fmtMoney, fmtNumber, fmtPercent, changeColor } from "@/lib/utils";
+import { fmtMoney, fmtNumber, fmtPercent, fmtPrice, changeColor } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import { Plus, Trash2, Briefcase, TrendingUp, Wallet } from "lucide-react";
 
@@ -71,10 +71,10 @@ export default function PortfolioPage() {
                     </Link>
                   </td>
                   <td className="p-3 text-right font-mono">{fmtNumber(p.quantity, { digits: 0 })}</td>
-                  <td className="p-3 text-right font-mono">{fmtNumber(p.avg_entry_price)}</td>
-                  <td className="p-3 text-right font-mono">{fmtNumber(p.stock.last_close)}</td>
+                  <td className="p-3 text-right font-mono">{fmtPrice(p.avg_entry_price, p.stock.currency)}</td>
+                  <td className="p-3 text-right font-mono">{fmtPrice(p.stock.last_close, p.stock.currency)}</td>
                   <td className={`p-3 text-right font-mono ${changeColor(p.unrealized_pl_pct)}`}>
-                    <div>{fmtNumber(p.unrealized_pl)}</div>
+                    <div>{fmtPrice(p.unrealized_pl, p.stock.currency)}</div>
                     <div className="text-xs">{fmtPercent(p.unrealized_pl_pct)}</div>
                   </td>
                   <td className="p-3 text-right"><VerdictBadge verdict={p.stock.verdict} size="xs" /></td>

@@ -21,7 +21,30 @@ export function fmtPercent(n: number | null | undefined, digits = 2) {
 
 export function fmtMoney(n: number | null | undefined, currency = "AED", compact = false) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
-  return `${currency} ${fmtNumber(n, { digits: 2, compact })}`;
+  const code = (currency || "").trim();
+  const formatted = fmtNumber(n, { digits: 2, compact });
+  return code ? `${code} ${formatted}` : formatted;
+}
+
+/**
+ * Format a price with its currency, e.g. fmtPrice(1.87, 'AED') -> 'AED 1.87'.
+ * Drops the prefix when no currency is known so we never print 'undefined 1.87'.
+ */
+export function fmtPrice(n: number | null | undefined, currency: string | null | undefined, opts?: { digits?: number; compact?: boolean }) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  const code = (currency || "").trim();
+  const formatted = fmtNumber(n, { digits: opts?.digits ?? 2, compact: opts?.compact });
+  return code ? `${code} ${formatted}` : formatted;
+}
+
+/** Pleasant CSS class for sentiment label badges. */
+export function sentimentBadgeClass(label: string | null | undefined): string {
+  switch ((label || "").toLowerCase()) {
+    case "positive": return "badge bg-verdict-buy/15 text-verdict-buy ring-1 ring-verdict-buy/30";
+    case "negative": return "badge bg-verdict-avoid/15 text-verdict-avoid ring-1 ring-verdict-avoid/30";
+    case "neutral":  return "badge bg-bg-elevated text-ink-muted ring-1 ring-border";
+    default: return "";
+  }
 }
 
 export function fmtDate(s: string | null | undefined) {

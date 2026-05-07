@@ -132,6 +132,70 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
     )
 
 
+def _score_and_persist(session, stock_id: int, today: date) -> str:
+    """Score one stock, upsert recommendation + snapshot, return verdict.
+
+    Caller owns the session lifecycle (commit/rollback). Used both by score_all
+    and by the per-stock /score/single endpoint that admins hit after manual
+    overrides so the verdict reflects the new inputs immediately.
+    """
+    metrics = gather_metrics(session, stock_id)
+    result = compute_score(metrics)
+
+    stmt = pg_insert(StockRecommendation).values(
+        stock_id=stock_id,
+        score_date=today,
+        fundamental_score=result.fundamental,
+        valuation_score=result.valuation,
+        momentum_score=result.momentum,
+        technical_score=result.technical,
+        analyst_score=result.analyst,
+        quality_score=result.quality,
+        risk_score=result.risk,
+        composite_score=result.composite,
+        verdict=result.verdict,
+        reasoning={"pros": result.pros, "cons": result.cons},
+        model_version="v1.1",
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id", "score_date"],
+        set_={
+            "fundamental_score": stmt.excluded.fundamental_score,
+            "valuation_score":   stmt.excluded.valuation_score,
+            "momentum_score":    stmt.excluded.momentum_score,
+            "technical_score":   stmt.excluded.technical_score,
+            "analyst_score":     stmt.excluded.analyst_score,
+            "quality_score":     stmt.excluded.quality_score,
+            "risk_score":        stmt.excluded.risk_score,
+            "composite_score":   stmt.excluded.composite_score,
+            "verdict":           stmt.excluded.verdict,
+            "reasoning":         stmt.excluded.reasoning,
+        },
+    )
+    session.execute(stmt)
+
+    snap_stmt = pg_insert(StockLatestSnapshot).values(
+        stock_id=stock_id,
+        composite_score=result.composite,
+        verdict=result.verdict,
+    ).on_conflict_do_update(
+        index_elements=["stock_id"],
+        set_={"composite_score": result.composite, "verdict": result.verdict},
+    )
+    session.execute(snap_stmt)
+
+    return result.verdict
+
+
+def score_one(stock_id: int) -> dict:
+    """Public single-stock scoring entrypoint. Returns the new verdict."""
+    today = date.today()
+    with SessionLocal() as session:
+        verdict = _score_and_persist(session, stock_id, today)
+        session.commit()
+    return {"stock_id": stock_id, "verdict": verdict}
+
+
 def score_all() -> dict:
     today = date.today()
     counts = {"BUY": 0, "WATCH": 0, "STAY_AWAY": 0, "errors": 0}
@@ -144,54 +208,9 @@ def score_all() -> dict:
     for stock_id in stock_ids:
         try:
             with SessionLocal() as session:
-                metrics = gather_metrics(session, stock_id)
-                result = compute_score(metrics)
-
-                stmt = pg_insert(StockRecommendation).values(
-                    stock_id=stock_id,
-                    score_date=today,
-                    fundamental_score=result.fundamental,
-                    valuation_score=result.valuation,
-                    momentum_score=result.momentum,
-                    technical_score=result.technical,
-                    analyst_score=result.analyst,
-                    quality_score=result.quality,
-                    risk_score=result.risk,
-                    composite_score=result.composite,
-                    verdict=result.verdict,
-                    reasoning={"pros": result.pros, "cons": result.cons},
-                    model_version="v1",
-                )
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["stock_id", "score_date"],
-                    set_={
-                        "fundamental_score": stmt.excluded.fundamental_score,
-                        "valuation_score":   stmt.excluded.valuation_score,
-                        "momentum_score":    stmt.excluded.momentum_score,
-                        "technical_score":   stmt.excluded.technical_score,
-                        "analyst_score":     stmt.excluded.analyst_score,
-                        "quality_score":     stmt.excluded.quality_score,
-                        "risk_score":        stmt.excluded.risk_score,
-                        "composite_score":   stmt.excluded.composite_score,
-                        "verdict":           stmt.excluded.verdict,
-                        "reasoning":         stmt.excluded.reasoning,
-                    },
-                )
-                session.execute(stmt)
-
-                # update snapshot
-                snap_stmt = pg_insert(StockLatestSnapshot).values(
-                    stock_id=stock_id,
-                    composite_score=result.composite,
-                    verdict=result.verdict,
-                ).on_conflict_do_update(
-                    index_elements=["stock_id"],
-                    set_={"composite_score": result.composite, "verdict": result.verdict},
-                )
-                session.execute(snap_stmt)
-
+                verdict = _score_and_persist(session, stock_id, today)
                 session.commit()
-                counts[result.verdict] += 1
+                counts[verdict] += 1
         except Exception as exc:
             log.exception("score_failed", stock_id=stock_id, error=str(exc))
             counts["errors"] += 1

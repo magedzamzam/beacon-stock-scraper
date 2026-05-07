@@ -35,7 +35,7 @@ from .fetcher import HttpFetcher
 from .parsers import (
     extract_label_value_pairs, extract_company_blurb, extract_news,
     build_market_daily, build_valuation, build_financials_ttm,
-    build_technicals, extract_close_price,
+    build_technicals, extract_close_price, extract_change_pct, extract_currency,
 )
 
 log = configure_logging("scraper")
@@ -195,6 +195,8 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
     close_price = extract_close_price(pairs, overview_html or "")
     if close_price is not None:
         market["close_price"] = close_price
+    change_pct = extract_change_pct(overview_html or "")
+    currency = extract_currency(pairs, overview_html or "")
 
     with SessionLocal() as session:
         try:
@@ -204,6 +206,10 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
                 return
 
             _update_stock_metadata(session, stock, blurb)
+            # Persist currency on the stock row when the page provides it.
+            if currency and stock.currency != currency:
+                stock.currency = currency
+                stock.updated_at = datetime.utcnow()
 
             if any(v is not None for v in market.values()):
                 _upsert_market_daily(session, stock_id, today, market)
@@ -221,6 +227,7 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
 
             _upsert_snapshot(session, stock_id, {
                 "last_close": market.get("close_price"),
+                "last_change_pct": change_pct,
                 "market_cap": market.get("market_cap"),
                 "pe_ratio": market.get("pe_ratio"),
                 "dividend_yield_pct": market.get("dividend_yield_pct"),

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 import { useSearchParams } from "next/navigation";
 import { api, type ScreenerParams, type Verdict } from "@/lib/api";
-import { fmtNumber, fmtPercent, changeColor } from "@/lib/utils";
+import { fmtNumber, fmtPercent, fmtPrice, changeColor } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import { Search, ArrowUp, ArrowDown, X } from "lucide-react";
 
@@ -158,9 +158,9 @@ export default function ScreenerPage() {
                         <div className="text-xs text-ink-muted truncate max-w-[260px]">{s.company_name}</div>
                       </Link>
                     </td>
-                    <td className="p-3 text-right font-mono">{fmtNumber(s.last_close)}</td>
+                    <td className="p-3 text-right font-mono">{fmtPrice(s.last_close, s.currency)}</td>
                     <td className={`p-3 text-right font-mono ${changeColor(s.last_change_pct)}`}>{fmtPercent(s.last_change_pct)}</td>
-                    <td className="p-3 text-right font-mono">{fmtNumber(s.market_cap, { compact: true, digits: 1 })}</td>
+                    <td className="p-3 text-right font-mono">{fmtPrice(s.market_cap, s.currency, { compact: true, digits: 1 })}</td>
                     <td className="p-3 text-right font-mono">{fmtNumber(s.pe_ratio)}</td>
                     <td className="p-3 text-right font-mono">{s.dividend_yield_pct != null ? `${s.dividend_yield_pct.toFixed(2)}%` : "—"}</td>
                     <td className="p-3 text-right font-mono">{fmtNumber(s.rsi_14, { digits: 1 })}</td>

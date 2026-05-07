@@ -24,6 +24,7 @@ services:
       API_CORS_ORIGINS: ${API_CORS_ORIGINS}
       SCRAPER_URL: http://scraper:8001
       RECOMMENDER_URL: http://recommender:8002
+      SENTIMENT_URL: http://sentiment:8003
     networks: [beacon-net]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
@@ -82,12 +83,39 @@ services:
       DAILY_SCRAPE_CRON: ${DAILY_SCRAPE_CRON}
       SCRAPER_URL: http://scraper:8001
       RECOMMENDER_URL: http://recommender:8002
+      SENTIMENT_URL: http://sentiment:8003
     depends_on:
       scraper:
         condition: service_healthy
       recommender:
         condition: service_healthy
+      sentiment:
+        condition: service_healthy
     networks: [beacon-net]
+
+  sentiment:
+    build:
+      context: .
+      dockerfile: services/sentiment/Dockerfile
+    image: beacon-sentiment:latest
+    restart: unless-stopped
+    dns: [1.1.1.1, 8.8.8.8]
+    environment:
+      <<: *python-env
+      SENTIMENT_MODEL: ProsusAI/finbert
+      SENTIMENT_BATCH_SIZE: "16"
+      SENTIMENT_DEFAULT_LIMIT: "200"
+      HF_HOME: /hf_cache
+    volumes:
+      - hf_cache:/hf_cache
+    networks: [beacon-net]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8003/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # First-time start can take a couple of minutes if the model isn't pre-baked.
+      start_period: 90s
 
   frontend:
     build:
@@ -133,3 +161,7 @@ services:
 networks:
   beacon-net:
     driver: bridge
+
+volumes:
+  hf_cache:
+    driver: local

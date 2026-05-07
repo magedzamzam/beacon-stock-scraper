@@ -3,7 +3,7 @@ import Link from "next/link";
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
 import { api } from "@/lib/api";
-import { fmtNumber, fmtPercent, changeColor } from "@/lib/utils";
+import { fmtNumber, fmtPercent, fmtPrice, changeColor } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import { Plus, Trash2, Star, X } from "lucide-react";
 
@@ -104,7 +104,7 @@ export default function WatchlistsPage() {
                             <div className="text-xs text-ink-muted truncate max-w-[260px]">{item.stock.company_name}</div>
                           </Link>
                         </td>
-                        <td className="p-3 text-right font-mono">{fmtNumber(item.stock.last_close)}</td>
+                        <td className="p-3 text-right font-mono">{fmtPrice(item.stock.last_close, item.stock.currency)}</td>
                         <td className={`p-3 text-right font-mono ${changeColor(item.stock.last_change_pct)}`}>{fmtPercent(item.stock.last_change_pct)}</td>
                         <td className="p-3 text-right font-mono">{fmtNumber(item.stock.rsi_14, { digits: 1 })}</td>
                         <td className="p-3 text-right font-mono font-semibold">{fmtNumber(item.stock.composite_score, { digits: 0 })}</td>

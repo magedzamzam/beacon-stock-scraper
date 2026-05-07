@@ -218,9 +218,28 @@ def build_technicals(pairs: dict[str, str]) -> dict:
 
 
 def extract_close_price(pairs: dict[str, str], html: str) -> Optional[Decimal]:
-    """Best-effort current price. The big number sits at the top of the page."""
+    """Extract the live header price from a stockanalysis.com quote page.
+
+    The header price has changed location over time; we try selectors in order
+    of increasing fragility so future redesigns degrade gracefully.
+
+    1. The current (Apr 2026) markup uses a <div class="text-4xl font-bold ..."> for
+       the header price. We match on the leading two utility classes only so a
+       Tailwind class reshuffle doesn't break us.
+    2. Otherwise, fall back to walking siblings of <h1> for the first numeric text.
+    3. Last resort: the "Previous Close" key/value pair (which is what the old
+       scraper was effectively returning — wrong, but better than nothing).
+    """
     soup = BeautifulSoup(html, "lxml")
-    # Header price is the first standalone numeric on the page after h1.
+
+    # 1) Modern markup
+    el = soup.select_one('.text-4xl.font-bold, [class*="text-4xl"][class*="font-bold"]')
+    if el:
+        v = parse_number(el.get_text(strip=True))
+        if v is not None and v > 0:
+            return v
+
+    # 2) Legacy fallback — first numeric after <h1>
     h1 = soup.find("h1")
     if h1:
         for sib in h1.find_all_next(string=True, limit=20):
@@ -230,7 +249,57 @@ def extract_close_price(pairs: dict[str, str], html: str) -> Optional[Decimal]:
             v = parse_number(cleaned)
             if v is not None and v > 0:
                 return v
+
+    # 3) Fallback to "Previous Close"
     return parse_number(pairs.get("Previous Close"))
+
+
+def extract_change_pct(html: str) -> Optional[Decimal]:
+    """Extract today's percentage change from the header.
+
+    The change figure sits next to the price in markup like
+        <div class="font-semibold inline-block text-2xl text-green-vivid">+0.100 (6.25%)</div>
+    or the equivalent red variant for declines.
+
+    We pull the parenthesised percent because that's what the rest of the
+    pipeline stores in stock_latest_snapshot.last_change_pct.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    candidates = soup.select(
+        '.text-2xl.text-green-vivid, .text-2xl.text-red-vivid, '
+        '[class*="text-2xl"][class*="text-green"], [class*="text-2xl"][class*="text-red"]'
+    )
+    for el in candidates:
+        text = el.get_text(" ", strip=True)
+        # e.g. "+0.100 (6.25%)" or "-0.250 (-2.41%)"
+        m = re.search(r"\(\s*([+-]?\d+(?:\.\d+)?)\s*%\s*\)", text)
+        if m:
+            try:
+                return Decimal(m.group(1))
+            except InvalidOperation:
+                continue
+        # Sometimes only the percent appears
+        m2 = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%", text)
+        if m2:
+            try:
+                return Decimal(m2.group(1))
+            except InvalidOperation:
+                continue
+    return None
+
+
+def extract_currency(pairs: dict[str, str], html: str) -> Optional[str]:
+    """Pick up 'Currency is AED' (or similar) from the page header.
+
+    The header reads e.g. 'United Arab Emirates · Delayed Price · Currency is AED'.
+    We only return when we see exactly that pattern so we never mis-classify.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+    m = re.search(r"Currency is\s+([A-Z]{3})\b", text)
+    if m:
+        return m.group(1)
+    return None
 
 
 # ---------- helpers ----------

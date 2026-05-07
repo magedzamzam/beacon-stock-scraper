@@ -7,10 +7,11 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, Radar, PolarRadiusAxis,
 } from "recharts";
 import { api } from "@/lib/api";
-import { fmtNumber, fmtPercent, fmtMoney, fmtDate, changeColor } from "@/lib/utils";
+import { useAuth } from "@/lib/auth-store";
+import { fmtNumber, fmtPercent, fmtMoney, fmtPrice, fmtDate, changeColor, sentimentBadgeClass } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import {
-  RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3,
+  RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2,
 } from "lucide-react";
 
 export default function StockDetailPage() {
@@ -18,6 +19,8 @@ export default function StockDetailPage() {
   const exchange = p.exchange.toLowerCase();
   const ticker = p.ticker.toUpperCase();
   const [refreshing, setRefreshing] = useState(false);
+  const [overriding, setOverriding] = useState(false);
+  const { user } = useAuth();
 
   const { data: stock } = useSWR(["stock", exchange, ticker], () => api.stockDetail(exchange, ticker));
   const { data: score } = useSWR(["score", exchange, ticker], () => api.stockScore(exchange, ticker));
@@ -89,7 +92,7 @@ export default function StockDetailPage() {
             {stock.ticker} <span className="text-ink-muted text-base font-normal">— {stock.company_name}</span>
           </h1>
           <div className="mt-2 flex items-baseline gap-3">
-            <div className="text-3xl font-semibold font-mono">{fmtNumber(stock.last_close)}</div>
+            <div className="text-3xl font-semibold font-mono">{fmtPrice(stock.last_close, stock.currency)}</div>
             <div className={`text-sm font-mono ${changeColor(stock.last_change_pct)}`}>{fmtPercent(stock.last_change_pct)}</div>
             {score && <VerdictBadge verdict={score.verdict} size="md" />}
           </div>
@@ -98,6 +101,11 @@ export default function StockDetailPage() {
           <button className="btn-ghost" onClick={refresh} disabled={refreshing}>
             <RefreshCw className={`size-4 ${refreshing ? "animate-spin" : ""}`} /> Refresh
           </button>
+          {user?.is_admin && (
+            <button className="btn-ghost" onClick={() => setOverriding(true)}>
+              <Settings2 className="size-4" /> Override
+            </button>
+          )}
           <div className="relative group">
             <button className="btn-ghost"><Star className="size-4" /> Watchlist</button>
             <div className="absolute right-0 mt-1 w-56 card p-1.5 hidden group-hover:block z-10">
@@ -121,7 +129,7 @@ export default function StockDetailPage() {
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold flex items-center gap-2"><BarChart3 className="size-4" /> 6-month price</h3>
               <div className="text-xs text-ink-muted">
-                52w: {fmtNumber(stock.week_52_low)} – {fmtNumber(stock.week_52_high)}
+                52w: {fmtPrice(stock.week_52_low, stock.currency)} – {fmtPrice(stock.week_52_high, stock.currency)}
               </div>
             </div>
             <div className="h-64">
@@ -140,7 +148,7 @@ export default function StockDetailPage() {
                   <Tooltip
                     contentStyle={{ background: "#111826", border: "1px solid #1f2a3d", borderRadius: 8, fontSize: 12 }}
                     labelFormatter={(v) => fmtDate(String(v))}
-                    formatter={(v: any) => [fmtNumber(v), "Close"]}
+                    formatter={(v: any) => [fmtPrice(Number(v), stock.currency), "Close"]}
                   />
                   <Area type="monotone" dataKey="close" stroke="#3b82f6" strokeWidth={2} fill="url(#priceGrad)" />
                 </AreaChart>
@@ -178,12 +186,20 @@ export default function StockDetailPage() {
                    className="block p-3 rounded-lg bg-bg-subtle hover:bg-bg-elevated transition-colors">
                   <div className="flex items-start justify-between gap-3">
                     <div className="text-sm">{n.headline}</div>
-                    {n.url && <ExternalLink className="size-3 text-ink-dim shrink-0 mt-1" />}
+                    <div className="flex items-center gap-2 shrink-0">
+                      {n.sentiment_label && (
+                        <span className={sentimentBadgeClass(n.sentiment_label)} title={
+                          n.sentiment_score != null ? `Confidence: ${n.sentiment_score.toFixed(2)}` : undefined
+                        }>
+                          {n.sentiment_label}
+                        </span>
+                      )}
+                      {n.url && <ExternalLink className="size-3 text-ink-dim mt-1" />}
+                    </div>
                   </div>
                   <div className="text-xs text-ink-dim mt-1 flex items-center gap-2">
                     <span>{fmtDate(n.news_date)}</span>
                     {n.source_code && <><span>·</span><span>{n.source_code}</span></>}
-                    {n.sentiment_label && <><span>·</span><span className="capitalize">{n.sentiment_label}</span></>}
                   </div>
                 </a>
               ))}
@@ -233,11 +249,12 @@ export default function StockDetailPage() {
               <Stat label="Beta" value={fmtNumber(stock.beta)} />
               <Stat label="Div yield" value={stock.dividend_yield_pct != null ? `${stock.dividend_yield_pct.toFixed(2)}%` : "—"} />
               <Stat label="RSI(14)" value={fmtNumber(stock.rsi_14, { digits: 1 })} />
-              <Stat label="50d SMA" value={fmtNumber(stock.sma_50)} />
-              <Stat label="200d SMA" value={fmtNumber(stock.sma_200)} />
-              <Stat label="Analyst tgt" value={fmtNumber(stock.analyst_target)} />
+              <Stat label="50d SMA" value={fmtPrice(stock.sma_50, stock.currency)} />
+              <Stat label="200d SMA" value={fmtPrice(stock.sma_200, stock.currency)} />
+              <Stat label="Analyst tgt" value={fmtPrice(stock.analyst_target, stock.currency)} />
               <Stat label="Upside" value={stock.analyst_upside_pct != null ? fmtPercent(stock.analyst_upside_pct) : "—"} />
               <Stat label="Analysts" value={fmtNumber(stock.analyst_count, { digits: 0 })} />
+              <Stat label="Rating" value={stock.analyst_rating || "—"} />
             </dl>
           </div>
 
@@ -257,6 +274,24 @@ export default function StockDetailPage() {
           </div>
         </div>
       </div>
+
+      {overriding && stock && user?.is_admin && (
+        <OverrideModal
+          exchange={exchange}
+          ticker={ticker}
+          currency={stock.currency || ""}
+          currentPrice={stock.last_close}
+          currentTarget={stock.analyst_target}
+          currentRating={stock.analyst_rating}
+          currentCount={stock.analyst_count}
+          onClose={() => setOverriding(false)}
+          onSaved={() => {
+            mutate(["stock", exchange, ticker]);
+            mutate(["score", exchange, ticker]);
+            setOverriding(false);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -267,6 +302,110 @@ function Stat({ label, value }: { label: string; value: any }) {
       <dt className="text-ink-muted">{label}</dt>
       <dd className="text-right font-mono">{value}</dd>
     </>
+  );
+}
+
+function OverrideModal({
+  exchange, ticker, currency, currentPrice, currentTarget, currentRating, currentCount,
+  onClose, onSaved,
+}: {
+  exchange: string; ticker: string;
+  currency: string;
+  currentPrice: number | null;
+  currentTarget: number | null;
+  currentRating: string | null;
+  currentCount: number | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [price, setPrice] = useState<string>(currentPrice?.toString() ?? "");
+  const [cur, setCur] = useState<string>(currency);
+  const [target, setTarget] = useState<string>(currentTarget?.toString() ?? "");
+  const [count, setCount] = useState<string>(currentCount?.toString() ?? "");
+  const [rating, setRating] = useState<string>(currentRating ?? "");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    setError(null);
+    const payload: any = {};
+    if (price && price !== currentPrice?.toString()) payload.last_close = Number(price);
+    if (cur && cur !== currency) payload.currency = cur.toUpperCase();
+    if (target && target !== currentTarget?.toString()) payload.analyst_target = Number(target);
+    if (count !== "" && count !== (currentCount?.toString() ?? "")) payload.analyst_count = Number(count);
+    if (rating && rating !== (currentRating ?? "")) payload.analyst_rating = rating;
+
+    if (Object.keys(payload).length === 0) {
+      setError("No changes to save");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.adminOverrideStock(exchange, ticker, payload);
+      onSaved();
+    } catch (e: any) {
+      setError(e.message || "Failed to save");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="card p-5 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+        <h3 className="font-semibold mb-1">Manual override · {ticker}</h3>
+        <p className="text-xs text-ink-dim mb-4">
+          Admin-only. The stock will be re-scored automatically after saving.
+        </p>
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label">Current price</label>
+              <input type="number" step="0.0001" className="input mt-1"
+                     value={price} onChange={(e) => setPrice(e.target.value)} />
+            </div>
+            <div>
+              <label className="label">Currency</label>
+              <input type="text" maxLength={8} className="input mt-1 uppercase"
+                     value={cur} onChange={(e) => setCur(e.target.value)} placeholder="AED" />
+            </div>
+          </div>
+          <div className="border-t border-border pt-3 mt-1">
+            <div className="text-xs text-ink-dim mb-2 uppercase tracking-wider">Analyst consensus</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="label">Target price</label>
+                <input type="number" step="0.0001" className="input mt-1"
+                       value={target} onChange={(e) => setTarget(e.target.value)} />
+              </div>
+              <div>
+                <label className="label"># of analysts</label>
+                <input type="number" min="0" step="1" className="input mt-1"
+                       value={count} onChange={(e) => setCount(e.target.value)} />
+              </div>
+              <div className="col-span-2">
+                <label className="label">Rating</label>
+                <select className="input mt-1" value={rating} onChange={(e) => setRating(e.target.value)}>
+                  <option value="">— unchanged —</option>
+                  <option value="Strong Buy">Strong Buy</option>
+                  <option value="Buy">Buy</option>
+                  <option value="Hold">Hold</option>
+                  <option value="Sell">Sell</option>
+                  <option value="Strong Sell">Strong Sell</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          {error && <div className="text-sm text-verdict-avoid">{error}</div>}
+          <div className="flex gap-2 justify-end pt-2">
+            <button className="btn-ghost" onClick={onClose} disabled={submitting}>Cancel</button>
+            <button className="btn-primary" onClick={submit} disabled={submitting}>
+              {submitting ? "Saving…" : "Save & rescore"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

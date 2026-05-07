@@ -2,7 +2,7 @@
 import Link from "next/link";
 import useSWR from "swr";
 import { api } from "@/lib/api";
-import { fmtNumber, fmtPercent, changeColor } from "@/lib/utils";
+import { fmtNumber, fmtPercent, fmtPrice, changeColor } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import { TrendingUp, BarChart3, Sparkles } from "lucide-react";
 
@@ -48,7 +48,7 @@ export default function DashboardPage() {
               <div className="text-xs text-ink-muted truncate mt-1">{s.company_name}</div>
               <div className="mt-3 flex items-end justify-between">
                 <div>
-                  <div className="text-lg font-semibold">{fmtNumber(s.last_close)}</div>
+                  <div className="text-lg font-semibold">{fmtPrice(s.last_close, s.currency)}</div>
                   <div className={`text-xs ${changeColor(s.last_change_pct)}`}>{fmtPercent(s.last_change_pct)}</div>
                 </div>
                 <div className="text-right">
@@ -105,7 +105,7 @@ export default function DashboardPage() {
                       <div className="text-xs text-ink-muted truncate max-w-[300px]">{s.company_name}</div>
                     </Link>
                   </td>
-                  <td className="p-3 text-right hidden sm:table-cell font-mono">{fmtNumber(s.last_close)}</td>
+                  <td className="p-3 text-right hidden sm:table-cell font-mono">{fmtPrice(s.last_close, s.currency)}</td>
                   <td className={`p-3 text-right font-mono ${changeColor(s.last_change_pct)}`}>{fmtPercent(s.last_change_pct)}</td>
                   <td className="p-3 text-right hidden md:table-cell font-mono">{fmtNumber(s.pe_ratio)}</td>
                   <td className="p-3 text-right font-mono font-semibold">{fmtNumber(s.composite_score, { digits: 0 })}</td>

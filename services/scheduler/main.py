@@ -34,6 +34,7 @@ settings = get_settings()
 
 SCRAPER_URL = "http://scraper:8001"
 RECOMMENDER_URL = "http://recommender:8002"
+SENTIMENT_URL = "http://sentiment:8003"
 
 
 async def wait_for_scraper_idle(idle_seconds: int = 120, max_minutes: int = 60):
@@ -63,6 +64,17 @@ async def daily_pipeline():
             r.raise_for_status()
             log.info("scraper_triggered", body=r.json())
         await wait_for_scraper_idle()
+
+        # Score sentiment on the headlines we just pulled. Long timeout because
+        # the first run of the day may have a couple hundred unscored rows.
+        try:
+            async with httpx.AsyncClient(timeout=60 * 15) as client:
+                rs = await client.post(f"{SENTIMENT_URL}/sentiment/score-pending")
+                rs.raise_for_status()
+                log.info("sentiment_done", body=rs.json())
+        except Exception as exc:
+            # Don't block scoring on sentiment failures — verdicts work without it.
+            log.warning("sentiment_step_failed", error=str(exc))
 
         async with httpx.AsyncClient(timeout=60 * 30) as client:
             r1 = await client.post(f"{RECOMMENDER_URL}/score/all/sync")

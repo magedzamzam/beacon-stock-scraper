@@ -37,10 +37,14 @@ export default function AdminPage() {
 
       <div className="card p-4">
         <h3 className="text-sm font-semibold mb-3">Pipeline triggers</h3>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
           <button className="btn-ghost justify-start" onClick={() => run("scrape", api.adminScrapeAll)}
                   disabled={running === "scrape"}>
             <PlayCircle className="size-4" /> {running === "scrape" ? "Starting…" : "Scrape all stocks"}
+          </button>
+          <button className="btn-ghost justify-start" onClick={() => run("sentiment", api.adminScoreSentiment)}
+                  disabled={running === "sentiment"}>
+            <Brain className="size-4" /> {running === "sentiment" ? "Scoring…" : "Score sentiment"}
           </button>
           <button className="btn-ghost justify-start" onClick={() => run("score", api.adminScoreAll)}
                   disabled={running === "score"}>

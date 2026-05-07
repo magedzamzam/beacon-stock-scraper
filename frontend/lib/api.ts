@@ -261,4 +261,20 @@ export const api = {
   adminScrapeAll: () => request<any>("/admin/scrape-all", { method: "POST" }),
   adminScoreAll: () => request<any>("/admin/score-all", { method: "POST" }),
   adminScorePortfolio: () => request<any>("/admin/score-portfolio", { method: "POST" }),
+  adminScoreSentiment: () => request<any>("/admin/score-sentiment", { method: "POST" }),
+  adminOverrideStock: (
+    exchange: string,
+    ticker: string,
+    payload: {
+      last_close?: number;
+      currency?: string;
+      analyst_target?: number;
+      analyst_count?: number;
+      analyst_rating?: string;
+    },
+  ) =>
+    request<{ ticker: string; exchange: string; changes: Record<string, any>; rescored: any }>(
+      `/admin/stocks/${exchange}/${ticker}/override`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
 };
