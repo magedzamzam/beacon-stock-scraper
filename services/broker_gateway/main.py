@@ -279,3 +279,48 @@ async def search_instruments(broker_id: int, q: str):
         raise HTTPException(_broker_error_to_status(exc), str(exc))
     finally:
         await adapter.aclose()
+
+
+@app.get("/brokers/{broker_id}/quote/{broker_symbol:path}")
+async def get_quote(broker_id: int, broker_symbol: str):
+    """Live quote for a (broker, broker_symbol) pair.
+
+    Borrows any active account on this broker for the session token —
+    quotes themselves aren't account-specific. Returns 404 if the broker
+    adapter doesn't support live quotes (e.g. manual brokers).
+    """
+    if not broker_symbol:
+        raise HTTPException(400, "broker_symbol is required")
+    with SessionLocal() as session:
+        acct = session.execute(
+            select(TradingAccount)
+            .where(TradingAccount.broker_id == broker_id, TradingAccount.is_active.is_(True))
+            .limit(1)
+        ).scalar_one_or_none()
+        if acct is None:
+            raise HTTPException(409, "No active account on this broker — connect one first")
+    _, broker, adapter = _build_adapter(acct.id)
+    try:
+        q = await adapter.get_quote(broker_symbol)
+        return {
+            "broker_id": broker_id,
+            "broker_symbol": q.broker_symbol,
+            "bid": str(q.bid) if q.bid is not None else None,
+            "offer": str(q.offer) if q.offer is not None else None,
+            "last_price": str(q.last_price) if q.last_price is not None else None,
+            "open_price": str(q.open_price) if q.open_price is not None else None,
+            "high_price": str(q.high_price) if q.high_price is not None else None,
+            "low_price": str(q.low_price) if q.low_price is not None else None,
+            "close_price": str(q.close_price) if q.close_price is not None else None,
+            "change_abs": str(q.change_abs) if q.change_abs is not None else None,
+            "change_pct": str(q.change_pct) if q.change_pct is not None else None,
+            "volume": str(q.volume) if q.volume is not None else None,
+            "currency": q.currency,
+            "market_status": q.market_status,
+        }
+    except NotImplementedError:
+        raise HTTPException(404, f"Broker '{broker.name}' does not support live quotes")
+    except BrokerError as exc:
+        raise HTTPException(_broker_error_to_status(exc), str(exc))
+    finally:
+        await adapter.aclose()

@@ -50,9 +50,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
       {/* Sidebar */}
       <aside className="hidden md:flex md:w-64 lg:w-72 flex-col border-r border-border bg-bg-card">
         <div className="px-5 py-6 flex items-center gap-3 border-b border-border">
-          <div className="size-9 rounded-lg bg-gradient-to-br from-brand to-emerald-500 flex items-center justify-center">
-            <Activity className="size-5 text-white" />
-          </div>
+          <img src="/icon-192.png" alt="Beacon" className="size-9 rounded-lg" />
           <div>
             <div className="font-semibold tracking-tight">Beacon</div>
             <div className="text-[10px] uppercase tracking-widest text-ink-dim">DFM · ADX · EGX</div>
@@ -93,9 +91,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
       {/* Mobile top bar */}
       <div className="md:hidden fixed top-0 inset-x-0 z-40 h-14 border-b border-border bg-bg-card flex items-center justify-between px-4">
         <Link href="/" className="flex items-center gap-2">
-          <div className="size-7 rounded-md bg-gradient-to-br from-brand to-emerald-500 flex items-center justify-center">
-            <Activity className="size-4 text-white" />
-          </div>
+          <img src="/icon-192.png" alt="Beacon" className="size-7 rounded-md" />
           <span className="font-semibold">Beacon</span>
         </Link>
         <button onClick={logout} className="text-ink-muted"><LogOut className="size-5" /></button>

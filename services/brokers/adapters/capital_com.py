@@ -14,7 +14,7 @@ import httpx
 from ..adapter_base import BrokerAdapter
 from ..types import (
     AccountInfo, AuthError, BrokerError, BrokerInstrument, BrokerOrder,
-    BrokerPosition, Direction, NetworkError, NotFoundError, OrderSide,
+    BrokerPosition, BrokerQuote, Direction, NetworkError, NotFoundError, OrderSide,
     OrderStatus, OrderType, PlaceOrderRequest, RateLimitError, to_dec,
 )
 
@@ -274,3 +274,42 @@ class CapitalComAdapter(BrokerAdapter):
                 min_qty=to_dec(m.get("minDealSize")),
             ))
         return out
+
+    async def get_quote(self, broker_symbol: str) -> BrokerQuote:
+        """Live quote for one Capital.com epic.
+
+        GET /api/v1/markets/{epic} returns 'instrument' (metadata) and
+        'snapshot' (the live block). We pull both into a BrokerQuote.
+        """
+        if not broker_symbol:
+            raise BrokerError("broker_symbol (epic) is required")
+        data = await self._request("GET", f"/api/v1/markets/{broker_symbol}")
+        snap = data.get("snapshot") or {}
+        instr = data.get("instrument") or {}
+
+        bid = to_dec(snap.get("bid"))
+        offer = to_dec(snap.get("offer"))
+        # Mid is a reasonable 'last' for spot markets when no last-trade is given.
+        last = None
+        if bid is not None and offer is not None:
+            last = (bid + offer) / Decimal(2)
+
+        # Capital.com gives netChange (absolute) and percentageChange. Derive
+        # the previous close from last - netChange when both are present.
+        net_change = to_dec(snap.get("netChange"))
+        prev_close = None
+        if last is not None and net_change is not None:
+            prev_close = last - net_change
+
+        return BrokerQuote(
+            broker_symbol=broker_symbol,
+            bid=bid, offer=offer, last_price=last,
+            high_price=to_dec(snap.get("high")),
+            low_price=to_dec(snap.get("low")),
+            close_price=prev_close,
+            change_abs=net_change,
+            change_pct=to_dec(snap.get("percentageChange")),
+            currency=instr.get("currency"),
+            market_status=snap.get("marketStatus"),
+            raw=data,
+        )

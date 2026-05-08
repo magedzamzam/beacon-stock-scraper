@@ -87,6 +87,25 @@ class BrokerInstrument:
 
 
 @dataclass
+class BrokerQuote:
+    """Live quote from a broker for one tradable instrument."""
+    broker_symbol: str
+    bid: Optional[Decimal] = None
+    offer: Optional[Decimal] = None       # aka ask
+    last_price: Optional[Decimal] = None  # mid or last-trade
+    open_price: Optional[Decimal] = None
+    high_price: Optional[Decimal] = None
+    low_price: Optional[Decimal] = None
+    close_price: Optional[Decimal] = None  # previous close
+    change_abs: Optional[Decimal] = None
+    change_pct: Optional[Decimal] = None
+    volume: Optional[Decimal] = None
+    currency: Optional[str] = None
+    market_status: Optional[str] = None
+    raw: Optional[dict] = None
+
+
+@dataclass
 class AccountInfo:
     account_id: str
     balance: Optional[Decimal]

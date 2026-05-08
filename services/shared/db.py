@@ -443,6 +443,35 @@ class AppSetting(Base):
     updated_by: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"))
 
 
+class StockBrokerQuote(Base):
+    """Latest live price snapshot from a broker for a (stock, broker) pair.
+
+    Refreshed hourly by the scheduler and on-demand from the stock detail
+    page. Single row per pair (UPSERT on stock_id+broker_id) — for history
+    use stock_market_daily.
+    """
+    __tablename__ = "stock_broker_quotes"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"))
+    broker_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("brokers.id", ondelete="CASCADE"))
+    broker_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    offer: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    last_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    open_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    high_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    low_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    close_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    change_abs: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    change_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    volume: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    currency: Mapped[Optional[str]] = mapped_column(String(8))
+    market_status: Mapped[Optional[str]] = mapped_column(String(32))
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("stock_id", "broker_id"),)
+
+
 class JobRun(Base):
     """Audit log of scheduled job executions, scheduled or manual."""
     __tablename__ = "job_runs"

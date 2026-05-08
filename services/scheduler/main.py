@@ -47,6 +47,7 @@ DEFAULT_JOBS = {
     "job.scrape_fundamentals": "0 3 1 * *",
     "job.score_recompute":     "30 16 * * *",
     "job.account_stats_snapshot": "15 */6 * * *",
+    "job.broker_quote_refresh": "5 * * * *",
 }
 
 
@@ -219,11 +220,93 @@ async def run_account_stats_snapshot():
         _finish_run(rid, started, "failed", error=str(exc))
 
 
+async def run_broker_quote_refresh():
+    """Hourly refresh of live quotes for stocks with a broker mapping.
+
+    For each (stock, broker) tradeable mapping, hits the broker_gateway and
+    UPSERTs into stock_broker_quotes. Bad mappings (broker offline, symbol
+    no longer valid) are logged and skipped.
+    """
+    cfg = _read_job_cfg("job.broker_quote_refresh")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.broker_quote_refresh")
+    try:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from shared.db import BrokerInstrument, StockBrokerQuote
+
+        with SessionLocal() as s:
+            mappings = s.execute(
+                select(BrokerInstrument)
+                .where(BrokerInstrument.is_tradeable.is_(True),
+                       BrokerInstrument.stock_id.is_not(None))
+            ).scalars().all()
+            mapping_data = [(m.stock_id, m.broker_id, m.broker_symbol) for m in mappings]
+
+        ok = failed = 0
+        async with httpx.AsyncClient(timeout=20) as client:
+            for (stock_id, broker_id, broker_symbol) in mapping_data:
+                try:
+                    r = await client.get(f"{BROKER_GATEWAY_URL}/brokers/{broker_id}/quote/{broker_symbol}")
+                    if r.status_code >= 400:
+                        failed += 1
+                        continue
+                    payload = r.json()
+                except Exception as exc:
+                    log.warning("quote_fetch_failed",
+                                stock_id=stock_id, broker_symbol=broker_symbol,
+                                error=str(exc))
+                    failed += 1
+                    continue
+
+                def _dec(k):
+                    v = payload.get(k)
+                    return Decimal(str(v)) if v is not None else None
+
+                values = {
+                    "stock_id": stock_id, "broker_id": broker_id,
+                    "broker_symbol": broker_symbol,
+                    "bid": _dec("bid"), "offer": _dec("offer"),
+                    "last_price": _dec("last_price"),
+                    "open_price": _dec("open_price"),
+                    "high_price": _dec("high_price"),
+                    "low_price": _dec("low_price"),
+                    "close_price": _dec("close_price"),
+                    "change_abs": _dec("change_abs"),
+                    "change_pct": _dec("change_pct"),
+                    "volume": _dec("volume"),
+                    "currency": payload.get("currency"),
+                    "market_status": payload.get("market_status"),
+                    "fetched_at": datetime.utcnow(),
+                }
+                try:
+                    with SessionLocal() as s:
+                        stmt = pg_insert(StockBrokerQuote).values(**values).on_conflict_do_update(
+                            index_elements=["stock_id", "broker_id"],
+                            set_={k: v for k, v in values.items()
+                                  if k not in ("stock_id", "broker_id", "broker_symbol")},
+                        )
+                        s.execute(stmt)
+                        s.commit()
+                    ok += 1
+                except Exception as exc:
+                    log.warning("quote_db_failed",
+                                stock_id=stock_id, error=str(exc))
+                    failed += 1
+        _finish_run(rid, started, "ok",
+                    summary={"updated": ok, "failed": failed,
+                             "total": len(mapping_data)})
+    except Exception as exc:
+        log.exception("broker_quote_refresh_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
+
+
 JOB_HANDLERS = {
     "job.scrape_daily_quotes": run_scrape_daily_quotes,
     "job.scrape_fundamentals": run_scrape_fundamentals,
     "job.score_recompute": run_score_recompute,
     "job.account_stats_snapshot": run_account_stats_snapshot,
+    "job.broker_quote_refresh": run_broker_quote_refresh,
 }
 
 

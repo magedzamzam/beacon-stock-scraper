@@ -6,12 +6,13 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Area, AreaChart,
   RadarChart, PolarGrid, PolarAngleAxis, Radar, PolarRadiusAxis,
 } from "recharts";
-import { api } from "@/lib/api";
+import { api, type BrokerQuoteRow as BrokerQuoteData } from "@/lib/api";
 import { useAuth } from "@/lib/auth-store";
 import { fmtNumber, fmtPercent, fmtMoney, fmtPrice, fmtDate, changeColor, sentimentBadgeClass } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import {
   RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2, ShoppingCart, Link2,
+  Radio, Wifi, WifiOff, TrendingUp, TrendingDown,
 } from "lucide-react";
 
 export default function StockDetailPage() {
@@ -134,6 +135,7 @@ export default function StockDetailPage() {
       <div className="grid grid-cols-1 lg:grid-cols-[1fr,360px] gap-5">
         {/* Left column - chart + news */}
         <div className="space-y-5">
+          <BrokerQuoteCard stockId={stock.id} currency={stock.currency} />
           <div className="card p-4">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold flex items-center gap-2"><BarChart3 className="size-4" /> 6-month price</h3>
@@ -801,6 +803,157 @@ function InstrumentMapModal({
           <button className="btn-ghost" onClick={onClose}>Close</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+
+/* ----------------------------------------------------------------------------
+   BrokerQuoteCard — live bid/offer/OHLC from connected brokers (Capital.com).
+
+   Hidden entirely if the stock has no broker mapping (most stocks won't, by
+   design — only stocks the admin has explicitly mapped). Auto-refresh every
+   60s. Manual refresh button hits POST /stocks/{id}/broker_quotes/refresh.
+   ----------------------------------------------------------------------------*/
+function BrokerQuoteCard({ stockId, currency }: { stockId: number; currency: string | null }) {
+  const { data: quotes, isLoading, mutate: reload } = useSWR(
+    ["broker-quotes", stockId],
+    () => api.listBrokerQuotes(stockId),
+    { refreshInterval: 60_000 },
+  );
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+
+  async function refresh() {
+    setRefreshing(true);
+    setRefreshError(null);
+    try {
+      const result = await api.refreshBrokerQuotes(stockId);
+      if (result.refreshed.length === 0 && result.failed.length > 0) {
+        setRefreshError("Broker reachable but no fresh data — try again in a minute.");
+      }
+      reload();
+    } catch (e: any) {
+      // 409 == "no broker mapping" — surface a friendlier message
+      const msg = String(e.message || e);
+      if (msg.includes("409") || msg.toLowerCase().includes("mapping")) {
+        setRefreshError("This stock isn't mapped to any broker yet. Use 'Map symbol' to link it.");
+      } else {
+        setRefreshError(msg);
+      }
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  // Loading first time: render a slim skeleton card so layout doesn't pop.
+  if (isLoading) {
+    return (
+      <div className="card p-4 animate-pulse">
+        <div className="h-4 w-32 bg-bg-elevated rounded" />
+      </div>
+    );
+  }
+
+  // No mapping at all: don't render the card. Hidden gracefully.
+  if (!quotes || quotes.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <Radio className="size-4 text-brand" /> Live broker quote
+        </h3>
+        <button onClick={refresh} disabled={refreshing} className="btn-ghost text-xs">
+          <RefreshCw className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} />
+          {refreshing ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+
+      {refreshError && (
+        <div className="text-xs text-verdict-avoid mb-2">{refreshError}</div>
+      )}
+
+      <div className="space-y-3">
+        {quotes.map(q => (
+          <BrokerQuoteRow key={`${q.broker_id}-${q.broker_symbol}`} q={q} stockCurrency={currency} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+function BrokerQuoteRow({ q, stockCurrency }: { q: BrokerQuoteData; stockCurrency: string | null }) {
+  const isOpen = (q.market_status || "").toUpperCase().includes("TRADEABLE")
+              || (q.market_status || "").toUpperCase() === "OPEN"
+              || (q.market_status || "").toUpperCase() === "TRADEABLE_ALL";
+  const cur = q.currency || stockCurrency || "";
+
+  const change = q.change_pct ? Number(q.change_pct) : null;
+  const changeAbs = q.change_abs ? Number(q.change_abs) : null;
+  const Trend = change !== null && change >= 0 ? TrendingUp : TrendingDown;
+  const trendCls = change !== null
+    ? (change >= 0 ? "text-verdict-buy" : "text-verdict-avoid")
+    : "text-ink-muted";
+
+  return (
+    <div className="border border-border rounded-lg p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-medium text-sm">{q.broker_name || `Broker #${q.broker_id}`}</span>
+          <span className="text-[10px] uppercase tracking-wider text-ink-dim font-mono">{q.broker_symbol}</span>
+          <span className={`badge ${isOpen
+            ? "bg-verdict-buy/15 text-verdict-buy"
+            : "bg-bg-elevated text-ink-muted"}`}>
+            {isOpen ? <Wifi className="size-2.5 mr-1 inline" /> : <WifiOff className="size-2.5 mr-1 inline" />}
+            {q.market_status || "—"}
+          </span>
+        </div>
+        <span className="text-[10px] text-ink-dim">{fmtDate(q.fetched_at)}</span>
+      </div>
+
+      {/* Headline price line */}
+      <div className="flex items-baseline gap-3 flex-wrap">
+        <span className="text-2xl font-semibold font-mono">
+          {q.last_price ? fmtPrice(Number(q.last_price), cur) : "—"}
+        </span>
+        {change !== null && (
+          <span className={`flex items-center gap-1 font-mono text-sm ${trendCls}`}>
+            <Trend className="size-3.5" />
+            {changeAbs !== null && (changeAbs >= 0 ? "+" : "") + changeAbs.toFixed(4)}
+            {" "}({(change >= 0 ? "+" : "") + change.toFixed(2)}%)
+          </span>
+        )}
+      </div>
+
+      {/* Quote grid */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
+        <Cell label="Bid" value={q.bid ? fmtPrice(Number(q.bid), cur) : "—"} />
+        <Cell label="Offer" value={q.offer ? fmtPrice(Number(q.offer), cur) : "—"} />
+        <Cell label="Day high" value={q.high_price ? fmtPrice(Number(q.high_price), cur) : "—"} />
+        <Cell label="Day low" value={q.low_price ? fmtPrice(Number(q.low_price), cur) : "—"} />
+      </div>
+
+      {(q.open_price || q.close_price || q.volume) && (
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mt-3 pt-3 border-t border-border">
+          {q.open_price && <Cell label="Open" value={fmtPrice(Number(q.open_price), cur)} />}
+          {q.close_price && <Cell label="Prev close" value={fmtPrice(Number(q.close_price), cur)} />}
+          {q.volume && <Cell label="Volume" value={Number(q.volume).toLocaleString()} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function Cell({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-ink-dim">{label}</div>
+      <div className="font-mono text-sm mt-0.5">{value}</div>
     </div>
   );
 }

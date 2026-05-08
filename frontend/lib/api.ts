@@ -398,7 +398,45 @@ export const api = {
     qs.set("limit", String(limit));
     return request<JobRun[]>(`/admin/settings/runs?${qs.toString()}`);
   },
+
+  // ===== Live broker quotes =====
+  listBrokerQuotes: (stock_id: number) =>
+    request<BrokerQuoteRow[]>(`/stocks/${stock_id}/broker_quotes`),
+
+  refreshBrokerQuotes: (stock_id: number, broker_id?: number) => {
+    const qs = broker_id !== undefined ? `?broker_id=${broker_id}` : "";
+    return request<BrokerQuoteRefreshResult>(
+      `/stocks/${stock_id}/broker_quotes/refresh${qs}`,
+      { method: "POST" },
+    );
+  },
 };
+
+// ===== Live broker quote types =====
+export interface BrokerQuoteRow {
+  broker_id: number;
+  broker_name: string | null;
+  broker_code: string | null;
+  broker_symbol: string;
+  bid: string | null;
+  offer: string | null;
+  last_price: string | null;
+  open_price: string | null;
+  high_price: string | null;
+  low_price: string | null;
+  close_price: string | null;
+  change_abs: string | null;
+  change_pct: string | null;
+  volume: string | null;
+  currency: string | null;
+  market_status: string | null;
+  fetched_at: string;
+}
+
+export interface BrokerQuoteRefreshResult {
+  refreshed: Array<{ broker_id: number; broker_symbol: string }>;
+  failed: Array<{ broker_id: number; broker_symbol: string }>;
+}
 
 // ===== Job settings types =====
 export interface JobConfig {

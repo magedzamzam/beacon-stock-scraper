@@ -18,6 +18,7 @@ from .routers_orders import (
 )
 from .routers_stats import stats_router
 from .routers_settings import settings_router
+from .routers_broker_quotes import broker_quotes_router
 
 log = configure_logging("api")
 settings = get_settings()
@@ -49,4 +50,5 @@ app.include_router(positions_router)
 app.include_router(instruments_router)
 app.include_router(stats_router)
 app.include_router(settings_router)
+app.include_router(broker_quotes_router)
 app.include_router(admin_router)

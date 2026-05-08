@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 
 from .types import (
-    AccountInfo, BrokerInstrument, BrokerOrder, BrokerPosition,
+    AccountInfo, BrokerInstrument, BrokerOrder, BrokerPosition, BrokerQuote,
     OrderStatus, PlaceOrderRequest,
 )
 
@@ -40,6 +40,17 @@ class BrokerAdapter(ABC):
 
     @abstractmethod
     async def search_instrument(self, query: str) -> List[BrokerInstrument]: ...
+
+    async def get_quote(self, broker_symbol: str) -> BrokerQuote:
+        """Live price snapshot for one instrument.
+
+        Adapters that don't support live quotes (e.g. manual brokers) must
+        raise NotImplementedError. This is intentionally not @abstractmethod
+        so existing adapters keep working without modification.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support get_quote"
+        )
 
     async def aclose(self) -> None:
         return None

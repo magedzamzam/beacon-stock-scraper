@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!-- Background: deep navy gradient -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#60a5fa" stop-opacity="0"/>
+      <stop offset="0.4" stop-color="#3b82f6" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#1d4ed8" stop-opacity="1"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#60a5fa" stop-opacity="0.55"/>
+      <stop offset="0.7" stop-color="#3b82f6" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#3b82f6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="base" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1e40af"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+
+  <!-- Halo behind the beam -->
+  <circle cx="256" cy="200" r="170" fill="url(#halo)"/>
+
+  <!-- The beam: an isoceles triangle pointing up, narrow at top -->
+  <path d="M 256 64
+           L 376 320
+           L 256 296
+           L 136 320 Z"
+        fill="url(#beam)" opacity="0.95"/>
+
+  <!-- Three arcs of light radiating outward, concentric -->
+  <g stroke="#60a5fa" stroke-linecap="round" fill="none" opacity="0.9">
+    <path d="M 196 252 Q 256 232 316 252" stroke-width="6"/>
+    <path d="M 168 290 Q 256 256 344 290" stroke-width="5" opacity="0.7"/>
+    <path d="M 142 326 Q 256 282 370 326" stroke-width="4" opacity="0.5"/>
+  </g>
+
+  <!-- Lighthouse base: tapered tower -->
+  <path d="M 222 320 L 290 320 L 282 432 L 230 432 Z"
+        fill="url(#base)"/>
+
+  <!-- Base platform -->
+  <rect x="208" y="430" width="96" height="20" rx="4" fill="#1e3a8a"/>
+
+  <!-- Light lantern on top of beam (highlight dot) -->
+  <circle cx="256" cy="80" r="14" fill="#dbeafe"/>
+  <circle cx="256" cy="80" r="22" fill="#60a5fa" opacity="0.4"/>
+</svg>

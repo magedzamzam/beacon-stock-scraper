@@ -63,6 +63,12 @@ KNOWN_JOBS: dict[str, dict[str, Any]] = {
         "supports_exchanges": False,
         "default_cron": "15 */6 * * *",
     },
+    "job.broker_quote_refresh": {
+        "label": "Broker live quote refresh",
+        "purpose": "Hourly: pulls bid/offer/OHLC from brokers for stocks with a mapping.",
+        "supports_exchanges": False,
+        "default_cron": "5 * * * *",
+    },
 }
 
 
@@ -203,6 +209,68 @@ async def run_job(
                 r2 = await client.post(f"{_RECOMMENDER_URL}/score/portfolio/sync")
                 r2.raise_for_status()
                 summary = {"all": r1.json(), "portfolio": r2.json()}
+        elif key == "job.broker_quote_refresh":
+            # Loops every tradeable broker_instrument, calls broker_gateway,
+            # UPSERTs into stock_broker_quotes. Mirrors the scheduler logic
+            # but runs in-process here for instant manual refresh.
+            from decimal import Decimal as _D
+            from sqlalchemy.dialects.postgresql import insert as _pg_insert
+            from shared.db import BrokerInstrument, StockBrokerQuote
+
+            mapping_data = db.execute(
+                select(BrokerInstrument.stock_id, BrokerInstrument.broker_id,
+                       BrokerInstrument.broker_symbol)
+                .where(BrokerInstrument.is_tradeable.is_(True),
+                       BrokerInstrument.stock_id.is_not(None))
+            ).all()
+
+            ok_n = failed_n = 0
+            gateway_url = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
+            async with httpx.AsyncClient(timeout=20) as client:
+                for (stock_id, broker_id, broker_symbol) in mapping_data:
+                    try:
+                        rq = await client.get(f"{gateway_url}/brokers/{broker_id}/quote/{broker_symbol}")
+                        if rq.status_code >= 400:
+                            failed_n += 1
+                            continue
+                        payload = rq.json()
+                    except Exception:
+                        failed_n += 1
+                        continue
+
+                    def _dec(k, p=payload):
+                        v = p.get(k)
+                        return _D(str(v)) if v is not None else None
+
+                    values = {
+                        "stock_id": stock_id, "broker_id": broker_id,
+                        "broker_symbol": broker_symbol,
+                        "bid": _dec("bid"), "offer": _dec("offer"),
+                        "last_price": _dec("last_price"),
+                        "open_price": _dec("open_price"),
+                        "high_price": _dec("high_price"),
+                        "low_price": _dec("low_price"),
+                        "close_price": _dec("close_price"),
+                        "change_abs": _dec("change_abs"),
+                        "change_pct": _dec("change_pct"),
+                        "volume": _dec("volume"),
+                        "currency": payload.get("currency"),
+                        "market_status": payload.get("market_status"),
+                        "fetched_at": datetime.utcnow(),
+                    }
+                    try:
+                        stmt = _pg_insert(StockBrokerQuote).values(**values).on_conflict_do_update(
+                            index_elements=["stock_id", "broker_id"],
+                            set_={k: v for k, v in values.items()
+                                  if k not in ("stock_id", "broker_id", "broker_symbol")},
+                        )
+                        db.execute(stmt)
+                        db.commit()
+                        ok_n += 1
+                    except Exception:
+                        db.rollback()
+                        failed_n += 1
+            summary = {"updated": ok_n, "failed": failed_n, "total": len(mapping_data)}
         elif key == "job.account_stats_snapshot":
             # The scheduler holds the actual implementation; manual trigger
             # via API would require HTTP-based dispatch we haven't built. Mark
