@@ -25,7 +25,11 @@ export default function StockDetailPage() {
   const [mapping, setMapping] = useState(false);
   const { user } = useAuth();
 
-  const { data: stock } = useSWR(["stock", exchange, ticker], () => api.stockDetail(exchange, ticker));
+  const { data: stock } = useSWR(
+    ["stock", exchange, ticker],
+    () => api.stockDetail(exchange, ticker),
+    { refreshInterval: 60_000 },
+  );
   const { data: score } = useSWR(["score", exchange, ticker], () => api.stockScore(exchange, ticker));
   const { data: history } = useSWR(["history", exchange, ticker], () => api.priceHistory(exchange, ticker, 180));
   const { data: news } = useSWR(["news", exchange, ticker], () => api.stockNews(exchange, ticker, 10));
@@ -94,9 +98,18 @@ export default function StockDetailPage() {
           <h1 className="text-2xl font-semibold tracking-tight">
             {stock.ticker} <span className="text-ink-muted text-base font-normal">— {stock.company_name}</span>
           </h1>
-          <div className="mt-2 flex items-baseline gap-3">
-            <div className="text-3xl font-semibold font-mono">{fmtPrice(stock.last_close, stock.currency)}</div>
-            <div className={`text-sm font-mono ${changeColor(stock.last_change_pct)}`}>{fmtPercent(stock.last_change_pct)}</div>
+          <div className="mt-2 flex items-baseline gap-3 flex-wrap">
+            <div className="text-3xl font-semibold font-mono">
+              {fmtPrice(stock.current_price ?? stock.last_close, stock.currency)}
+            </div>
+            <div className={`text-sm font-mono ${changeColor(stock.change_pct ?? stock.last_change_pct)}`}>
+              {fmtPercent(stock.change_pct ?? stock.last_change_pct)}
+            </div>
+            {stock.price_source === "broker" && (
+              <span className="badge bg-brand/15 text-brand text-[10px] uppercase tracking-wider">
+                <Radio className="size-2.5 mr-1 inline" /> Live
+              </span>
+            )}
             {score && <VerdictBadge verdict={score.verdict} size="md" />}
           </div>
         </div>
@@ -135,7 +148,12 @@ export default function StockDetailPage() {
       <div className="grid grid-cols-1 lg:grid-cols-[1fr,360px] gap-5">
         {/* Left column - chart + news */}
         <div className="space-y-5">
-          <BrokerQuoteCard stockId={stock.id} currency={stock.currency} />
+          <BrokerQuoteCard
+            stockId={stock.id}
+            currency={stock.currency}
+            exchange={exchange}
+            ticker={ticker}
+          />
           <div className="card p-4">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold flex items-center gap-2"><BarChart3 className="size-4" /> 6-month price</h3>
@@ -815,7 +833,14 @@ function InstrumentMapModal({
    design — only stocks the admin has explicitly mapped). Auto-refresh every
    60s. Manual refresh button hits POST /stocks/{id}/broker_quotes/refresh.
    ----------------------------------------------------------------------------*/
-function BrokerQuoteCard({ stockId, currency }: { stockId: number; currency: string | null }) {
+function BrokerQuoteCard({
+  stockId, currency, exchange, ticker,
+}: {
+  stockId: number;
+  currency: string | null;
+  exchange: string;
+  ticker: string;
+}) {
   const { data: quotes, isLoading, mutate: reload } = useSWR(
     ["broker-quotes", stockId],
     () => api.listBrokerQuotes(stockId),
@@ -833,8 +858,10 @@ function BrokerQuoteCard({ stockId, currency }: { stockId: number; currency: str
         setRefreshError("Broker reachable but no fresh data — try again in a minute.");
       }
       reload();
+      // The header reads the unified price (which uses the broker quote when
+      // available), so invalidate the parent stock query too.
+      mutate(["stock", exchange, ticker]);
     } catch (e: any) {
-      // 409 == "no broker mapping" — surface a friendlier message
       const msg = String(e.message || e);
       if (msg.includes("409") || msg.toLowerCase().includes("mapping")) {
         setRefreshError("This stock isn't mapped to any broker yet. Use 'Map symbol' to link it.");
@@ -892,16 +919,14 @@ function BrokerQuoteRow({ q, stockCurrency }: { q: BrokerQuoteData; stockCurrenc
               || (q.market_status || "").toUpperCase() === "TRADEABLE_ALL";
   const cur = q.currency || stockCurrency || "";
 
-  const change = q.change_pct ? Number(q.change_pct) : null;
-  const changeAbs = q.change_abs ? Number(q.change_abs) : null;
-  const Trend = change !== null && change >= 0 ? TrendingUp : TrendingDown;
-  const trendCls = change !== null
-    ? (change >= 0 ? "text-verdict-buy" : "text-verdict-avoid")
-    : "text-ink-muted";
+  // Spread (offer - bid). Useful for traders.
+  const bid = q.bid ? Number(q.bid) : null;
+  const offer = q.offer ? Number(q.offer) : null;
+  const spread = (bid !== null && offer !== null) ? offer - bid : null;
 
   return (
     <div className="border border-border rounded-lg p-3">
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-medium text-sm">{q.broker_name || `Broker #${q.broker_id}`}</span>
           <span className="text-[10px] uppercase tracking-wider text-ink-dim font-mono">{q.broker_symbol}</span>
@@ -915,35 +940,24 @@ function BrokerQuoteRow({ q, stockCurrency }: { q: BrokerQuoteData; stockCurrenc
         <span className="text-[10px] text-ink-dim">{fmtDate(q.fetched_at)}</span>
       </div>
 
-      {/* Headline price line */}
-      <div className="flex items-baseline gap-3 flex-wrap">
-        <span className="text-2xl font-semibold font-mono">
-          {q.last_price ? fmtPrice(Number(q.last_price), cur) : "—"}
-        </span>
-        {change !== null && (
-          <span className={`flex items-center gap-1 font-mono text-sm ${trendCls}`}>
-            <Trend className="size-3.5" />
-            {changeAbs !== null && (changeAbs >= 0 ? "+" : "") + changeAbs.toFixed(4)}
-            {" "}({(change >= 0 ? "+" : "") + change.toFixed(2)}%)
-          </span>
-        )}
-      </div>
-
-      {/* Quote grid */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
-        <Cell label="Bid" value={q.bid ? fmtPrice(Number(q.bid), cur) : "—"} />
-        <Cell label="Offer" value={q.offer ? fmtPrice(Number(q.offer), cur) : "—"} />
+      {/* Trading details only — header above shows the unified price.
+          The broker quote's own change %/absolute is intentionally NOT shown
+          here because Capital.com's percentageChange/netChange can be measured
+          against day-open (not prev close), causing display inconsistencies
+          with the header's prev-close-based change. The header is canonical. */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Cell label="Bid" value={bid !== null ? fmtPrice(bid, cur) : "—"} />
+        <Cell label="Offer" value={offer !== null ? fmtPrice(offer, cur) : "—"} />
         <Cell label="Day high" value={q.high_price ? fmtPrice(Number(q.high_price), cur) : "—"} />
         <Cell label="Day low" value={q.low_price ? fmtPrice(Number(q.low_price), cur) : "—"} />
       </div>
 
-      {(q.open_price || q.close_price || q.volume) && (
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mt-3 pt-3 border-t border-border">
-          {q.open_price && <Cell label="Open" value={fmtPrice(Number(q.open_price), cur)} />}
-          {q.close_price && <Cell label="Prev close" value={fmtPrice(Number(q.close_price), cur)} />}
-          {q.volume && <Cell label="Volume" value={Number(q.volume).toLocaleString()} />}
-        </div>
-      )}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 pt-3 border-t border-border">
+        {q.last_price && <Cell label="Last (broker)" value={fmtPrice(Number(q.last_price), cur)} />}
+        {spread !== null && <Cell label="Spread" value={spread.toFixed(4)} />}
+        {q.open_price && <Cell label="Open" value={fmtPrice(Number(q.open_price), cur)} />}
+        {q.volume && <Cell label="Volume" value={Number(q.volume).toLocaleString()} />}
+      </div>
     </div>
   );
 }

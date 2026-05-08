@@ -41,6 +41,9 @@ def healthz():
     return {"ok": True}
 
 app.include_router(auth_router)
+# IMPORTANT: broker_quotes_router uses /stocks/{stock_id}/* routes which would
+# otherwise be shadowed by stocks_router's /stocks/{exchange}/{ticker}. Register
+# it FIRST so FastAPI matches it before the wildcard.
 app.include_router(broker_quotes_router)
 app.include_router(stocks_router)
 app.include_router(watchlists_router)

@@ -10,8 +10,8 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    Exchange, Stock, StockAnalystConsensus, StockLatestSnapshot, StockMarketDaily,
-    StockNews, StockRecommendation, StockTechnicals,
+    Exchange, Stock, StockAnalystConsensus, StockBrokerQuote, StockLatestSnapshot,
+    StockMarketDaily, StockNews, StockRecommendation, StockTechnicals,
 )
 from .auth import get_db
 from .schemas import (
@@ -171,6 +171,52 @@ def stock_detail(exchange: str, ticker: str, db: Session = Depends(get_db)):
         .order_by(desc(StockAnalystConsensus.consensus_date)).limit(1)
     ).scalars().first()
 
+    # ---------------- Unified price (single source of truth) ----------------
+    # Pick the most recent broker quote for this stock. Multiple brokers can
+    # cover the same stock; prefer the one fetched most recently.
+    bq = db.execute(
+        select(StockBrokerQuote)
+        .where(StockBrokerQuote.stock_id == row.id)
+        .order_by(desc(StockBrokerQuote.fetched_at))
+        .limit(1)
+    ).scalars().first()
+
+    # Reference: the second-most-recent close in stock_market_daily. Using the
+    # second row guarantees we don't compare today's close against today's
+    # close (which would always be 0%). If we only have ONE day on file,
+    # there's no honest "previous close" — leave it null.
+    prev_close = None
+    md_rows = db.execute(
+        select(StockMarketDaily.close_price, StockMarketDaily.trading_date)
+        .where(StockMarketDaily.stock_id == row.id,
+               StockMarketDaily.close_price.is_not(None))
+        .order_by(desc(StockMarketDaily.trading_date))
+        .limit(2)
+    ).all()
+    if len(md_rows) >= 2:
+        prev_close = float(md_rows[1].close_price)
+
+    # current_price: live broker if we have a fresh-enough quote, else scrape.
+    current_price = None
+    price_source = None
+    price_fetched_at = None
+    if bq is not None and bq.last_price is not None:
+        current_price = float(bq.last_price)
+        price_source = "broker"
+        price_fetched_at = bq.fetched_at
+    elif row.last_close is not None:
+        current_price = float(row.last_close)
+        price_source = "scrape"
+        # last_updated on StockLatestSnapshot is the closest analog to "fetched_at"
+        price_fetched_at = row.last_updated
+
+    # change_abs / change_pct: always against prev_close, so header and quote
+    # card mathematically agree.
+    change_abs = change_pct = None
+    if current_price is not None and prev_close is not None and prev_close != 0:
+        change_abs = current_price - prev_close
+        change_pct = (change_abs / prev_close) * 100.0
+
     summary = _row_to_summary(row)
     return StockDetail(
         **summary.model_dump(),
@@ -187,6 +233,13 @@ def stock_detail(exchange: str, ticker: str, db: Session = Depends(get_db)):
         analyst_upside_pct=_f(row.analyst_upside_pct),
         analyst_count=analyst.analyst_count if analyst else None,
         analyst_rating=analyst.rating if analyst else None,
+        # Unified price block
+        current_price=current_price,
+        prev_close=prev_close,
+        change_abs=change_abs,
+        change_pct=change_pct,
+        price_source=price_source,
+        price_fetched_at=price_fetched_at,
     )
 
 

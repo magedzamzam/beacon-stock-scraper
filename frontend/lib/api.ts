@@ -105,6 +105,13 @@ export interface StockDetail extends StockSummary {
   analyst_upside_pct: number | null;
   analyst_count: number | null;
   analyst_rating: string | null;
+  // Unified price (single source of truth)
+  current_price: number | null;
+  prev_close: number | null;
+  change_abs: number | null;
+  change_pct: number | null;
+  price_source: "broker" | "scrape" | null;
+  price_fetched_at: string | null;
 }
 
 export interface PriceHistoryPoint {

@@ -74,6 +74,21 @@ class StockDetail(StockSummary):
     analyst_count: Optional[int] = None
     analyst_rating: Optional[str] = None
 
+    # ----- Unified price (single source of truth) -----
+    # current_price: live broker last_price if available, else scraped close.
+    current_price: Optional[float] = None
+    # prev_close: scraped close on the most recent prior trading day. Always
+    # the same reference, regardless of which source current_price came from.
+    prev_close: Optional[float] = None
+    # change_abs / change_pct: ALWAYS (current_price - prev_close), so the
+    # header and broker-quote card never disagree.
+    change_abs: Optional[float] = None
+    change_pct: Optional[float] = None
+    # Where current_price came from. 'broker' or 'scrape' or null.
+    price_source: Optional[str] = None
+    # When current_price was last refreshed.
+    price_fetched_at: Optional[datetime] = None
+
 
 class ScoreBreakdown(BaseModel):
     ticker: str
