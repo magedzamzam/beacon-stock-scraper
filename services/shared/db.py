@@ -45,6 +45,7 @@ class Stock(Base):
     employees: Mapped[Optional[int]] = mapped_column(Integer)
     website: Mapped[Optional[str]] = mapped_column(Text)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_scraping_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     country: Mapped[Optional[str]] = mapped_column(Text)
@@ -406,6 +407,26 @@ class BrokerPositionSnapshot(Base):
     raw: Mapped[Optional[dict]] = mapped_column(JSONB)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("account_id", "broker_symbol"),)
+
+
+class AccountBalanceSnapshot(Base):
+    """Timeseries of account balance / equity / unrealized P/L.
+
+    Captured both periodically (scheduler tick) and lazily (when the user
+    opens an account view, with a freshness TTL). Manual accounts have
+    NULL balance but DO have equity computed from open positions.
+    """
+    __tablename__ = "account_balance_snapshots"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    account_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("trading_accounts.id", ondelete="CASCADE"))
+    balance: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    available: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    equity: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    unrealized_pl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    open_position_count: Mapped[Optional[int]] = mapped_column(Integer)
+    currency: Mapped[Optional[str]] = mapped_column(String(8))
+    source: Mapped[str] = mapped_column(String(16), default="periodic")
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 # ---------- Engine factory ----------

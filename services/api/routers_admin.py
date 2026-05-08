@@ -341,3 +341,167 @@ def _upsert_snapshot(db: Session, stock_id: int, payload: dict):
         set_={k: stmt.excluded[k] for k in record if k != "stock_id"},
     )
     db.execute(stmt)
+
+
+# ---------------------------------------------------------------------------
+# Admin: stocks management (list / create / patch scraping flag)
+# ---------------------------------------------------------------------------
+class AdminStockListItem(BaseModel):
+    id: int
+    ticker: str
+    exchange_code: str
+    company_name: str
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    currency: Optional[str] = None
+    country: Optional[str] = None
+    isin: Optional[str] = None
+    active: bool
+    is_scraping_enabled: bool
+    last_close: Optional[float] = None
+    last_updated: Optional[datetime] = None
+
+
+class AdminStockCreateRequest(BaseModel):
+    """All fields except exchange_code+ticker+company_name are optional."""
+    exchange_code: str = Field(..., min_length=2, max_length=16)
+    ticker: str = Field(..., min_length=1, max_length=32)
+    company_name: str = Field(..., min_length=1, max_length=255)
+    isin: Optional[str] = Field(None, max_length=32)
+    marketscreener_slug: Optional[str] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    currency: Optional[str] = Field(None, max_length=10)
+    country: Optional[str] = None
+    founded_year: Optional[int] = None
+    employees: Optional[int] = None
+    website: Optional[str] = None
+    # Default OFF for admin-created stocks per the user's stated requirement:
+    # we don't want to scrape an unverified slug on next scheduler tick.
+    is_scraping_enabled: bool = False
+
+
+class AdminStockPatchRequest(BaseModel):
+    is_scraping_enabled: Optional[bool] = None
+    active: Optional[bool] = None
+
+
+@router.get("/stocks", response_model=list[AdminStockListItem])
+def admin_list_stocks(
+    q: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """List stocks for the admin /admin/stocks page. Joins exchange + snapshot."""
+    stmt = (
+        select(
+            Stock.id, Stock.ticker, Stock.company_name, Stock.sector, Stock.industry,
+            Stock.currency, Stock.country, Stock.isin, Stock.active,
+            Stock.is_scraping_enabled,
+            Exchange.code.label("exchange_code"),
+            StockLatestSnapshot.last_close, StockLatestSnapshot.last_updated,
+        )
+        .select_from(Stock)
+        .join(Exchange, Stock.exchange_id == Exchange.id)
+        .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
+    )
+    if q:
+        like = f"%{q.lower()}%"
+        stmt = stmt.where(
+            (func.lower(Stock.ticker).like(like))
+            | (func.lower(Stock.company_name).like(like))
+        )
+    stmt = stmt.order_by(Stock.ticker).limit(limit).offset(offset)
+    rows = db.execute(stmt).all()
+    return [AdminStockListItem(
+        id=r.id, ticker=r.ticker, exchange_code=r.exchange_code,
+        company_name=r.company_name, sector=r.sector, industry=r.industry,
+        currency=r.currency, country=r.country, isin=r.isin, active=r.active,
+        is_scraping_enabled=r.is_scraping_enabled,
+        last_close=float(r.last_close) if r.last_close is not None else None,
+        last_updated=r.last_updated,
+    ) for r in rows]
+
+
+@router.post("/stocks", response_model=AdminStockListItem)
+def admin_create_stock(
+    body: AdminStockCreateRequest,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Manually create a stock. Defaults is_scraping_enabled=False so the next
+    scrape tick won't immediately attempt the (possibly bad) slug."""
+    exchange = db.execute(
+        select(Exchange).where(func.lower(Exchange.code) == body.exchange_code.lower())
+    ).scalar_one_or_none()
+    if exchange is None:
+        raise HTTPException(404, f"Unknown exchange '{body.exchange_code}'")
+    ticker_up = body.ticker.upper()
+    existing = db.execute(
+        select(Stock.id).where(
+            Stock.exchange_id == exchange.id,
+            func.upper(Stock.ticker) == ticker_up,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(409, f"{exchange.code.upper()}:{ticker_up} already exists (id={existing})")
+
+    stock = Stock(
+        exchange_id=exchange.id,
+        ticker=ticker_up,
+        company_name=body.company_name,
+        isin=body.isin,
+        marketscreener_slug=body.marketscreener_slug,
+        sector=body.sector,
+        industry=body.industry,
+        currency=(body.currency or "").upper() or None,
+        country=body.country,
+        founded_year=body.founded_year,
+        employees=body.employees,
+        website=body.website,
+        active=True,
+        is_scraping_enabled=body.is_scraping_enabled,
+    )
+    db.add(stock)
+    db.commit()
+    db.refresh(stock)
+    return AdminStockListItem(
+        id=stock.id, ticker=stock.ticker, exchange_code=exchange.code,
+        company_name=stock.company_name, sector=stock.sector, industry=stock.industry,
+        currency=stock.currency, country=stock.country, isin=stock.isin,
+        active=stock.active, is_scraping_enabled=stock.is_scraping_enabled,
+        last_close=None, last_updated=None,
+    )
+
+
+@router.patch("/stocks/{stock_id}")
+def admin_patch_stock(
+    stock_id: int,
+    body: AdminStockPatchRequest,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Partial update — used today to flip is_scraping_enabled / active."""
+    stock = db.get(Stock, stock_id)
+    if stock is None:
+        raise HTTPException(404, "Stock not found")
+    changed: dict[str, object] = {}
+    if body.is_scraping_enabled is not None and body.is_scraping_enabled != stock.is_scraping_enabled:
+        stock.is_scraping_enabled = body.is_scraping_enabled
+        changed["is_scraping_enabled"] = body.is_scraping_enabled
+    if body.active is not None and body.active != stock.active:
+        stock.active = body.active
+        changed["active"] = body.active
+    if changed:
+        stock.updated_at = datetime.utcnow()
+        db.commit()
+    return {"id": stock.id, "changed": changed}
+
+
+@router.get("/exchanges")
+def admin_list_exchanges(_: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Used by the 'add stock' form to populate the exchange dropdown."""
+    rows = db.execute(select(Exchange).order_by(Exchange.code)).scalars().all()
+    return [{"id": r.id, "code": r.code, "name": r.name} for r in rows]

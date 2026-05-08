@@ -9,8 +9,8 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    Exchange, PortfolioPosition, PositionRecommendation, Stock,
-    StockLatestSnapshot, User,
+    Broker, Exchange, PortfolioPosition, PositionRecommendation, Stock,
+    StockLatestSnapshot, TradingAccount, User,
 )
 from .auth import get_current_user, get_db
 from .routers_watchlists import _stock_summary
@@ -112,8 +112,24 @@ def create_position(
 ):
     if not db.get(Stock, req.stock_id):
         raise HTTPException(404, "Stock not found")
+
+    # Validate the optional account: must belong to the user, must be active,
+    # and must be a MANUAL broker. Automated accounts get their positions
+    # from the broker_gateway (broker_positions_snapshot), not portfolio_positions.
+    if req.account_id is not None:
+        acct = db.get(TradingAccount, req.account_id)
+        if acct is None or acct.user_id != user.id or not acct.is_active:
+            raise HTTPException(404, "Trading account not found")
+        broker = db.get(Broker, acct.broker_id)
+        if broker is None or broker.kind != "manual":
+            raise HTTPException(
+                400,
+                "Only manual accounts can hold portfolio_positions. "
+                "Automated accounts pull positions live from the broker.",
+            )
+
     pos = PortfolioPosition(
-        user_id=user.id, stock_id=req.stock_id,
+        user_id=user.id, stock_id=req.stock_id, account_id=req.account_id,
         quantity=req.quantity, avg_entry_price=req.avg_entry_price,
         entry_date=req.entry_date or date.today(), notes=req.notes, is_open=True,
     )

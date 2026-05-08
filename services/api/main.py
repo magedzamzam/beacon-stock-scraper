@@ -16,6 +16,7 @@ from .routers_accounts import router as accounts_router
 from .routers_orders import (
     orders_router, positions_router, instruments_router,
 )
+from .routers_stats import stats_router
 
 log = configure_logging("api")
 settings = get_settings()
@@ -45,4 +46,5 @@ app.include_router(accounts_router)
 app.include_router(orders_router)
 app.include_router(positions_router)
 app.include_router(instruments_router)
+app.include_router(stats_router)
 app.include_router(admin_router)

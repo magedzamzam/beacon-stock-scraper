@@ -158,6 +158,9 @@ class PositionCreateRequest(BaseModel):
     avg_entry_price: float = Field(gt=0)
     entry_date: Optional[date] = None
     notes: Optional[str] = None
+    # Optional manual trading account that owns this position.
+    # Must be a manual broker account; the API rejects automated ones.
+    account_id: Optional[int] = None
 
 
 class PositionOut(BaseModel):

@@ -30,11 +30,9 @@ export default function PortfolioPage() {
               : "Single-account view: live broker positions or manual records."}
           </p>
         </div>
-        {selectedAccount === null && (
-          <button onClick={() => setAdding(true)} className="btn-primary">
-            <Plus className="size-4" /> Add position
-          </button>
-        )}
+        <button onClick={() => setAdding(true)} className="btn-primary">
+          <Plus className="size-4" /> Add position
+        </button>
       </header>
 
       <div className="flex flex-wrap gap-2">
@@ -72,7 +70,12 @@ export default function PortfolioPage() {
         <PortfolioAggregateView portfolio={portfolio} isLoading={isLoading} onClose={close} />
       )}
 
-      {adding && <AddPositionModal onClose={() => setAdding(false)} />}
+      {adding && (
+        <AddPositionModal
+          onClose={() => setAdding(false)}
+          defaultAccountId={selectedAccount}
+        />
+      )}
     </div>
   );
 }
@@ -177,7 +180,24 @@ function SummaryCard({ icon, label, value, sub, color }: {
   );
 }
 
-function AddPositionModal({ onClose }: { onClose: () => void }) {
+function AddPositionModal({
+  onClose, defaultAccountId,
+}: {
+  onClose: () => void;
+  defaultAccountId: number | null;
+}) {
+  const { data: accounts } = useSWR("accounts", () => api.listAccounts());
+  // Only manual accounts can hold portfolio_positions rows.
+  const manualAccounts = (accounts || []).filter(a => a.broker_kind === "manual");
+
+  // If the user opened the modal from a per-account view that's manual,
+  // pre-select it. Otherwise default to "no account" (legacy).
+  const initialAcct =
+    defaultAccountId && manualAccounts.some(a => a.id === defaultAccountId)
+      ? defaultAccountId
+      : "";
+  const [accountId, setAccountId] = useState<number | "">(initialAcct);
+
   const [q, setQ] = useState("");
   const { data: search } = useSWR(q.length >= 2 ? ["search", q] : null, () => api.screener({ q, limit: 8 }));
   const [picked, setPicked] = useState<any>(null);
@@ -185,24 +205,61 @@ function AddPositionModal({ onClose }: { onClose: () => void }) {
   const [price, setPrice] = useState("");
   const [date, setDate] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function submit() {
+    setError(null);
     if (!picked || !qty || !price) return;
     setSubmitting(true);
     try {
-      await api.addPosition(picked.id, Number(qty), Number(price), date || undefined);
+      await api.addPosition(
+        picked.id, Number(qty), Number(price),
+        date || undefined, undefined,
+        accountId ? Number(accountId) : undefined,
+      );
       mutate("portfolio");
+      // Refresh per-account positions if this position was attached to one.
+      if (accountId) mutate(["account-positions", Number(accountId)]);
       onClose();
     } catch (e: any) {
-      alert(e.message);
+      setError(e.message || "Failed to add position");
     } finally { setSubmitting(false); }
   }
+
+  // Caller informed us the user is on an automated-account chip — not legal here.
+  const onAutomatedChip =
+    defaultAccountId !== null
+    && (accounts || []).some(a => a.id === defaultAccountId && a.broker_kind === "automated");
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
       <div className="card p-5 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
         <h3 className="font-semibold mb-4">Add position</h3>
         <div className="space-y-3">
+          <div>
+            <label className="label">Account (optional)</label>
+            <select className="input mt-1"
+                    value={accountId}
+                    onChange={(e) => setAccountId(e.target.value ? Number(e.target.value) : "")}>
+              <option value="">— No account (legacy) —</option>
+              {manualAccounts.map(a => (
+                <option key={a.id} value={a.id}>
+                  {a.label} ({a.broker_name})
+                </option>
+              ))}
+            </select>
+            {onAutomatedChip && (
+              <p className="text-[11px] text-verdict-avoid mt-1">
+                Automated accounts are populated live from the broker. Pick a manual account or
+                place an order from a stock page instead.
+              </p>
+            )}
+            {!onAutomatedChip && manualAccounts.length === 0 && (
+              <p className="text-[11px] text-ink-dim mt-1">
+                No manual accounts yet. <a href="/profile" className="underline">Add one</a> if you want to attach this position.
+              </p>
+            )}
+          </div>
           <div>
             <label className="label">Search ticker or company</label>
             <input className="input mt-1" autoFocus value={q} onChange={(e) => { setQ(e.target.value); setPicked(null); }} />
@@ -232,6 +289,7 @@ function AddPositionModal({ onClose }: { onClose: () => void }) {
             <label className="label">Entry date (optional)</label>
             <input type="date" className="input mt-1" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
+          {error && <div className="text-sm text-verdict-avoid">{error}</div>}
           <div className="flex gap-2 justify-end pt-2">
             <button className="btn-ghost" onClick={onClose}>Cancel</button>
             <button className="btn-primary" onClick={submit} disabled={!picked || !qty || !price || submitting}>
@@ -260,17 +318,21 @@ function AccountView({ accountId, account }: { accountId: number; account: any }
   const { data: orders, mutate: reloadOrders } = useSWR(
     ["account-orders", accountId], () => api.listOrders(accountId),
   );
-  const { data: info } = useSWR(
-    account?.broker_kind === "automated" ? ["account-info", accountId] : null,
-    () => api.accountInfo(accountId),
+  const { data: stats, mutate: reloadStats } = useSWR(
+    ["account-stats", accountId], () => api.accountStats(accountId),
+  );
+  const { data: history } = useSWR(
+    ["account-stats-history", accountId], () => api.accountStatsHistory(accountId, 30),
   );
 
   async function refresh() {
     setRefreshing(true);
     try {
       await api.accountPositions(accountId, true);
+      await api.accountStats(accountId, true);
       reloadPositions();
       reloadOrders();
+      reloadStats();
     } catch (e) {
       // tolerate — show stale data rather than crash
     } finally {
@@ -296,19 +358,15 @@ function AccountView({ accountId, account }: { accountId: number; account: any }
         <div>
           <div className="text-xs uppercase tracking-wider text-ink-dim">{account?.broker_name}</div>
           <div className="font-semibold">{account?.label}</div>
-          {isAutomated && info && (
-            <div className="text-xs text-ink-muted mt-1">
-              Balance: <span className="font-mono">{info.balance ?? "—"}</span>{info.currency ? ` ${info.currency}` : ""}
-              {info.available && <> · Available: <span className="font-mono">{info.available}</span></>}
-            </div>
-          )}
         </div>
-        {isAutomated && (
-          <button className="btn-ghost" onClick={refresh} disabled={refreshing}>
-            <RefreshCw className={`size-4 ${refreshing ? "animate-spin" : ""}`} /> Refresh from broker
-          </button>
-        )}
+        <button className="btn-ghost" onClick={refresh} disabled={refreshing}>
+          <RefreshCw className={`size-4 ${refreshing ? "animate-spin" : ""}`} /> Refresh
+          {isAutomated ? " from broker" : ""}
+        </button>
       </div>
+
+      {/* Stats card: balance / equity / unrealized P/L + 30-day mini chart */}
+      <AccountStatsCard stats={stats} history={history} isAutomated={isAutomated} />
 
       <div className="card overflow-hidden">
         <div className="px-4 py-3 border-b border-border text-xs uppercase tracking-wider text-ink-dim">
@@ -427,4 +485,119 @@ function OrderStatusBadge({ status, reason }: { status: string; reason: string |
       {status}
     </span>
   );
+}
+
+
+/* ----------------------------------------------------------------------------
+   AccountStatsCard — balance / equity / unrealized P/L + sparkline.
+
+   The sparkline is a tiny inline SVG (no chart library) plotting equity over
+   the last 30 days. It rescales to its own min/max so a small account looks
+   the same shape as a large one.
+   ----------------------------------------------------------------------------*/
+function AccountStatsCard({
+  stats, history, isAutomated,
+}: {
+  stats: any | undefined;
+  history: any[] | undefined;
+  isAutomated: boolean;
+}) {
+  if (!stats) {
+    return <div className="card p-4 text-sm text-ink-muted">Loading stats…</div>;
+  }
+
+  const balance = stats.balance ? Number(stats.balance) : null;
+  const equity = stats.equity ? Number(stats.equity) : null;
+  const unrealized = stats.unrealized_pl ? Number(stats.unrealized_pl) : null;
+  const cur = stats.currency || "";
+
+  // Build the spark from `history` (oldest → newest), preferring equity.
+  const points = (history || [])
+    .map(h => h.equity ? Number(h.equity) : null)
+    .filter((v): v is number => v !== null);
+
+  return (
+    <div className="card p-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <Metric
+          label={isAutomated ? "Balance" : "Balance"}
+          value={balance !== null ? fmtMoneyVal(balance, cur) : "—"}
+          hint={isAutomated ? "Cash held at broker" : "Manual accounts have no cash balance"}
+        />
+        <Metric
+          label="Equity"
+          value={equity !== null ? fmtMoneyVal(equity, cur) : "—"}
+          hint="Mark-to-market value"
+        />
+        <Metric
+          label="Unrealized P/L"
+          value={unrealized !== null ? fmtMoneyVal(unrealized, cur) : "—"}
+          tone={unrealized !== null ? (unrealized >= 0 ? "buy" : "avoid") : undefined}
+          hint={`${stats.open_position_count ?? 0} open position${stats.open_position_count === 1 ? "" : "s"}`}
+        />
+        <div className="md:border-l md:border-border md:pl-4">
+          <div className="text-[10px] uppercase tracking-wider text-ink-dim">Equity (30d)</div>
+          {points.length >= 2
+            ? <Sparkline values={points} className="mt-2" />
+            : <div className="text-xs text-ink-muted mt-2">No history yet — re-check after the next snapshot.</div>}
+        </div>
+      </div>
+      <div className="text-[10px] text-ink-dim mt-3">
+        Last updated: {fmtDate(stats.fetched_at)} · source {stats.source}
+      </div>
+    </div>
+  );
+}
+
+
+function Metric({
+  label, value, hint, tone,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  tone?: "buy" | "avoid";
+}) {
+  const cls =
+    tone === "buy"   ? "text-verdict-buy" :
+    tone === "avoid" ? "text-verdict-avoid" :
+                       "text-ink";
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-ink-dim">{label}</div>
+      <div className={`text-2xl font-semibold mt-1 font-mono ${cls}`}>{value}</div>
+      {hint && <div className="text-[11px] text-ink-dim mt-1">{hint}</div>}
+    </div>
+  );
+}
+
+
+function Sparkline({ values, className }: { values: number[]; className?: string }) {
+  const w = 200, h = 44, pad = 2;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const stepX = (w - 2 * pad) / (values.length - 1);
+  const points = values.map((v, i) => {
+    const x = pad + i * stepX;
+    const y = h - pad - ((v - min) / range) * (h - 2 * pad);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const last = values[values.length - 1];
+  const first = values[0];
+  const stroke = last >= first ? "rgb(34,197,94)" : "rgb(239,68,68)";
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className={className} preserveAspectRatio="none" style={{ width: "100%", height: 44 }}>
+      <polyline points={points} fill="none" stroke={stroke} strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+
+function fmtMoneyVal(n: number, cur: string): string {
+  // Compact display: two decimals if small, no decimals if >=1000.
+  const opts: Intl.NumberFormatOptions = Math.abs(n) >= 1000
+    ? { maximumFractionDigits: 0 }
+    : { maximumFractionDigits: 2 };
+  return `${cur ? cur + " " : ""}${n.toLocaleString(undefined, opts)}`;
 }

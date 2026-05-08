@@ -193,20 +193,40 @@ async def get_positions(
     broker = db.get(Broker, acct.broker_id)
 
     if broker.kind == "manual":
-        from shared.db import PortfolioPosition
+        from shared.db import PortfolioPosition, StockLatestSnapshot
         rows = db.execute(
-            select(PortfolioPosition, Stock, Exchange)
+            select(PortfolioPosition, Stock, Exchange, StockLatestSnapshot)
             .join(Stock, PortfolioPosition.stock_id == Stock.id)
             .join(Exchange, Stock.exchange_id == Exchange.id)
+            .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
             .where(PortfolioPosition.account_id == account_id, PortfolioPosition.is_open.is_(True))
         ).all()
-        return [{
-            "source": "manual",
-            "stock_id": s.id, "ticker": s.ticker, "exchange": e.code,
-            "company_name": s.company_name, "currency": s.currency,
-            "quantity": str(p.quantity), "avg_open_price": str(p.avg_entry_price),
-            "broker_symbol": s.ticker,
-        } for (p, s, e) in rows]
+        out = []
+        for (p, s, e, snap) in rows:
+            current = snap.last_close if snap else None
+            unrealized_pl = None
+            unrealized_pl_pct = None
+            if current is not None and p.avg_entry_price is not None:
+                unrealized_pl = float(current - p.avg_entry_price) * float(p.quantity)
+                if float(p.avg_entry_price) > 0:
+                    unrealized_pl_pct = (
+                        (float(current) - float(p.avg_entry_price))
+                        / float(p.avg_entry_price)
+                    ) * 100.0
+            out.append({
+                "source": "manual",
+                "stock_id": s.id, "ticker": s.ticker, "exchange": e.code,
+                "company_name": s.company_name, "currency": s.currency,
+                "quantity": str(p.quantity),
+                "avg_open_price": str(p.avg_entry_price),
+                "current_price": str(current) if current is not None else None,
+                "unrealized_pl": (f"{unrealized_pl:.4f}" if unrealized_pl is not None else None),
+                "unrealized_pl_pct": (f"{unrealized_pl_pct:.4f}" if unrealized_pl_pct is not None else None),
+                "broker_symbol": s.ticker,
+                "direction": "LONG",   # manual positions are long-only in our schema
+                "position_id": p.id,    # so the UI can call /portfolio/{id} to close it
+            })
+        return out
 
     needs_refresh = refresh
     if not needs_refresh:

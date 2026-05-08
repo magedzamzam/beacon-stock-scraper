@@ -248,10 +248,17 @@ export const api = {
 
   // portfolio
   portfolio: () => request<Portfolio>("/portfolio"),
-  addPosition: (stock_id: number, quantity: number, avg_entry_price: number, entry_date?: string, notes?: string) =>
+  addPosition: (
+    stock_id: number,
+    quantity: number,
+    avg_entry_price: number,
+    entry_date?: string,
+    notes?: string,
+    account_id?: number,
+  ) =>
     request<Position>("/portfolio", {
       method: "POST",
-      body: JSON.stringify({ stock_id, quantity, avg_entry_price, entry_date, notes }),
+      body: JSON.stringify({ stock_id, quantity, avg_entry_price, entry_date, notes, account_id }),
     }),
   closePosition: (id: number) =>
     request<void>(`/portfolio/${id}`, { method: "DELETE" }),
@@ -348,7 +355,87 @@ export const api = {
       broker_symbol: string; name: string; instrument_type: string | null;
       currency: string | null; min_qty: string | null;
     }>>(`/instruments/search/${broker_code}?q=${encodeURIComponent(q)}`),
+
+  // ===== Account stats =====
+  accountStats: (id: number, refresh = false) =>
+    request<AccountStats>(`/accounts/${id}/stats${refresh ? "?refresh=true" : ""}`),
+
+  accountStatsHistory: (id: number, days = 30) =>
+    request<AccountStatsPoint[]>(`/accounts/${id}/stats/history?days=${days}`),
+
+  // ===== Admin: stocks management =====
+  adminListStocks: (q?: string, limit = 100, offset = 0) => {
+    const qs = new URLSearchParams();
+    if (q) qs.set("q", q);
+    qs.set("limit", String(limit));
+    qs.set("offset", String(offset));
+    return request<AdminStockListItem[]>(`/admin/stocks?${qs.toString()}`);
+  },
+  adminCreateStock: (body: AdminStockCreateRequest) =>
+    request<AdminStockListItem>("/admin/stocks", { method: "POST", body: JSON.stringify(body) }),
+  adminPatchStock: (id: number, body: { is_scraping_enabled?: boolean; active?: boolean }) =>
+    request<{ id: number; changed: Record<string, any> }>(`/admin/stocks/${id}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  adminListExchanges: () =>
+    request<Array<{ id: number; code: string; name: string }>>("/admin/exchanges"),
 };
+
+// ===== Account stats types =====
+export interface AccountStats {
+  account_id: number;
+  broker_kind: "automated" | "manual";
+  balance: string | null;
+  available: string | null;
+  equity: string | null;
+  unrealized_pl: string | null;
+  open_position_count: number | null;
+  currency: string | null;
+  fetched_at: string;
+  source: string;
+}
+
+export interface AccountStatsPoint {
+  fetched_at: string;
+  balance: string | null;
+  equity: string | null;
+  unrealized_pl: string | null;
+  currency: string | null;
+  source: string;
+}
+
+// ===== Admin stocks types =====
+export interface AdminStockListItem {
+  id: number;
+  ticker: string;
+  exchange_code: string;
+  company_name: string;
+  sector: string | null;
+  industry: string | null;
+  currency: string | null;
+  country: string | null;
+  isin: string | null;
+  active: boolean;
+  is_scraping_enabled: boolean;
+  last_close: number | null;
+  last_updated: string | null;
+}
+
+export interface AdminStockCreateRequest {
+  exchange_code: string;
+  ticker: string;
+  company_name: string;
+  isin?: string;
+  marketscreener_slug?: string;
+  sector?: string;
+  industry?: string;
+  currency?: string;
+  country?: string;
+  founded_year?: number;
+  employees?: number;
+  website?: string;
+  is_scraping_enabled?: boolean;
+}
 
 // ===== Broker types =====
 export interface BrokerCredentialField {

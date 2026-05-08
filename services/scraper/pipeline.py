@@ -259,7 +259,7 @@ async def scrape_all_active() -> dict:
         rows = session.execute(
             select(Stock.id, Exchange.code, Stock.ticker)
             .join(Exchange, Stock.exchange_id == Exchange.id)
-            .where(Stock.active.is_(True))
+            .where(Stock.active.is_(True), Stock.is_scraping_enabled.is_(True))
         ).all()
 
     log.info("scrape_batch_start", total=len(rows))
