@@ -379,7 +379,65 @@ export const api = {
     }),
   adminListExchanges: () =>
     request<Array<{ id: number; code: string; name: string }>>("/admin/exchanges"),
+
+  // ===== Admin: scheduled job settings =====
+  listJobSettings: () =>
+    request<JobSetting[]>("/admin/settings"),
+  updateJobSetting: (key: string, body: JobConfig) =>
+    request<JobSetting>(`/admin/settings/${encodeURIComponent(key)}`, {
+      method: "PUT", body: JSON.stringify(body),
+    }),
+  runJob: (key: string) =>
+    request<{ status: string; summary?: any; error?: string | null; message?: string }>(
+      `/admin/settings/${encodeURIComponent(key)}/run`,
+      { method: "POST" },
+    ),
+  listJobRuns: (job_key?: string, limit = 50) => {
+    const qs = new URLSearchParams();
+    if (job_key) qs.set("job_key", job_key);
+    qs.set("limit", String(limit));
+    return request<JobRun[]>(`/admin/settings/runs?${qs.toString()}`);
+  },
 };
+
+// ===== Job settings types =====
+export interface JobConfig {
+  enabled: boolean;
+  cron: string;
+  exchanges: string[];
+  description?: string | null;
+}
+
+export interface JobLastRun {
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  triggered_by: string;
+  duration_s: number | null;
+  error_message: string | null;
+  summary: any;
+}
+
+export interface JobSetting {
+  key: string;
+  label: string;
+  purpose: string;
+  supports_exchanges: boolean;
+  config: JobConfig;
+  last_run: JobLastRun | null;
+}
+
+export interface JobRun {
+  id: number;
+  job_key: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  triggered_by: string;
+  duration_s: number | null;
+  summary: any;
+  error_message: string | null;
+}
 
 // ===== Account stats types =====
 export interface AccountStats {

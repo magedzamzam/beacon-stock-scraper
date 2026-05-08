@@ -20,7 +20,7 @@ import asyncio
 from datetime import date, datetime
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -152,8 +152,17 @@ def _update_stock_metadata(session: Session, stock: Stock, blurb: dict):
 
 # ----- main per-stock job -----
 
-async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ticker: str):
-    """One stock = up to two HTTP calls + one DB transaction."""
+async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ticker: str,
+                     mode: str = "full"):
+    """One stock = one or two HTTP calls + one DB transaction.
+
+    mode='daily' fetches only the overview page (price, technicals, news,
+    analyst block) and writes the price/snapshot/technicals/news tables.
+
+    mode='full' (default) additionally fetches the statistics page so we can
+    populate stock_valuation / stock_financials_ttm with multi-period growth
+    metrics. That data only changes quarterly, so daily mode skips it.
+    """
     today = date.today()
     overview_html: str | None = None
     statistics_html: str | None = None
@@ -166,12 +175,13 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
         err = f"overview: {exc}"
         log.warning("overview_fetch_failed", ticker=ticker, error=str(exc))
 
-    try:
-        stats_status, statistics_html = await fetcher.get(_quote_url(exchange_code, ticker, "statistics"))
-    except Exception as exc:
-        log.warning("stats_fetch_failed", ticker=ticker, error=str(exc))
-        if not err:
-            err = f"statistics: {exc}"
+    if mode == "full":
+        try:
+            stats_status, statistics_html = await fetcher.get(_quote_url(exchange_code, ticker, "statistics"))
+        except Exception as exc:
+            log.warning("stats_fetch_failed", ticker=ticker, error=str(exc))
+            if not err:
+                err = f"statistics: {exc}"
 
     if not overview_html and not statistics_html:
         with SessionLocal() as session:
@@ -216,11 +226,14 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
             if any(v is not None for v in market.values()):
                 _upsert_market_daily(session, stock_id, today, market)
 
-            fiscal_year = today.year
-            if any(v is not None for v in valuation.values()):
-                _upsert_valuation(session, stock_id, fiscal_year, valuation)
-            if any(v is not None for v in financials.values()):
-                _upsert_financials_ttm(session, stock_id, fiscal_year, financials)
+            # Valuation + multi-period financials change quarterly. Skip in
+            # daily mode to keep the scrape lightweight.
+            if mode == "full":
+                fiscal_year = today.year
+                if any(v is not None for v in valuation.values()):
+                    _upsert_valuation(session, stock_id, fiscal_year, valuation)
+                if any(v is not None for v in financials.values()):
+                    _upsert_financials_ttm(session, stock_id, fiscal_year, financials)
             if any(v is not None for v in technicals.values()):
                 _upsert_technicals(session, stock_id, today, technicals)
 
@@ -253,23 +266,34 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
 
 # ----- batch entrypoint -----
 
-async def scrape_all_active() -> dict:
-    """Iterate every active stock and scrape it. Returns summary."""
+async def scrape_all_active(mode: str = "full",
+                            exchanges: Optional[list[str]] = None) -> dict:
+    """Iterate scraping-enabled stocks and scrape them.
+
+    mode      'daily' or 'full' — see scrape_one().
+    exchanges list of exchange codes (case-insensitive) to include. None or
+              empty list means all exchanges.
+    """
     with SessionLocal() as session:
-        rows = session.execute(
+        stmt = (
             select(Stock.id, Exchange.code, Stock.ticker)
             .join(Exchange, Stock.exchange_id == Exchange.id)
             .where(Stock.active.is_(True), Stock.is_scraping_enabled.is_(True))
-        ).all()
+        )
+        if exchanges:
+            codes = [c.lower() for c in exchanges]
+            stmt = stmt.where(func.lower(Exchange.code).in_(codes))
+        rows = session.execute(stmt).all()
 
-    log.info("scrape_batch_start", total=len(rows))
+    log.info("scrape_batch_start", total=len(rows), mode=mode,
+             exchanges=exchanges or "all")
     successes = failures = 0
 
     async with HttpFetcher() as fetcher:
         async def _wrapped(row):
             nonlocal successes, failures
             try:
-                await scrape_one(fetcher, row.id, row.code, row.ticker)
+                await scrape_one(fetcher, row.id, row.code, row.ticker, mode=mode)
                 successes += 1
             except Exception as exc:
                 failures += 1
@@ -277,7 +301,11 @@ async def scrape_all_active() -> dict:
 
         await asyncio.gather(*(_wrapped(row) for row in rows))
 
-    summary = {"total": len(rows), "ok": successes, "failed": failures, "ts": datetime.utcnow().isoformat()}
+    summary = {
+        "total": len(rows), "ok": successes, "failed": failures,
+        "mode": mode, "exchanges": exchanges or "all",
+        "ts": datetime.utcnow().isoformat(),
+    }
     log.info("scrape_batch_done", **summary)
     return summary
 

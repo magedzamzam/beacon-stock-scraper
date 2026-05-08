@@ -429,6 +429,35 @@ class AccountBalanceSnapshot(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class AppSetting(Base):
+    """Generic key/value config store. Values are JSON for flexibility.
+
+    Today: holds the four scheduled-job descriptors keyed by 'job.<name>'.
+    Tomorrow: any system-wide config the admin UI exposes.
+    """
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_by: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"))
+
+
+class JobRun(Base):
+    """Audit log of scheduled job executions, scheduled or manual."""
+    __tablename__ = "job_runs"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    job_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    triggered_by: Mapped[str] = mapped_column(String(16), default="scheduled")
+    user_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"))
+    duration_s: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+    summary: Mapped[Optional[dict]] = mapped_column(JSONB)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+
+
 # ---------- Engine factory ----------
 _settings = get_settings()
 _engine = create_engine(_settings.database_url_sync, pool_pre_ping=True, pool_size=10)

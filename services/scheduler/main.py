@@ -1,210 +1,315 @@
-"""Beacon scheduler.
+"""Beacon scheduler — DB-driven configuration with live reload.
 
-Triggers — once daily at 11:00 (timezone configurable, default Asia/Dubai):
-    1) call scraper:  POST http://scraper:8001/scrape/all
-       (returns immediately; scraper does the work in the background)
-    2) wait until scraper finishes
-    3) call recommender: POST http://recommender:8002/score/all/sync
-    4) call recommender: POST http://recommender:8002/score/portfolio/sync
+Job schedules live in app_settings (one row per 'job.<name>'). Every 60s
+this service re-reads them and updates the APScheduler triggers via
+replace_existing=True. Admin UI edits propagate without restart.
 
-We deliberately use the SYNC endpoints for steps 3-4 so we get a deterministic
-order: data first, scoring second.
+Each scheduled run writes a row to job_runs so the admin can audit it.
 
-The scrape itself is async-in-background, so we must poll the scraper's
-audit table to know when it's done. We read scrape_runs.run_time and wait
-until no new rows have been written for ~120 seconds.
+Job kinds today:
+    job.scrape_daily_quotes      -> POST /scrape/all (mode='daily')  on scraper
+    job.scrape_fundamentals      -> POST /scrape/all (mode='full')   on scraper
+    job.score_recompute          -> POST /score/all/sync             on recommender
+                                    + POST /score/portfolio/sync
+    job.account_stats_snapshot   -> in-process (snapshot_all_accounts)
 """
 from __future__ import annotations
 
 import asyncio
-import time
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import func, select
+from sqlalchemy import select
 
-from shared.db import SessionLocal, ScrapeRun
+from shared.db import (
+    AccountBalanceSnapshot, AppSetting, Broker, BrokerPositionSnapshot, JobRun,
+    PortfolioPosition, SessionLocal, Stock, StockLatestSnapshot, TradingAccount,
+)
 from shared.logging_setup import configure_logging
 from shared.settings import get_settings
 
 log = configure_logging("scheduler")
 settings = get_settings()
 
-SCRAPER_URL = "http://scraper:8001"
-RECOMMENDER_URL = "http://recommender:8002"
-SENTIMENT_URL = "http://sentiment:8003"
+SCRAPER_URL = os.environ.get("SCRAPER_URL", "http://scraper:8001")
+RECOMMENDER_URL = os.environ.get("RECOMMENDER_URL", "http://recommender:8002")
+BROKER_GATEWAY_URL = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
+
+# Default crons mirror routers_settings.KNOWN_JOBS so a fresh DB without
+# seeded settings still gets reasonable behaviour.
+DEFAULT_JOBS = {
+    "job.scrape_daily_quotes": "0 16 * * *",
+    "job.scrape_fundamentals": "0 3 1 * *",
+    "job.score_recompute":     "30 16 * * *",
+    "job.account_stats_snapshot": "15 */6 * * *",
+}
 
 
-async def wait_for_scraper_idle(idle_seconds: int = 120, max_minutes: int = 60):
-    """Block until scrape_runs has had no new rows for `idle_seconds`."""
-    deadline = time.time() + max_minutes * 60
-    last_seen: datetime | None = None
-    last_change = time.time()
-    while time.time() < deadline:
-        with SessionLocal() as s:
-            latest = s.execute(select(func.max(ScrapeRun.run_time))).scalar()
-        if latest != last_seen:
-            last_seen = latest
-            last_change = time.time()
-        if time.time() - last_change >= idle_seconds:
-            log.info("scraper_idle_detected", since=last_seen.isoformat() if last_seen else None)
+# --------------------------------------------------------------------------
+# job_runs audit helpers
+# --------------------------------------------------------------------------
+def _start_run(job_key: str) -> tuple[int, datetime]:
+    """Insert a 'running' row and return (id, started_at)."""
+    with SessionLocal() as s:
+        run = JobRun(job_key=job_key, status="running", triggered_by="scheduled")
+        s.add(run)
+        s.commit()
+        s.refresh(run)
+        return run.id, run.started_at
+
+
+def _finish_run(run_id: int, started: datetime, status: str,
+                summary: Optional[dict] = None, error: Optional[str] = None):
+    finished = datetime.utcnow()
+    duration = Decimal(str((finished - started).total_seconds())).quantize(Decimal("0.01"))
+    with SessionLocal() as s:
+        run = s.get(JobRun, run_id)
+        if run is None:
             return
-        await asyncio.sleep(15)
-    log.warning("scraper_idle_timeout")
+        run.finished_at = finished
+        run.duration_s = duration
+        run.status = status
+        run.summary = summary
+        run.error_message = error
+        s.commit()
 
 
-async def daily_pipeline():
-    started = datetime.utcnow()
-    log.info("daily_pipeline_start", at=started.isoformat())
+# --------------------------------------------------------------------------
+# Job implementations
+# --------------------------------------------------------------------------
+async def _scrape_with_mode(mode: str, exchanges: list[str]):
+    payload = {"mode": mode, "exchanges": exchanges or None}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(f"{SCRAPER_URL}/scrape/all", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+async def run_scrape_daily_quotes():
+    """Light daily scrape: OHLC + technicals + analyst + news."""
+    cfg = _read_job_cfg("job.scrape_daily_quotes")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.scrape_daily_quotes")
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(f"{SCRAPER_URL}/scrape/all")
-            r.raise_for_status()
-            log.info("scraper_triggered", body=r.json())
-        await wait_for_scraper_idle()
+        summary = await _scrape_with_mode("daily", cfg.get("exchanges") or [])
+        _finish_run(rid, started, "ok", summary=summary)
+    except Exception as exc:
+        log.exception("scrape_daily_quotes_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
 
-        # Score sentiment on the headlines we just pulled. Long timeout because
-        # the first run of the day may have a couple hundred unscored rows.
-        try:
-            async with httpx.AsyncClient(timeout=60 * 15) as client:
-                rs = await client.post(f"{SENTIMENT_URL}/sentiment/score-pending")
-                rs.raise_for_status()
-                log.info("sentiment_done", body=rs.json())
-        except Exception as exc:
-            # Don't block scoring on sentiment failures — verdicts work without it.
-            log.warning("sentiment_step_failed", error=str(exc))
 
+async def run_scrape_fundamentals():
+    """Heavy monthly scrape: full fundamentals + valuation."""
+    cfg = _read_job_cfg("job.scrape_fundamentals")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.scrape_fundamentals")
+    try:
+        summary = await _scrape_with_mode("full", cfg.get("exchanges") or [])
+        _finish_run(rid, started, "ok", summary=summary)
+    except Exception as exc:
+        log.exception("scrape_fundamentals_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
+
+
+async def run_score_recompute():
+    """Recompute composite scores (all + portfolio)."""
+    cfg = _read_job_cfg("job.score_recompute")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.score_recompute")
+    try:
         async with httpx.AsyncClient(timeout=60 * 30) as client:
             r1 = await client.post(f"{RECOMMENDER_URL}/score/all/sync")
             r1.raise_for_status()
-            log.info("scoring_done", body=r1.json())
             r2 = await client.post(f"{RECOMMENDER_URL}/score/portfolio/sync")
             r2.raise_for_status()
-            log.info("portfolio_scored", body=r2.json())
+        _finish_run(rid, started, "ok",
+                    summary={"all": r1.json(), "portfolio": r2.json()})
     except Exception as exc:
-        log.exception("daily_pipeline_failed", error=str(exc))
-    log.info("daily_pipeline_done", duration_s=(datetime.utcnow() - started).total_seconds())
+        log.exception("score_recompute_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
 
 
-async def snapshot_all_accounts():
-    """Periodic capture of account balance snapshots.
+async def run_account_stats_snapshot():
+    """In-process snapshot of every active trading account."""
+    cfg = _read_job_cfg("job.account_stats_snapshot")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.account_stats_snapshot")
+    try:
+        with SessionLocal() as s:
+            accts = s.execute(
+                select(TradingAccount, Broker)
+                .join(Broker, TradingAccount.broker_id == Broker.id)
+                .where(TradingAccount.is_active.is_(True))
+            ).all()
 
-    For automated accounts: hits broker_gateway /accounts/{id}/info to refresh
-    balance, sums unrealized_pl from broker_positions_snapshot, derives equity.
+        written = 0
+        for (acct, broker) in accts:
+            try:
+                with SessionLocal() as s:
+                    if broker.kind == "manual":
+                        rows = s.execute(
+                            select(PortfolioPosition, Stock, StockLatestSnapshot)
+                            .join(Stock, PortfolioPosition.stock_id == Stock.id)
+                            .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
+                            .where(PortfolioPosition.account_id == acct.id,
+                                   PortfolioPosition.is_open.is_(True))
+                        ).all()
+                        equity = Decimal("0"); unrealized = Decimal("0"); counted = 0
+                        for (p, _stock, snap) in rows:
+                            cur = snap.last_close if snap else None
+                            if cur is None:
+                                continue
+                            equity += Decimal(str(cur)) * Decimal(str(p.quantity))
+                            unrealized += (Decimal(str(cur)) - Decimal(str(p.avg_entry_price))) * Decimal(str(p.quantity))
+                            counted += 1
+                        s.add(AccountBalanceSnapshot(
+                            account_id=acct.id,
+                            balance=None, available=None,
+                            equity=equity, unrealized_pl=unrealized,
+                            open_position_count=counted, currency=acct.currency,
+                            source="periodic",
+                        ))
+                    else:
+                        balance = available = None
+                        currency = acct.currency
+                        try:
+                            async with httpx.AsyncClient(timeout=15) as client:
+                                r = await client.get(f"{BROKER_GATEWAY_URL}/accounts/{acct.id}/info")
+                                if r.status_code < 400:
+                                    info = r.json()
+                                    if info.get("balance") is not None:
+                                        balance = Decimal(str(info["balance"]))
+                                    if info.get("available") is not None:
+                                        available = Decimal(str(info["available"]))
+                                    if info.get("currency"):
+                                        currency = info["currency"]
+                        except Exception as exc:
+                            log.warning("stats_snapshot_broker_unreachable",
+                                        account_id=acct.id, error=str(exc))
+                        pl_rows = s.execute(
+                            select(BrokerPositionSnapshot.unrealized_pl)
+                            .where(BrokerPositionSnapshot.account_id == acct.id)
+                        ).scalars().all()
+                        unrealized = sum((Decimal(str(x)) for x in pl_rows if x is not None), start=Decimal("0"))
+                        pos_count = len(pl_rows)
+                        equity = (balance + unrealized) if balance is not None else None
+                        s.add(AccountBalanceSnapshot(
+                            account_id=acct.id,
+                            balance=balance, available=available,
+                            equity=equity, unrealized_pl=unrealized,
+                            open_position_count=pos_count, currency=currency,
+                            source="periodic",
+                        ))
+                    s.commit()
+                    written += 1
+            except Exception as exc:
+                log.warning("stats_snapshot_failed", account_id=acct.id, error=str(exc))
+        _finish_run(rid, started, "ok", summary={"written": written})
+    except Exception as exc:
+        log.exception("account_stats_snapshot_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
 
-    For manual accounts: pulls open positions from portfolio_positions, marks
-    them with stock_latest_snapshot.last_close, sums to equity / unrealized.
 
-    All errors are swallowed per-account so one bad credential doesn't stop
-    the whole tick.
-    """
-    from decimal import Decimal
-    from shared.db import (
-        AccountBalanceSnapshot, Broker, BrokerPositionSnapshot,
-        PortfolioPosition, Stock, StockLatestSnapshot, TradingAccount,
-    )
-    log.info("stats_snapshot_start")
+JOB_HANDLERS = {
+    "job.scrape_daily_quotes": run_scrape_daily_quotes,
+    "job.scrape_fundamentals": run_scrape_fundamentals,
+    "job.score_recompute": run_score_recompute,
+    "job.account_stats_snapshot": run_account_stats_snapshot,
+}
+
+
+# --------------------------------------------------------------------------
+# DB-driven scheduling
+# --------------------------------------------------------------------------
+def _read_job_cfg(key: str) -> dict:
+    """Return the current config for a job key. Falls back to defaults."""
     with SessionLocal() as s:
-        accts = s.execute(
-            select(TradingAccount, Broker)
-            .join(Broker, TradingAccount.broker_id == Broker.id)
-            .where(TradingAccount.is_active.is_(True))
-        ).all()
+        row = s.get(AppSetting, key)
+        if row is None or not row.value:
+            return {"enabled": True, "cron": DEFAULT_JOBS.get(key), "exchanges": []}
+        v = row.value
+        return {
+            "enabled": bool(v.get("enabled", True)),
+            "cron": v.get("cron") or DEFAULT_JOBS.get(key),
+            "exchanges": v.get("exchanges") or [],
+        }
 
-    BROKER_GATEWAY_URL = "http://broker_gateway:8004"
-    written = 0
-    for (acct, broker) in accts:
+
+def _apply_job_to_scheduler(scheduler: AsyncIOScheduler, key: str):
+    """Add or update one APScheduler job from current DB config.
+
+    Disabled jobs are removed entirely so they don't fire.
+    """
+    cfg = _read_job_cfg(key)
+    handler = JOB_HANDLERS[key]
+    cron_str = cfg.get("cron") or DEFAULT_JOBS.get(key)
+    if not cfg.get("enabled", True):
+        if scheduler.get_job(key):
+            scheduler.remove_job(key)
+            log.info("job_disabled", key=key)
+        return
+    parts = cron_str.split()
+    if len(parts) != 5:
+        log.warning("job_invalid_cron", key=key, cron=cron_str)
+        return
+    minute, hour, dom, month, dow = parts
+    try:
+        scheduler.add_job(
+            handler,
+            CronTrigger(minute=minute, hour=hour, day=dom, month=month,
+                        day_of_week=dow, timezone=settings.timezone),
+            id=key, name=key, replace_existing=True,
+            misfire_grace_time=60 * 15,
+        )
+    except Exception as exc:
+        log.warning("job_apply_failed", key=key, cron=cron_str, error=str(exc))
+
+
+def reload_all_jobs(scheduler: AsyncIOScheduler):
+    for key in JOB_HANDLERS:
+        _apply_job_to_scheduler(scheduler, key)
+
+
+async def reload_loop(scheduler: AsyncIOScheduler):
+    """Re-read app_settings every 60 seconds so admin edits take effect."""
+    while True:
         try:
-            with SessionLocal() as s:
-                if broker.kind == "manual":
-                    rows = s.execute(
-                        select(PortfolioPosition, Stock, StockLatestSnapshot)
-                        .join(Stock, PortfolioPosition.stock_id == Stock.id)
-                        .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
-                        .where(PortfolioPosition.account_id == acct.id,
-                               PortfolioPosition.is_open.is_(True))
-                    ).all()
-                    equity = Decimal("0")
-                    unrealized = Decimal("0")
-                    counted = 0
-                    for (p, _stock, snap) in rows:
-                        cur = snap.last_close if snap else None
-                        if cur is None:
-                            continue
-                        equity += Decimal(str(cur)) * Decimal(str(p.quantity))
-                        unrealized += (Decimal(str(cur)) - Decimal(str(p.avg_entry_price))) * Decimal(str(p.quantity))
-                        counted += 1
-                    s.add(AccountBalanceSnapshot(
-                        account_id=acct.id,
-                        balance=None, available=None,
-                        equity=equity, unrealized_pl=unrealized,
-                        open_position_count=counted, currency=acct.currency,
-                        source="periodic",
-                    ))
-                else:
-                    balance = available = None
-                    currency = acct.currency
-                    try:
-                        async with httpx.AsyncClient(timeout=15) as client:
-                            r = await client.get(f"{BROKER_GATEWAY_URL}/accounts/{acct.id}/info")
-                            if r.status_code < 400:
-                                info = r.json()
-                                if info.get("balance") is not None:
-                                    balance = Decimal(str(info["balance"]))
-                                if info.get("available") is not None:
-                                    available = Decimal(str(info["available"]))
-                                if info.get("currency"):
-                                    currency = info["currency"]
-                    except Exception as exc:
-                        log.warning("stats_snapshot_broker_unreachable",
-                                    account_id=acct.id, error=str(exc))
-                    pl_rows = s.execute(
-                        select(BrokerPositionSnapshot.unrealized_pl)
-                        .where(BrokerPositionSnapshot.account_id == acct.id)
-                    ).scalars().all()
-                    unrealized = sum((Decimal(str(x)) for x in pl_rows if x is not None), start=Decimal("0"))
-                    pos_count = len(pl_rows)
-                    equity = (balance + unrealized) if balance is not None else None
-                    s.add(AccountBalanceSnapshot(
-                        account_id=acct.id,
-                        balance=balance, available=available,
-                        equity=equity, unrealized_pl=unrealized,
-                        open_position_count=pos_count, currency=currency,
-                        source="periodic",
-                    ))
-                s.commit()
-                written += 1
+            await asyncio.sleep(60)
+            reload_all_jobs(scheduler)
+        except asyncio.CancelledError:
+            return
         except Exception as exc:
-            log.warning("stats_snapshot_failed", account_id=acct.id, error=str(exc))
-    log.info("stats_snapshot_done", written=written)
+            log.warning("reload_loop_error", error=str(exc))
+
+
+# --------------------------------------------------------------------------
+# Entrypoint
+# --------------------------------------------------------------------------
+async def _async_main():
+    scheduler = AsyncIOScheduler(timezone=settings.timezone)
+    reload_all_jobs(scheduler)
+    scheduler.start()
+    log.info("scheduler_started", tz=settings.timezone, jobs=list(JOB_HANDLERS.keys()))
+    asyncio.create_task(reload_loop(scheduler))
+    # Run forever
+    while True:
+        await asyncio.sleep(3600)
 
 
 def main():
-    scheduler = AsyncIOScheduler(timezone=settings.timezone)
-    minute, hour, dom, month, dow = settings.daily_scrape_cron.split()
-    scheduler.add_job(
-        daily_pipeline,
-        CronTrigger(minute=minute, hour=hour, day=dom, month=month, day_of_week=dow,
-                    timezone=settings.timezone),
-        id="daily_pipeline", name="Daily scrape + score",
-        replace_existing=True, misfire_grace_time=60 * 30,
-    )
-    # Account balance snapshots — every 6 hours.
-    scheduler.add_job(
-        snapshot_all_accounts,
-        CronTrigger(hour="*/6", minute=15, timezone=settings.timezone),
-        id="account_stats_snapshot", name="Account balance snapshot",
-        replace_existing=True, misfire_grace_time=60 * 15,
-    )
-    scheduler.start()
-    log.info("scheduler_started", cron=settings.daily_scrape_cron, tz=settings.timezone)
-    loop = asyncio.get_event_loop()
     try:
-        loop.run_forever()
+        asyncio.run(_async_main())
     except KeyboardInterrupt:
-        scheduler.shutdown()
+        pass
 
 
 if __name__ == "__main__":
