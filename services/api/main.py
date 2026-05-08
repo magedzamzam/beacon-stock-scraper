@@ -41,6 +41,7 @@ def healthz():
     return {"ok": True}
 
 app.include_router(auth_router)
+app.include_router(broker_quotes_router)
 app.include_router(stocks_router)
 app.include_router(watchlists_router)
 app.include_router(portfolio_router)
@@ -50,5 +51,4 @@ app.include_router(positions_router)
 app.include_router(instruments_router)
 app.include_router(stats_router)
 app.include_router(settings_router)
-app.include_router(broker_quotes_router)
 app.include_router(admin_router)
