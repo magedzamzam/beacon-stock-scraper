@@ -28,6 +28,10 @@ class Exchange(Base):
     code: Mapped[str] = mapped_column(String(10), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     country: Mapped[Optional[str]] = mapped_column(String(100))
+    # URL path template for stockanalysis.com. {ticker} is the placeholder.
+    # MENA / LSE: '/quote/dfm/{ticker}/', '/quote/lon/{ticker}/'
+    # US:         '/stocks/{ticker}/'
+    stockanalysis_url_template: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class Stock(Base):

@@ -1,17 +1,20 @@
 """Per-stock scraping pipeline.
 
-For each active stock we fetch:
-    - /quote/{exchange}/{ticker}/             (overview)
-    - /quote/{exchange}/{ticker}/statistics/  (statistics)
+For each active stock we fetch (URL pattern depends on exchange — see
+Exchange.stockanalysis_url_template):
+    * MENA / LSE: /quote/{exchange}/{ticker}/[statistics/]
+    * US:         /stocks/{ticker}/[statistics/]
 
-We then UPSERT into:
+We then UPSERT into the parallel-schema tables:
     stocks (company metadata),
-    stock_market_daily (price + valuations of the day),
-    stock_valuation (TTM ratios),
-    stock_financials (TTM snapshot, period_type='TTM'),
-    stock_technicals (RSI / SMAs),
+    stock_history_quote (daily OHLC time-series),
+    stock_fin_ratios (PE / PB / EV multiples per period),
+    stock_fin_statement (P&L items per period),
+    stock_fin_cashflow (cashflow items per period),
+    stock_mkt_technicals (RSI / SMAs / momentum windows / 52w / beta),
+    stock_mkt_dividends (dividend metrics — one row per stock),
     stock_news (headlines),
-    stock_latest_snapshot (denormalised cache for fast UI),
+    stock_quotes (canonical 'now' row — denormalised cache for fast UI),
     scrape_runs (audit trail, per source).
 """
 from __future__ import annotations
@@ -45,8 +48,17 @@ log = configure_logging("scraper")
 settings = get_settings()
 
 
-def _quote_url(exchange_code: str, ticker: str, sub: str = "") -> str:
-    base = f"{settings.scraper_base_url}/quote/{exchange_code.lower()}/{ticker}/"
+def _quote_url(url_template: str, ticker: str, sub: str = "") -> str:
+    """Build a stockanalysis.com URL for this stock.
+
+    url_template is the per-exchange pattern from Exchange.stockanalysis_url_template,
+    e.g. '/quote/dfm/{ticker}/' or '/stocks/{ticker}/'. We substitute the ticker
+    and optionally append a sub-page (e.g. 'statistics').
+    """
+    base = settings.scraper_base_url + url_template.format(ticker=ticker)
+    # Ensure trailing slash on the base before any sub-page is appended.
+    if not base.endswith("/"):
+        base += "/"
     return base + (sub.rstrip("/") + "/" if sub else "")
 
 
@@ -324,16 +336,20 @@ def _update_stock_metadata(session: Session, stock: Stock, blurb: dict):
 
 # ----- main per-stock job -----
 
-async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ticker: str,
-                     mode: str = "full"):
+async def scrape_one(fetcher: HttpFetcher, stock_id: int, ticker: str,
+                     url_template: str, mode: str = "full"):
     """One stock = one or two HTTP calls + one DB transaction.
 
+    url_template comes from Exchange.stockanalysis_url_template — e.g.
+    '/quote/dfm/{ticker}/' for DFM or '/stocks/{ticker}/' for NASDAQ.
+
     mode='daily' fetches only the overview page (price, technicals, news,
-    analyst block) and writes the price/snapshot/technicals/news tables.
+    analyst block) and writes the new parallel-schema price + technicals + news.
 
     mode='full' (default) additionally fetches the statistics page so we can
-    populate stock_valuation / stock_financials_ttm with multi-period growth
-    metrics. That data only changes quarterly, so daily mode skips it.
+    populate stock_fin_ratios / stock_fin_statement / stock_fin_cashflow with
+    multi-period growth metrics. That data only changes quarterly, so daily
+    mode skips it.
     """
     today = date.today()
     overview_html: str | None = None
@@ -342,14 +358,14 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
     err: str | None = None
 
     try:
-        overview_status, overview_html = await fetcher.get(_quote_url(exchange_code, ticker))
+        overview_status, overview_html = await fetcher.get(_quote_url(url_template, ticker))
     except Exception as exc:
         err = f"overview: {exc}"
         log.warning("overview_fetch_failed", ticker=ticker, error=str(exc))
 
     if mode == "full":
         try:
-            stats_status, statistics_html = await fetcher.get(_quote_url(exchange_code, ticker, "statistics"))
+            stats_status, statistics_html = await fetcher.get(_quote_url(url_template, ticker, "statistics"))
         except Exception as exc:
             log.warning("stats_fetch_failed", ticker=ticker, error=str(exc))
             if not err:
@@ -479,7 +495,7 @@ async def scrape_all_active(mode: str = "full",
     """
     with SessionLocal() as session:
         stmt = (
-            select(Stock.id, Exchange.code, Stock.ticker)
+            select(Stock.id, Stock.ticker, Exchange.stockanalysis_url_template)
             .join(Exchange, Stock.exchange_id == Exchange.id)
             .where(Stock.active.is_(True), Stock.is_scraping_enabled.is_(True))
         )
@@ -496,7 +512,8 @@ async def scrape_all_active(mode: str = "full",
         async def _wrapped(row):
             nonlocal successes, failures
             try:
-                await scrape_one(fetcher, row.id, row.code, row.ticker, mode=mode)
+                await scrape_one(fetcher, row.id, row.ticker,
+                                 row.stockanalysis_url_template, mode=mode)
                 successes += 1
             except Exception as exc:
                 failures += 1
@@ -517,7 +534,7 @@ async def scrape_by_ticker(exchange_code: str, ticker: str) -> dict:
     """On-demand scrape for a single ticker (used by API)."""
     with SessionLocal() as session:
         row = session.execute(
-            select(Stock.id, Exchange.code, Stock.ticker)
+            select(Stock.id, Stock.ticker, Exchange.stockanalysis_url_template)
             .join(Exchange, Stock.exchange_id == Exchange.id)
             .where(Exchange.code == exchange_code.lower(), Stock.ticker == ticker.upper())
         ).first()
@@ -525,5 +542,5 @@ async def scrape_by_ticker(exchange_code: str, ticker: str) -> dict:
         return {"ok": False, "error": "stock_not_found"}
 
     async with HttpFetcher() as fetcher:
-        await scrape_one(fetcher, row.id, row.code, row.ticker)
+        await scrape_one(fetcher, row.id, row.ticker, row.stockanalysis_url_template)
     return {"ok": True, "exchange": exchange_code, "ticker": ticker}
