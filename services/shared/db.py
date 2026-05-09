@@ -487,6 +487,261 @@ class JobRun(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
 
 
+# =========================================================================
+# Parallel-schema models (Round 1 created the tables, Round 2 dual-writes,
+# Round 3 switches reads, Round 4 drops the old tables).
+# =========================================================================
+
+class StockQuote(Base):
+    """Denormalised 'current state' per stock — the canonical row that the
+    screener and stock detail header will read from once Round 3 is in place.
+
+    Maintained by:
+      * scraper.pipeline._upsert_quote() after each daily scrape
+      * scheduler.run_broker_quote_refresh() after each broker quote pull
+      * recommender.pipeline after each scoring run (composite_score, verdict)
+      * routers_admin.override (manual price override)
+    """
+    __tablename__ = "stock_quotes"
+    stock_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), primary_key=True,
+    )
+    # Canonical price block
+    current_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    prev_close: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    change_abs: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    change_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    price_source: Mapped[Optional[str]] = mapped_column(String(16))
+    price_fetched_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Denormalised for fast list rendering
+    market_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    currency: Mapped[Optional[str]] = mapped_column(String(8))
+    pe_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    pe_forward: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    dividend_yield_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    rsi_14: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    week_52_high: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    week_52_low: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    analyst_target: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    analyst_upside_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    # Composite scoring (materialised by recommender)
+    composite_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    verdict: Mapped[Optional[str]] = mapped_column(String(16))
+    last_updated: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StockCurQuote(Base):
+    """Live broker quote per (stock, broker). Replaces stock_broker_quotes
+    in Round 4.
+    """
+    __tablename__ = "stock_cur_quote"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False)
+    broker_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("brokers.id", ondelete="CASCADE"), nullable=False)
+    broker_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    offer: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    last_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    open_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    high_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    low_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    close_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    volume: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    # Renamed from change_abs/change_pct on stock_broker_quotes — these often
+    # disagree with prev-close-based change. Don't use as canonical.
+    broker_change_abs: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    broker_change_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    currency: Mapped[Optional[str]] = mapped_column(String(8))
+    market_status: Mapped[Optional[str]] = mapped_column(String(32))
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("stock_id", "broker_id"),)
+
+
+class StockHistoryQuote(Base):
+    """Daily OHLC + volume time series per (stock, trading_date).
+    NO broker_id — history is per-exchange.
+    """
+    __tablename__ = "stock_history_quote"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False)
+    trading_date: Mapped[date] = mapped_column(Date, nullable=False)
+    open_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    high_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    low_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    close_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    volume: Mapped[Optional[int]] = mapped_column(BigInteger)
+    market_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    change_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    source: Mapped[Optional[str]] = mapped_column(String(32))
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("stock_id", "trading_date"),)
+
+
+class StockFinRatios(Base):
+    """Valuation ratios time series per (stock, period_end, period_type)."""
+    __tablename__ = "stock_fin_ratios"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    period_type: Mapped[str] = mapped_column(String(16), nullable=False, default="TTM")
+    pe_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    pe_forward: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    ps_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    pb_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    p_fcf_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    peg_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    ev_sales: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    ev_ebitda: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    roe: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    roa: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    roic: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    sbc_revenue_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    fcf_per_share: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    snapshot_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    snapshot_market_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("stock_id", "period_end", "period_type"),)
+
+
+class StockFinStatement(Base):
+    """P&L items + growth metrics, time series."""
+    __tablename__ = "stock_fin_statement"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    period_type: Mapped[str] = mapped_column(String(16), nullable=False, default="TTM")
+    last_report_date: Mapped[Optional[date]] = mapped_column(Date)
+    revenue: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    gross_profit: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    operating_income: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    net_income: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    ebitda: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    income_tax: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    eps_diluted: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    revenue_growth_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    revenue_growth_3y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    revenue_growth_5y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    gross_profit_growth_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    operating_income_growth_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    net_income_growth_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    eps_growth_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    eps_growth_3y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    eps_growth_5y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    profitable_years: Mapped[Optional[int]] = mapped_column(Integer)
+    is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("stock_id", "period_end", "period_type", "is_estimate"),)
+
+
+class StockFinCashflow(Base):
+    """Cashflow items, time series. SBC lives here (non-cash expense)."""
+    __tablename__ = "stock_fin_cashflow"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    period_type: Mapped[str] = mapped_column(String(16), nullable=False, default="TTM")
+    operating_cash_flow: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    investing_cash_flow: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    financing_cash_flow: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    net_cash_flow: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    cap_ex: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    free_cash_flow: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    sbc: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    fcf_minus_sbc: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    net_borrowing: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("stock_id", "period_end", "period_type", "is_estimate"),)
+
+
+class StockMktDividends(Base):
+    """Dividend metrics, current state only — one row per stock."""
+    __tablename__ = "stock_mkt_dividends"
+    stock_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), primary_key=True,
+    )
+    dividend_yield_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    dividend_per_share: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    last_dividend_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    ex_dividend_date: Mapped[Optional[date]] = mapped_column(Date)
+    payout_ratio_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    payout_frequency: Mapped[Optional[str]] = mapped_column(String(32))
+    div_growth_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    div_growth_3y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    div_growth_5y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    growth_years_streak: Mapped[Optional[int]] = mapped_column(Integer)
+    payment_years_streak: Mapped[Optional[int]] = mapped_column(Integer)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StockMktTechnicals(Base):
+    """Technical indicators time series per (stock, trading_date).
+    Replaces stock_technicals + stock_performance_daily in Round 4.
+    """
+    __tablename__ = "stock_mkt_technicals"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False)
+    trading_date: Mapped[date] = mapped_column(Date, nullable=False)
+    rsi_14: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    sma_50: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    sma_200: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    ema_20: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    macd: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    macd_signal: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    atr_14: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    volatility_30d: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    above_sma_50: Mapped[Optional[bool]] = mapped_column(Boolean)
+    above_sma_200: Mapped[Optional[bool]] = mapped_column(Boolean)
+    golden_cross: Mapped[Optional[bool]] = mapped_column(Boolean)
+    price_chg_1m_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    price_chg_3m_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    price_chg_6m_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    price_chg_1y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    price_chg_3y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    price_chg_5y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    total_ret_1y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    total_ret_3y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    total_ret_5y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    ret_cagr_3y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    ret_cagr_5y_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    week_52_high: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    week_52_low: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    week_52_high_change_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    week_52_low_change_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    ath_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    ath_change_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    volume_daily: Mapped[Optional[int]] = mapped_column(BigInteger)
+    dollar_volume_daily: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    avg_dollar_volume_30d: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    beta: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("stock_id", "trading_date"),)
+
+
+class StockScoring(Base):
+    """Append-only scoring history. Each scoring run produces a new row.
+    The latest row is denormalised onto stock_quotes.composite_score / verdict.
+    """
+    __tablename__ = "stock_scoring"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False)
+    composite_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    verdict: Mapped[Optional[str]] = mapped_column(String(16))
+    score_valuation: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    score_growth: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    score_quality: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    score_momentum: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    score_income: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    score_risk: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    pros: Mapped[Optional[list]] = mapped_column(JSONB)
+    cons: Mapped[Optional[list]] = mapped_column(JSONB)
+    risk_flags: Mapped[Optional[list]] = mapped_column(JSONB)
+    model_version: Mapped[Optional[str]] = mapped_column(String(32))
+    inputs_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # ---------- Engine factory ----------
 _settings = get_settings()
 _engine = create_engine(_settings.database_url_sync, pool_pre_ping=True, pool_size=10)

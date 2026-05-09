@@ -21,6 +21,8 @@ from sqlalchemy.orm import Session
 
 from shared.db import (
     Broker, BrokerInstrument, Stock, StockBrokerQuote, User,
+    # Round-2 dual-write targets:
+    StockCurQuote, StockHistoryQuote, StockQuote,
 )
 
 from .auth import get_current_user, get_db
@@ -109,6 +111,60 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
         set_={k: v for k, v in values.items() if k not in ("stock_id", "broker_id", "broker_symbol")},
     )
     db.execute(stmt)
+
+    # Round-2 dual-write: same payload into stock_cur_quote.
+    # change_abs/change_pct on the broker quote are renamed to broker_change_*
+    # since they often disagree with prev-close-based change.
+    cur_quote_values = {
+        "stock_id": stock_id, "broker_id": broker_id, "broker_symbol": broker_symbol,
+        "bid": values["bid"], "offer": values["offer"],
+        "last_price": values["last_price"],
+        "open_price": values["open_price"], "high_price": values["high_price"],
+        "low_price": values["low_price"], "close_price": values["close_price"],
+        "broker_change_abs": values["change_abs"],
+        "broker_change_pct": values["change_pct"],
+        "volume": values["volume"], "currency": values["currency"],
+        "market_status": values["market_status"], "fetched_at": values["fetched_at"],
+    }
+    cq_stmt = pg_insert(StockCurQuote).values(**cur_quote_values).on_conflict_do_update(
+        index_elements=["stock_id", "broker_id"],
+        set_={k: v for k, v in cur_quote_values.items()
+              if k not in ("stock_id", "broker_id", "broker_symbol")},
+    )
+    db.execute(cq_stmt)
+
+    # Round-2 dual-write: refresh canonical stock_quotes row with broker price.
+    # We update only the price block; preserve composite_score/verdict.
+    last_price = values["last_price"]
+    if last_price is not None:
+        # prev_close from history (second-most-recent close)
+        hist = db.execute(
+            select(StockHistoryQuote.close_price)
+            .where(StockHistoryQuote.stock_id == stock_id,
+                   StockHistoryQuote.close_price.is_not(None))
+            .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
+        ).all()
+        prev_close = hist[1].close_price if len(hist) >= 2 else None
+        change_abs = change_pct = None
+        if prev_close is not None and prev_close != 0:
+            change_abs = last_price - prev_close
+            change_pct = (change_abs / prev_close) * 100
+        sq_record = {
+            "stock_id": stock_id,
+            "current_price": last_price,
+            "prev_close": prev_close,
+            "change_abs": change_abs,
+            "change_pct": change_pct,
+            "price_source": "broker",
+            "price_fetched_at": values["fetched_at"],
+            "last_updated": datetime.utcnow(),
+        }
+        sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
+            index_elements=["stock_id"],
+            set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+        )
+        db.execute(sq_stmt)
+
     db.commit()
     return payload
 

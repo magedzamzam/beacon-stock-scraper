@@ -27,6 +27,10 @@ from sqlalchemy.orm import Session
 from shared.db import (
     SessionLocal, Stock, Exchange, ScrapeRun, StockMarketDaily, StockValuation,
     StockFinancials, StockTechnicals, StockNews, StockLatestSnapshot,
+    StockBrokerQuote,
+    # Round-2 dual-write targets:
+    StockQuote, StockHistoryQuote, StockFinRatios, StockFinStatement,
+    StockFinCashflow, StockMktDividends, StockMktTechnicals,
 )
 from shared.logging_setup import configure_logging
 from shared.settings import get_settings
@@ -123,6 +127,241 @@ def _upsert_snapshot(session: Session, stock_id: int, payload: dict):
     stmt = pg_insert(StockLatestSnapshot).values(**record)
     stmt = stmt.on_conflict_do_update(
         index_elements=["stock_id"],
+        set_={k: stmt.excluded[k] for k in record if k != "stock_id"},
+    )
+    session.execute(stmt)
+
+
+# =============================================================================
+# Round-2 dual-write helpers. Each writes to the new parallel-schema table
+# alongside the old one. Round 3 will switch reads to these; Round 4 will drop
+# the old tables and remove the old _upsert_* helpers.
+# =============================================================================
+
+def _upsert_history_quote(session: Session, stock_id: int, today: date,
+                          market: dict, change_pct, source: str = "scrape"):
+    """Write OHLC + volume + market_cap + change_pct to stock_history_quote."""
+    record = {
+        "stock_id": stock_id, "trading_date": today,
+        "open_price": market.get("open_price"),
+        "high_price": market.get("high_price"),
+        "low_price": market.get("low_price"),
+        "close_price": market.get("close_price"),
+        "volume": market.get("volume"),
+        "market_cap": market.get("market_cap"),
+        "change_pct": change_pct,
+        "source": source,
+        "scraped_at": datetime.utcnow(),
+    }
+    if not any(record[k] is not None for k in
+               ("open_price", "high_price", "low_price", "close_price", "volume")):
+        return  # nothing meaningful to write
+    stmt = pg_insert(StockHistoryQuote).values(**record)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id", "trading_date"],
+        set_={k: stmt.excluded[k] for k in record if k not in ("stock_id", "trading_date")},
+    )
+    session.execute(stmt)
+
+
+def _upsert_fin_ratios(session: Session, stock_id: int, period_end: date,
+                       period_type: str, ratios: dict):
+    """Write valuation ratios to stock_fin_ratios."""
+    if not any(v is not None for v in ratios.values()):
+        return
+    record = {
+        "stock_id": stock_id, "period_end": period_end, "period_type": period_type,
+        "scraped_at": datetime.utcnow(),
+        **ratios,
+    }
+    stmt = pg_insert(StockFinRatios).values(**record)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id", "period_end", "period_type"],
+        set_={k: stmt.excluded[k] for k in record if k not in ("stock_id", "period_end", "period_type")},
+    )
+    session.execute(stmt)
+
+
+def _upsert_fin_statement(session: Session, stock_id: int, period_end: date,
+                          period_type: str, payload: dict, is_estimate: bool = False):
+    """Write P&L items to stock_fin_statement."""
+    if not any(v is not None for v in payload.values()):
+        return
+    record = {
+        "stock_id": stock_id, "period_end": period_end, "period_type": period_type,
+        "is_estimate": is_estimate, "scraped_at": datetime.utcnow(),
+        **payload,
+    }
+    stmt = pg_insert(StockFinStatement).values(**record)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id", "period_end", "period_type", "is_estimate"],
+        set_={k: stmt.excluded[k] for k in record
+              if k not in ("stock_id", "period_end", "period_type", "is_estimate")},
+    )
+    session.execute(stmt)
+
+
+def _upsert_fin_cashflow(session: Session, stock_id: int, period_end: date,
+                         period_type: str, payload: dict, is_estimate: bool = False):
+    """Write cashflow items to stock_fin_cashflow."""
+    if not any(v is not None for v in payload.values()):
+        return
+    record = {
+        "stock_id": stock_id, "period_end": period_end, "period_type": period_type,
+        "is_estimate": is_estimate, "scraped_at": datetime.utcnow(),
+        **payload,
+    }
+    stmt = pg_insert(StockFinCashflow).values(**record)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id", "period_end", "period_type", "is_estimate"],
+        set_={k: stmt.excluded[k] for k in record
+              if k not in ("stock_id", "period_end", "period_type", "is_estimate")},
+    )
+    session.execute(stmt)
+
+
+def _upsert_mkt_dividends(session: Session, stock_id: int, payload: dict):
+    """Write dividend metrics to stock_mkt_dividends (one row per stock)."""
+    if not any(v is not None for v in payload.values()):
+        return
+    record = {"stock_id": stock_id, "scraped_at": datetime.utcnow(), **payload}
+    stmt = pg_insert(StockMktDividends).values(**record)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id"],
+        set_={k: stmt.excluded[k] for k in record if k != "stock_id"},
+    )
+    session.execute(stmt)
+
+
+def _upsert_mkt_technicals(session: Session, stock_id: int, today: date, payload: dict):
+    """Write technical indicators to stock_mkt_technicals."""
+    if not any(v is not None for v in payload.values()):
+        return
+    record = {
+        "stock_id": stock_id, "trading_date": today,
+        "scraped_at": datetime.utcnow(),
+        **payload,
+    }
+    stmt = pg_insert(StockMktTechnicals).values(**record)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id", "trading_date"],
+        set_={k: stmt.excluded[k] for k in record if k not in ("stock_id", "trading_date")},
+    )
+    session.execute(stmt)
+
+
+def _recompute_stock_quote(session: Session, stock_id: int):
+    """Refresh stock_quotes (the canonical "now" row) from latest scrape data.
+
+    Strategy:
+      * current_price: prefer fresh broker quote (<30 min old) else latest
+        scrape close from stock_history_quote.
+      * prev_close: second-most-recent close in stock_history_quote.
+      * change_abs / change_pct: derived from current_price + prev_close.
+      * Denormalised ratios from latest stock_fin_ratios + stock_mkt_technicals
+        + stock_analyst_consensus + stock_mkt_dividends.
+
+    Called at the end of scrape_one. Round-3 will move broker-quote refresh
+    callers (broker_quotes router, scheduler) to also call this.
+    """
+    from sqlalchemy import select, desc as _desc  # local imports to keep top tidy
+    from shared.db import StockAnalystConsensus  # noqa: PLC0415
+
+    # --- price block --------------------------------------------------------
+    hist = session.execute(
+        select(StockHistoryQuote.close_price, StockHistoryQuote.market_cap,
+               StockHistoryQuote.trading_date)
+        .where(StockHistoryQuote.stock_id == stock_id,
+               StockHistoryQuote.close_price.is_not(None))
+        .order_by(_desc(StockHistoryQuote.trading_date)).limit(2)
+    ).all()
+    latest_close = hist[0].close_price if hist else None
+    prev_close = hist[1].close_price if len(hist) >= 2 else None
+    market_cap = hist[0].market_cap if hist else None
+
+    # See if a fresh broker quote exists for this stock (in old table — Round 4
+    # switches to stock_cur_quote).
+    bq = session.execute(
+        select(StockBrokerQuote.last_price, StockBrokerQuote.fetched_at)
+        .where(StockBrokerQuote.stock_id == stock_id,
+               StockBrokerQuote.last_price.is_not(None))
+        .order_by(_desc(StockBrokerQuote.fetched_at)).limit(1)
+    ).first()
+    use_broker = False
+    if bq is not None and bq.fetched_at is not None:
+        age = (datetime.utcnow() - bq.fetched_at).total_seconds()
+        if age < 30 * 60:
+            use_broker = True
+
+    if use_broker:
+        current_price = bq.last_price
+        price_source = "broker"
+        price_fetched_at = bq.fetched_at
+    elif latest_close is not None:
+        current_price = latest_close
+        price_source = "scrape"
+        price_fetched_at = datetime.utcnow()
+    else:
+        current_price = None
+        price_source = None
+        price_fetched_at = None
+
+    change_abs = change_pct = None
+    if current_price is not None and prev_close is not None and prev_close != 0:
+        change_abs = current_price - prev_close
+        change_pct = (change_abs / prev_close) * 100
+
+    # --- denormalised ratios + technicals + analyst -------------------------
+    ratios = session.execute(
+        select(StockFinRatios.pe_ratio, StockFinRatios.pe_forward)
+        .where(StockFinRatios.stock_id == stock_id)
+        .order_by(_desc(StockFinRatios.period_end), _desc(StockFinRatios.id)).limit(1)
+    ).first()
+    div = session.execute(
+        select(StockMktDividends.dividend_yield_pct).where(StockMktDividends.stock_id == stock_id)
+    ).first()
+    tech = session.execute(
+        select(StockMktTechnicals.rsi_14, StockMktTechnicals.week_52_high,
+               StockMktTechnicals.week_52_low)
+        .where(StockMktTechnicals.stock_id == stock_id)
+        .order_by(_desc(StockMktTechnicals.trading_date)).limit(1)
+    ).first()
+    analyst = session.execute(
+        select(StockAnalystConsensus.target_price, StockAnalystConsensus.implied_upside_pct)
+        .where(StockAnalystConsensus.stock_id == stock_id)
+        .order_by(_desc(StockAnalystConsensus.consensus_date)).limit(1)
+    ).first()
+
+    stock = session.get(Stock, stock_id)
+    currency = stock.currency if stock else None
+
+    # Build the upsert. Use ON CONFLICT DO UPDATE to PRESERVE columns we don't
+    # set (composite_score, verdict — those are owned by recommender).
+    record = {
+        "stock_id": stock_id,
+        "current_price": current_price,
+        "prev_close": prev_close,
+        "change_abs": change_abs,
+        "change_pct": change_pct,
+        "price_source": price_source,
+        "price_fetched_at": price_fetched_at,
+        "market_cap": market_cap,
+        "currency": currency,
+        "pe_ratio": ratios.pe_ratio if ratios else None,
+        "pe_forward": ratios.pe_forward if ratios else None,
+        "dividend_yield_pct": div.dividend_yield_pct if div else None,
+        "rsi_14": tech.rsi_14 if tech else None,
+        "week_52_high": tech.week_52_high if tech else None,
+        "week_52_low": tech.week_52_low if tech else None,
+        "analyst_target": analyst.target_price if analyst else None,
+        "analyst_upside_pct": analyst.implied_upside_pct if analyst else None,
+        "last_updated": datetime.utcnow(),
+    }
+    stmt = pg_insert(StockQuote).values(**record)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id"],
+        # Only overwrite columns we just set — preserve composite_score / verdict
+        # (those are owned by the recommender).
         set_={k: stmt.excluded[k] for k in record if k != "stock_id"},
     )
     session.execute(stmt)
@@ -225,6 +464,8 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
 
             if any(v is not None for v in market.values()):
                 _upsert_market_daily(session, stock_id, today, market)
+            # Round-2 dual-write: OHLC → stock_history_quote
+            _upsert_history_quote(session, stock_id, today, market, change_pct)
 
             # Valuation + multi-period financials change quarterly. Skip in
             # daily mode to keep the scrape lightweight.
@@ -234,8 +475,54 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
                     _upsert_valuation(session, stock_id, fiscal_year, valuation)
                 if any(v is not None for v in financials.values()):
                     _upsert_financials_ttm(session, stock_id, fiscal_year, financials)
+
+                # Round-2 dual-write: split into ratios / statement / cashflow
+                # period_end = Dec 31 of fiscal_year (best we can derive without
+                # an explicit reporting date from the scraper).
+                period_end = today.replace(month=12, day=31)
+                _upsert_fin_ratios(session, stock_id, period_end, "ANNUAL", {
+                    "pe_ratio": valuation.get("pe") or market.get("pe_ratio"),
+                    "pe_forward": market.get("forward_pe"),
+                    "ps_ratio": None,
+                    "pb_ratio": valuation.get("price_to_book"),
+                    "p_fcf_ratio": None,
+                    "ev_sales": valuation.get("ev_sales"),
+                    "ev_ebitda": valuation.get("ev_ebitda"),
+                    "snapshot_price": market.get("close_price"),
+                    "snapshot_market_cap": market.get("market_cap"),
+                })
+                _upsert_fin_statement(session, stock_id, period_end, "TTM", {
+                    "revenue": financials.get("revenue"),
+                    "operating_income": financials.get("operating_income"),
+                    "net_income": financials.get("net_income"),
+                    "ebitda": financials.get("ebitda"),
+                })
+                _upsert_fin_cashflow(session, stock_id, period_end, "TTM", {
+                    "operating_cash_flow": financials.get("operating_cash_flow"),
+                    "free_cash_flow": financials.get("free_cash_flow"),
+                })
+
             if any(v is not None for v in technicals.values()):
                 _upsert_technicals(session, stock_id, today, technicals)
+            # Round-2 dual-write: technicals → stock_mkt_technicals
+            # Also fold in 52w from market_daily payload since they belong with technicals.
+            _upsert_mkt_technicals(session, stock_id, today, {
+                **technicals,
+                "week_52_high": market.get("week_52_high"),
+                "week_52_low": market.get("week_52_low"),
+                "beta": market.get("beta"),
+                "volume_daily": market.get("volume"),
+            })
+
+            # Round-2 dual-write: dividends → stock_mkt_dividends (one row per stock)
+            _upsert_mkt_dividends(session, stock_id, {
+                "dividend_yield_pct": market.get("dividend_yield_pct"),
+                "dividend_per_share": market.get("dividend"),
+                "ex_dividend_date": market.get("ex_dividend_date"),
+                "payout_ratio_pct": market.get("payout_ratio_pct"),
+                "payout_frequency": market.get("payout_frequency"),
+                "div_growth_yoy": market.get("dividend_growth_pct"),
+            })
 
             if news:
                 _upsert_news(session, stock_id, news)
@@ -250,6 +537,10 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
                 "week_52_low": market.get("week_52_low"),
                 "rsi_14": technicals.get("rsi_14"),
             })
+            # Round-2 dual-write: refresh canonical stock_quotes row.
+            # MUST be called LAST since it reads from stock_history_quote +
+            # stock_fin_ratios + stock_mkt_technicals + stock_mkt_dividends.
+            _recompute_stock_quote(session, stock_id)
 
             _record_run(session, stock_id, "stockanalysis.com", "OK",
                         overview_status or stats_status, None)

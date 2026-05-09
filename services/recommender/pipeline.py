@@ -7,7 +7,7 @@ Reads the latest data for each stock from the DB and produces:
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -18,6 +18,8 @@ from shared.db import (
     SessionLocal, Stock, StockMarketDaily, StockPerformanceDaily, StockValuation,
     StockFinancials, StockTechnicals, StockAnalystConsensus, StockRecommendation,
     PortfolioPosition, PositionRecommendation, StockLatestSnapshot,
+    # Round-2 dual-write targets:
+    StockQuote, StockScoring,
 )
 from shared.logging_setup import configure_logging
 
@@ -183,6 +185,51 @@ def _score_and_persist(session, stock_id: int, today: date) -> str:
         set_={"composite_score": result.composite, "verdict": result.verdict},
     )
     session.execute(snap_stmt)
+
+    # Round-2 dual-write: append a row to stock_scoring (new history table).
+    # Component scores cut differently from the old StockRecommendation:
+    #   old fundamental → mapped to score_quality (best fit)
+    #   old technical   → mapped to score_momentum
+    #   old analyst     → no direct equivalent — preserved in inputs_snapshot
+    session.add(StockScoring(
+        stock_id=stock_id,
+        composite_score=result.composite,
+        verdict=result.verdict,
+        score_valuation=result.valuation,
+        score_momentum=result.momentum,
+        score_quality=result.quality,
+        score_risk=result.risk,
+        # score_growth, score_income left NULL — old model didn't compute them
+        pros=result.pros,
+        cons=result.cons,
+        risk_flags=None,
+        model_version="v1.1",
+        inputs_snapshot={
+            "fundamental_score": float(result.fundamental) if result.fundamental is not None else None,
+            "technical_score": float(result.technical) if result.technical is not None else None,
+            "analyst_score": float(result.analyst) if result.analyst is not None else None,
+            "score_date": str(today),
+        },
+        updated_at=datetime.utcnow(),
+    ))
+
+    # Round-2 dual-write: also denormalise composite_score + verdict onto
+    # stock_quotes (the canonical row). Preserve other columns by only setting
+    # the two we own here.
+    sq_stmt = pg_insert(StockQuote).values(
+        stock_id=stock_id,
+        composite_score=result.composite,
+        verdict=result.verdict,
+        last_updated=datetime.utcnow(),
+    ).on_conflict_do_update(
+        index_elements=["stock_id"],
+        set_={
+            "composite_score": result.composite,
+            "verdict": result.verdict,
+            "last_updated": datetime.utcnow(),
+        },
+    )
+    session.execute(sq_stmt)
 
     return result.verdict
 

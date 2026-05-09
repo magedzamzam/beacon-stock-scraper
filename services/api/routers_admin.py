@@ -197,7 +197,7 @@ def override_stock(
         if prev and prev > 0:
             last_change_pct = (new_price - prev) / prev * Decimal("100")
 
-        # 3) Snapshot.
+        # 3) Snapshot (old).
         snap = {"last_close": new_price, "last_updated": datetime.utcnow()}
         if last_change_pct is not None:
             snap["last_change_pct"] = last_change_pct
@@ -205,6 +205,37 @@ def override_stock(
         changes["last_close"] = float(new_price)
         if last_change_pct is not None:
             changes["last_change_pct"] = float(last_change_pct)
+
+        # 4) Round-2 dual-write: stock_history_quote (today's close).
+        from shared.db import StockHistoryQuote, StockQuote
+        hq_stmt = pg_insert(StockHistoryQuote).values(
+            stock_id=stock.id, trading_date=today,
+            close_price=new_price, change_pct=last_change_pct,
+            source="manual_override", scraped_at=datetime.utcnow(),
+        ).on_conflict_do_update(
+            index_elements=["stock_id", "trading_date"],
+            set_={"close_price": new_price, "change_pct": last_change_pct,
+                  "source": "manual_override", "scraped_at": datetime.utcnow()},
+        )
+        db.execute(hq_stmt)
+
+        # 5) Round-2 dual-write: stock_quotes (canonical row).
+        ch_abs = (new_price - prev) if (prev and prev > 0) else None
+        sq_stmt = pg_insert(StockQuote).values(
+            stock_id=stock.id, current_price=new_price,
+            prev_close=prev, change_abs=ch_abs, change_pct=last_change_pct,
+            price_source="scrape", price_fetched_at=datetime.utcnow(),
+            last_updated=datetime.utcnow(),
+        ).on_conflict_do_update(
+            index_elements=["stock_id"],
+            set_={
+                "current_price": new_price, "prev_close": prev,
+                "change_abs": ch_abs, "change_pct": last_change_pct,
+                "price_source": "scrape", "price_fetched_at": datetime.utcnow(),
+                "last_updated": datetime.utcnow(),
+            },
+        )
+        db.execute(sq_stmt)
 
     # ---- Analyst consensus ----
     if any(v is not None for v in (req.analyst_target, req.analyst_count, req.analyst_rating)):

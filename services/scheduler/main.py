@@ -233,7 +233,11 @@ async def run_broker_quote_refresh():
     rid, started = _start_run("job.broker_quote_refresh")
     try:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
-        from shared.db import BrokerInstrument, StockBrokerQuote
+        from shared.db import (
+            BrokerInstrument, StockBrokerQuote,
+            # Round-2 dual-write targets:
+            StockCurQuote, StockHistoryQuote, StockQuote,
+        )
 
         with SessionLocal() as s:
             mappings = s.execute(
@@ -281,12 +285,67 @@ async def run_broker_quote_refresh():
                 }
                 try:
                     with SessionLocal() as s:
+                        # Old table (still authoritative for now)
                         stmt = pg_insert(StockBrokerQuote).values(**values).on_conflict_do_update(
                             index_elements=["stock_id", "broker_id"],
                             set_={k: v for k, v in values.items()
                                   if k not in ("stock_id", "broker_id", "broker_symbol")},
                         )
                         s.execute(stmt)
+
+                        # Round-2 dual-write: new stock_cur_quote
+                        cq_values = {
+                            "stock_id": stock_id, "broker_id": broker_id,
+                            "broker_symbol": broker_symbol,
+                            "bid": values["bid"], "offer": values["offer"],
+                            "last_price": values["last_price"],
+                            "open_price": values["open_price"],
+                            "high_price": values["high_price"],
+                            "low_price": values["low_price"],
+                            "close_price": values["close_price"],
+                            "broker_change_abs": values["change_abs"],
+                            "broker_change_pct": values["change_pct"],
+                            "volume": values["volume"], "currency": values["currency"],
+                            "market_status": values["market_status"],
+                            "fetched_at": values["fetched_at"],
+                        }
+                        cq_stmt = pg_insert(StockCurQuote).values(**cq_values).on_conflict_do_update(
+                            index_elements=["stock_id", "broker_id"],
+                            set_={k: v for k, v in cq_values.items()
+                                  if k not in ("stock_id", "broker_id", "broker_symbol")},
+                        )
+                        s.execute(cq_stmt)
+
+                        # Round-2 dual-write: refresh canonical stock_quotes price
+                        last_price = values["last_price"]
+                        if last_price is not None:
+                            hist = s.execute(
+                                select(StockHistoryQuote.close_price)
+                                .where(StockHistoryQuote.stock_id == stock_id,
+                                       StockHistoryQuote.close_price.is_not(None))
+                                .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
+                            ).all()
+                            prev_close = hist[1].close_price if len(hist) >= 2 else None
+                            ch_abs = ch_pct = None
+                            if prev_close is not None and prev_close != 0:
+                                ch_abs = last_price - prev_close
+                                ch_pct = (ch_abs / prev_close) * 100
+                            sq_record = {
+                                "stock_id": stock_id,
+                                "current_price": last_price,
+                                "prev_close": prev_close,
+                                "change_abs": ch_abs,
+                                "change_pct": ch_pct,
+                                "price_source": "broker",
+                                "price_fetched_at": values["fetched_at"],
+                                "last_updated": datetime.utcnow(),
+                            }
+                            sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
+                                index_elements=["stock_id"],
+                                set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                            )
+                            s.execute(sq_stmt)
+
                         s.commit()
                     ok += 1
                 except Exception as exc:
