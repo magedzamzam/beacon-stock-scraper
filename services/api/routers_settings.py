@@ -211,11 +211,13 @@ async def run_job(
                 summary = {"all": r1.json(), "portfolio": r2.json()}
         elif key == "job.broker_quote_refresh":
             # Loops every tradeable broker_instrument, calls broker_gateway,
-            # UPSERTs into stock_broker_quotes. Mirrors the scheduler logic
-            # but runs in-process here for instant manual refresh.
+            # UPSERTs into stock_cur_quote and refreshes stock_quotes.
+            # Mirrors scheduler logic but runs in-process for instant manual refresh.
             from decimal import Decimal as _D
             from sqlalchemy.dialects.postgresql import insert as _pg_insert
-            from shared.db import BrokerInstrument, StockBrokerQuote
+            from shared.db import (
+                BrokerInstrument, StockCurQuote, StockHistoryQuote, StockQuote,
+            )
 
             mapping_data = db.execute(
                 select(BrokerInstrument.stock_id, BrokerInstrument.broker_id,
@@ -242,7 +244,7 @@ async def run_job(
                         v = p.get(k)
                         return _D(str(v)) if v is not None else None
 
-                    values = {
+                    cur_values = {
                         "stock_id": stock_id, "broker_id": broker_id,
                         "broker_symbol": broker_symbol,
                         "bid": _dec("bid"), "offer": _dec("offer"),
@@ -251,20 +253,50 @@ async def run_job(
                         "high_price": _dec("high_price"),
                         "low_price": _dec("low_price"),
                         "close_price": _dec("close_price"),
-                        "change_abs": _dec("change_abs"),
-                        "change_pct": _dec("change_pct"),
+                        "broker_change_abs": _dec("change_abs"),
+                        "broker_change_pct": _dec("change_pct"),
                         "volume": _dec("volume"),
                         "currency": payload.get("currency"),
                         "market_status": payload.get("market_status"),
                         "fetched_at": datetime.utcnow(),
                     }
                     try:
-                        stmt = _pg_insert(StockBrokerQuote).values(**values).on_conflict_do_update(
+                        cq_stmt = _pg_insert(StockCurQuote).values(**cur_values).on_conflict_do_update(
                             index_elements=["stock_id", "broker_id"],
-                            set_={k: v for k, v in values.items()
+                            set_={k: v for k, v in cur_values.items()
                                   if k not in ("stock_id", "broker_id", "broker_symbol")},
                         )
-                        db.execute(stmt)
+                        db.execute(cq_stmt)
+
+                        # Update canonical stock_quotes price (preserve score/verdict)
+                        last_p = cur_values["last_price"]
+                        if last_p is not None:
+                            hist = db.execute(
+                                select(StockHistoryQuote.close_price)
+                                .where(StockHistoryQuote.stock_id == stock_id,
+                                       StockHistoryQuote.close_price.is_not(None))
+                                .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
+                            ).all()
+                            prev_c = hist[1].close_price if len(hist) >= 2 else None
+                            ch_a = ch_p = None
+                            if prev_c is not None and prev_c != 0:
+                                ch_a = last_p - prev_c
+                                ch_p = (ch_a / prev_c) * 100
+                            sq_record = {
+                                "stock_id": stock_id,
+                                "current_price": last_p,
+                                "prev_close": prev_c,
+                                "change_abs": ch_a,
+                                "change_pct": ch_p,
+                                "price_source": "broker",
+                                "price_fetched_at": cur_values["fetched_at"],
+                                "last_updated": datetime.utcnow(),
+                            }
+                            sq_stmt = _pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
+                                index_elements=["stock_id"],
+                                set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                            )
+                            db.execute(sq_stmt)
                         db.commit()
                         ok_n += 1
                     except Exception:

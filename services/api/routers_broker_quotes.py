@@ -20,8 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    Broker, BrokerInstrument, Stock, StockBrokerQuote, User,
-    # Round-2 dual-write targets:
+    Broker, BrokerInstrument, Stock, User,
     StockCurQuote, StockHistoryQuote, StockQuote,
 )
 
@@ -33,20 +32,12 @@ broker_quotes_router = APIRouter(prefix="/stocks", tags=["broker_quotes"])
 _GATEWAY_URL = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
 
 
-def _serialize_quote(row, broker_name: Optional[str] = None) -> dict:
-    """Serialize a quote row. Accepts either StockCurQuote (Round-3 reads) or
-    StockBrokerQuote (legacy). The broker change fields are renamed on
-    StockCurQuote to broker_change_*; the API still returns change_abs / change_pct
-    for client compat (those names are baked into frontend types).
+def _serialize_quote(row: "StockCurQuote", broker_name: Optional[str] = None) -> dict:
+    """Serialize a StockCurQuote row.
+
+    Renames broker_change_* → change_* in the API response since clients
+    expect change_abs / change_pct field names.
     """
-    # StockCurQuote uses broker_change_*; StockBrokerQuote uses change_*.
-    # Use getattr so we work with either model.
-    change_abs = getattr(row, "broker_change_abs", None)
-    if change_abs is None:
-        change_abs = getattr(row, "change_abs", None)
-    change_pct = getattr(row, "broker_change_pct", None)
-    if change_pct is None:
-        change_pct = getattr(row, "change_pct", None)
     return {
         "broker_id": row.broker_id,
         "broker_name": broker_name,
@@ -58,8 +49,8 @@ def _serialize_quote(row, broker_name: Optional[str] = None) -> dict:
         "high_price": str(row.high_price) if row.high_price is not None else None,
         "low_price": str(row.low_price) if row.low_price is not None else None,
         "close_price": str(row.close_price) if row.close_price is not None else None,
-        "change_abs": str(change_abs) if change_abs is not None else None,
-        "change_pct": str(change_pct) if change_pct is not None else None,
+        "change_abs": str(row.broker_change_abs) if row.broker_change_abs is not None else None,
+        "change_pct": str(row.broker_change_pct) if row.broker_change_pct is not None else None,
         "volume": str(row.volume) if row.volume is not None else None,
         "currency": row.currency,
         "market_status": row.market_status,
@@ -106,41 +97,21 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
         v = payload.get(k)
         return Decimal(str(v)) if v is not None else None
 
-    values = {
-        "stock_id": stock_id, "broker_id": broker_id,
-        "broker_symbol": broker_symbol,
-        "bid": _dec("bid"), "offer": _dec("offer"),
-        "last_price": _dec("last_price"),
-        "open_price": _dec("open_price"),
-        "high_price": _dec("high_price"),
-        "low_price": _dec("low_price"),
-        "close_price": _dec("close_price"),
-        "change_abs": _dec("change_abs"),
-        "change_pct": _dec("change_pct"),
-        "volume": _dec("volume"),
-        "currency": payload.get("currency"),
-        "market_status": payload.get("market_status"),
-        "fetched_at": datetime.utcnow(),
-    }
-    stmt = pg_insert(StockBrokerQuote).values(**values).on_conflict_do_update(
-        index_elements=["stock_id", "broker_id"],
-        set_={k: v for k, v in values.items() if k not in ("stock_id", "broker_id", "broker_symbol")},
-    )
-    db.execute(stmt)
-
-    # Round-2 dual-write: same payload into stock_cur_quote.
-    # change_abs/change_pct on the broker quote are renamed to broker_change_*
-    # since they often disagree with prev-close-based change.
+    # Write live quote into stock_cur_quote.
+    # The broker's reported change_abs/change_pct often disagree with
+    # prev-close-based change — store them under broker_change_* and never
+    # use them as canonical.
     cur_quote_values = {
         "stock_id": stock_id, "broker_id": broker_id, "broker_symbol": broker_symbol,
-        "bid": values["bid"], "offer": values["offer"],
-        "last_price": values["last_price"],
-        "open_price": values["open_price"], "high_price": values["high_price"],
-        "low_price": values["low_price"], "close_price": values["close_price"],
-        "broker_change_abs": values["change_abs"],
-        "broker_change_pct": values["change_pct"],
-        "volume": values["volume"], "currency": values["currency"],
-        "market_status": values["market_status"], "fetched_at": values["fetched_at"],
+        "bid": _dec("bid"), "offer": _dec("offer"),
+        "last_price": _dec("last_price"),
+        "open_price": _dec("open_price"), "high_price": _dec("high_price"),
+        "low_price": _dec("low_price"), "close_price": _dec("close_price"),
+        "broker_change_abs": _dec("change_abs"),
+        "broker_change_pct": _dec("change_pct"),
+        "volume": _dec("volume"), "currency": payload.get("currency"),
+        "market_status": payload.get("market_status"),
+        "fetched_at": datetime.utcnow(),
     }
     cq_stmt = pg_insert(StockCurQuote).values(**cur_quote_values).on_conflict_do_update(
         index_elements=["stock_id", "broker_id"],
@@ -149,9 +120,9 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
     )
     db.execute(cq_stmt)
 
-    # Round-2 dual-write: refresh canonical stock_quotes row with broker price.
+    # Refresh canonical stock_quotes row with broker price.
     # We update only the price block; preserve composite_score/verdict.
-    last_price = values["last_price"]
+    last_price = cur_quote_values["last_price"]
     if last_price is not None:
         # prev_close from history (second-most-recent close)
         hist = db.execute(
@@ -172,7 +143,7 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
             "change_abs": change_abs,
             "change_pct": change_pct,
             "price_source": "broker",
-            "price_fetched_at": values["fetched_at"],
+            "price_fetched_at": cur_quote_values["fetched_at"],
             "last_updated": datetime.utcnow(),
         }
         sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(

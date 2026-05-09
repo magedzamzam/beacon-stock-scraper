@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from shared.db import (
     Broker, Exchange, PortfolioPosition, PositionRecommendation, Stock,
-    StockLatestSnapshot, TradingAccount, User,
+    TradingAccount, User,
 )
 from .auth import get_current_user, get_db
 from .routers_watchlists import _stock_summary

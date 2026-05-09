@@ -28,7 +28,7 @@ from sqlalchemy import select
 
 from shared.db import (
     AccountBalanceSnapshot, AppSetting, Broker, BrokerPositionSnapshot, JobRun,
-    PortfolioPosition, SessionLocal, Stock, StockLatestSnapshot, TradingAccount,
+    PortfolioPosition, SessionLocal, Stock, TradingAccount,
 )
 from shared.logging_setup import configure_logging
 from shared.settings import get_settings
@@ -236,8 +236,7 @@ async def run_broker_quote_refresh():
     try:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from shared.db import (
-            BrokerInstrument, StockBrokerQuote,
-            # Round-2 dual-write targets:
+            BrokerInstrument,
             StockCurQuote, StockHistoryQuote, StockQuote,
         )
 
@@ -269,7 +268,7 @@ async def run_broker_quote_refresh():
                     v = payload.get(k)
                     return Decimal(str(v)) if v is not None else None
 
-                values = {
+                cq_values = {
                     "stock_id": stock_id, "broker_id": broker_id,
                     "broker_symbol": broker_symbol,
                     "bid": _dec("bid"), "offer": _dec("offer"),
@@ -278,8 +277,8 @@ async def run_broker_quote_refresh():
                     "high_price": _dec("high_price"),
                     "low_price": _dec("low_price"),
                     "close_price": _dec("close_price"),
-                    "change_abs": _dec("change_abs"),
-                    "change_pct": _dec("change_pct"),
+                    "broker_change_abs": _dec("change_abs"),
+                    "broker_change_pct": _dec("change_pct"),
                     "volume": _dec("volume"),
                     "currency": payload.get("currency"),
                     "market_status": payload.get("market_status"),
@@ -287,30 +286,7 @@ async def run_broker_quote_refresh():
                 }
                 try:
                     with SessionLocal() as s:
-                        # Old table (still authoritative for now)
-                        stmt = pg_insert(StockBrokerQuote).values(**values).on_conflict_do_update(
-                            index_elements=["stock_id", "broker_id"],
-                            set_={k: v for k, v in values.items()
-                                  if k not in ("stock_id", "broker_id", "broker_symbol")},
-                        )
-                        s.execute(stmt)
-
-                        # Round-2 dual-write: new stock_cur_quote
-                        cq_values = {
-                            "stock_id": stock_id, "broker_id": broker_id,
-                            "broker_symbol": broker_symbol,
-                            "bid": values["bid"], "offer": values["offer"],
-                            "last_price": values["last_price"],
-                            "open_price": values["open_price"],
-                            "high_price": values["high_price"],
-                            "low_price": values["low_price"],
-                            "close_price": values["close_price"],
-                            "broker_change_abs": values["change_abs"],
-                            "broker_change_pct": values["change_pct"],
-                            "volume": values["volume"], "currency": values["currency"],
-                            "market_status": values["market_status"],
-                            "fetched_at": values["fetched_at"],
-                        }
+                        # Write to stock_cur_quote
                         cq_stmt = pg_insert(StockCurQuote).values(**cq_values).on_conflict_do_update(
                             index_elements=["stock_id", "broker_id"],
                             set_={k: v for k, v in cq_values.items()
@@ -318,8 +294,8 @@ async def run_broker_quote_refresh():
                         )
                         s.execute(cq_stmt)
 
-                        # Round-2 dual-write: refresh canonical stock_quotes price
-                        last_price = values["last_price"]
+                        # Refresh canonical stock_quotes price (preserve score/verdict)
+                        last_price = cq_values["last_price"]
                         if last_price is not None:
                             hist = s.execute(
                                 select(StockHistoryQuote.close_price)
@@ -339,7 +315,7 @@ async def run_broker_quote_refresh():
                                 "change_abs": ch_abs,
                                 "change_pct": ch_pct,
                                 "price_source": "broker",
-                                "price_fetched_at": values["fetched_at"],
+                                "price_fetched_at": cq_values["fetched_at"],
                                 "last_updated": datetime.utcnow(),
                             }
                             sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(

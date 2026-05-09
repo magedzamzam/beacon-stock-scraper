@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    Exchange, Stock, StockLatestSnapshot, StockQuote, User, Watchlist, WatchlistItem,
+    Exchange, Stock, StockQuote, User, Watchlist, WatchlistItem,
 )
 from .auth import get_current_user, get_db
 from .schemas import (

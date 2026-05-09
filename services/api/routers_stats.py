@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from shared.db import (
     AccountBalanceSnapshot, Broker, BrokerPositionSnapshot, PortfolioPosition,
-    Stock, StockLatestSnapshot, StockQuote, TradingAccount, User,
+    Stock, StockQuote, TradingAccount, User,
 )
 
 from .auth import get_current_user, get_db

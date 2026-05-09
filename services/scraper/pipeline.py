@@ -25,12 +25,11 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    SessionLocal, Stock, Exchange, ScrapeRun, StockMarketDaily, StockValuation,
-    StockFinancials, StockTechnicals, StockNews, StockLatestSnapshot,
-    StockBrokerQuote,
-    # Round-2 dual-write targets:
-    StockQuote, StockHistoryQuote, StockFinRatios, StockFinStatement,
-    StockFinCashflow, StockMktDividends, StockMktTechnicals,
+    SessionLocal, Stock, Exchange, ScrapeRun, StockNews,
+    # Round-2 dual-write targets are now the only writers (Round 4):
+    StockQuote, StockCurQuote, StockHistoryQuote,
+    StockFinRatios, StockFinStatement, StockFinCashflow,
+    StockMktDividends, StockMktTechnicals,
 )
 from shared.logging_setup import configure_logging
 from shared.settings import get_settings
@@ -53,59 +52,6 @@ def _quote_url(exchange_code: str, ticker: str, sub: str = "") -> str:
 
 # ----- DB write helpers (UPSERT semantics) -----
 
-def _upsert_market_daily(session: Session, stock_id: int, today: date, payload: dict):
-    stmt = pg_insert(StockMarketDaily).values(
-        stock_id=stock_id, trading_date=today, **payload
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["stock_id", "trading_date"],
-        set_={k: stmt.excluded[k] for k in payload.keys()},
-    )
-    session.execute(stmt)
-
-
-def _upsert_valuation(session: Session, stock_id: int, fiscal_year: int, payload: dict):
-    payload = {**payload, "source_date": date.today()}
-    stmt = pg_insert(StockValuation).values(
-        stock_id=stock_id, fiscal_year=fiscal_year, **payload
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["stock_id", "fiscal_year"],
-        set_={k: stmt.excluded[k] for k in payload.keys()},
-    )
-    session.execute(stmt)
-
-
-def _upsert_financials_ttm(session: Session, stock_id: int, fiscal_year: int, payload: dict):
-    """TTM snapshot lives at (stock_id, fiscal_year, 'TTM', 'INCOME', is_estimate=False)."""
-    record = {
-        "stock_id": stock_id,
-        "fiscal_year": fiscal_year,
-        "period_type": "TTM",
-        "statement_type": "MIXED",
-        "is_estimate": False,
-        "source_date": date.today(),
-        **payload,
-    }
-    stmt = pg_insert(StockFinancials).values(**record)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["stock_id", "fiscal_year", "period_type", "statement_type", "is_estimate"],
-        set_={k: stmt.excluded[k] for k in payload.keys()},
-    )
-    session.execute(stmt)
-
-
-def _upsert_technicals(session: Session, stock_id: int, today: date, payload: dict):
-    stmt = pg_insert(StockTechnicals).values(
-        stock_id=stock_id, trading_date=today, **payload,
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["stock_id", "trading_date"],
-        set_={k: stmt.excluded[k] for k in payload.keys()},
-    )
-    session.execute(stmt)
-
-
 def _upsert_news(session: Session, stock_id: int, items: list[dict]):
     for item in items:
         stmt = pg_insert(StockNews).values(
@@ -122,20 +68,8 @@ def _upsert_news(session: Session, stock_id: int, items: list[dict]):
         session.execute(stmt)
 
 
-def _upsert_snapshot(session: Session, stock_id: int, payload: dict):
-    record = {"stock_id": stock_id, "last_updated": datetime.utcnow(), **payload}
-    stmt = pg_insert(StockLatestSnapshot).values(**record)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["stock_id"],
-        set_={k: stmt.excluded[k] for k in record if k != "stock_id"},
-    )
-    session.execute(stmt)
-
-
 # =============================================================================
-# Round-2 dual-write helpers. Each writes to the new parallel-schema table
-# alongside the old one. Round 3 will switch reads to these; Round 4 will drop
-# the old tables and remove the old _upsert_* helpers.
+# UPSERT helpers writing to the parallel-schema tables.
 # =============================================================================
 
 def _upsert_history_quote(session: Session, stock_id: int, today: date,
@@ -279,13 +213,12 @@ def _recompute_stock_quote(session: Session, stock_id: int):
     prev_close = hist[1].close_price if len(hist) >= 2 else None
     market_cap = hist[0].market_cap if hist else None
 
-    # See if a fresh broker quote exists for this stock (in old table — Round 4
-    # switches to stock_cur_quote).
+    # See if a fresh broker quote exists for this stock.
     bq = session.execute(
-        select(StockBrokerQuote.last_price, StockBrokerQuote.fetched_at)
-        .where(StockBrokerQuote.stock_id == stock_id,
-               StockBrokerQuote.last_price.is_not(None))
-        .order_by(_desc(StockBrokerQuote.fetched_at)).limit(1)
+        select(StockCurQuote.last_price, StockCurQuote.fetched_at)
+        .where(StockCurQuote.stock_id == stock_id,
+               StockCurQuote.last_price.is_not(None))
+        .order_by(_desc(StockCurQuote.fetched_at)).limit(1)
     ).first()
     use_broker = False
     if bq is not None and bq.fetched_at is not None:
@@ -462,21 +395,12 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
                 stock.currency = currency
                 stock.updated_at = datetime.utcnow()
 
-            if any(v is not None for v in market.values()):
-                _upsert_market_daily(session, stock_id, today, market)
-            # Round-2 dual-write: OHLC → stock_history_quote
+            # OHLC + volume + market_cap → stock_history_quote
             _upsert_history_quote(session, stock_id, today, market, change_pct)
 
             # Valuation + multi-period financials change quarterly. Skip in
             # daily mode to keep the scrape lightweight.
             if mode == "full":
-                fiscal_year = today.year
-                if any(v is not None for v in valuation.values()):
-                    _upsert_valuation(session, stock_id, fiscal_year, valuation)
-                if any(v is not None for v in financials.values()):
-                    _upsert_financials_ttm(session, stock_id, fiscal_year, financials)
-
-                # Round-2 dual-write: split into ratios / statement / cashflow
                 # period_end = Dec 31 of fiscal_year (best we can derive without
                 # an explicit reporting date from the scraper).
                 period_end = today.replace(month=12, day=31)
@@ -502,10 +426,8 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
                     "free_cash_flow": financials.get("free_cash_flow"),
                 })
 
-            if any(v is not None for v in technicals.values()):
-                _upsert_technicals(session, stock_id, today, technicals)
-            # Round-2 dual-write: technicals → stock_mkt_technicals
-            # Also fold in 52w from market_daily payload since they belong with technicals.
+            # Technicals → stock_mkt_technicals.
+            # Fold in 52w from the market payload since they belong here.
             _upsert_mkt_technicals(session, stock_id, today, {
                 **technicals,
                 "week_52_high": market.get("week_52_high"),
@@ -514,7 +436,7 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
                 "volume_daily": market.get("volume"),
             })
 
-            # Round-2 dual-write: dividends → stock_mkt_dividends (one row per stock)
+            # Dividends → stock_mkt_dividends (one row per stock)
             _upsert_mkt_dividends(session, stock_id, {
                 "dividend_yield_pct": market.get("dividend_yield_pct"),
                 "dividend_per_share": market.get("dividend"),
@@ -527,17 +449,7 @@ async def scrape_one(fetcher: HttpFetcher, stock_id: int, exchange_code: str, ti
             if news:
                 _upsert_news(session, stock_id, news)
 
-            _upsert_snapshot(session, stock_id, {
-                "last_close": market.get("close_price"),
-                "last_change_pct": change_pct,
-                "market_cap": market.get("market_cap"),
-                "pe_ratio": market.get("pe_ratio"),
-                "dividend_yield_pct": market.get("dividend_yield_pct"),
-                "week_52_high": market.get("week_52_high"),
-                "week_52_low": market.get("week_52_low"),
-                "rsi_14": technicals.get("rsi_14"),
-            })
-            # Round-2 dual-write: refresh canonical stock_quotes row.
+            # Refresh canonical stock_quotes row.
             # MUST be called LAST since it reads from stock_history_quote +
             # stock_fin_ratios + stock_mkt_technicals + stock_mkt_dividends.
             _recompute_stock_quote(session, stock_id)

@@ -14,10 +14,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    Exchange, PortfolioPosition, ScrapeRun, Stock, StockAnalystConsensus,
-    StockLatestSnapshot, StockMarketDaily, StockRecommendation, User,
-    # Round-3 read targets:
-    StockQuote, StockHistoryQuote,
+    Exchange, PortfolioPosition, ScrapeRun, Stock, StockAnalystConsensus, User,
+    StockQuote, StockHistoryQuote, StockScoring,
 )
 from .auth import get_current_user, get_db
 from .import_tool import build_import_catalog, build_preview, execute_import, save_upload_preview
@@ -44,9 +42,10 @@ def system_status(_: User = Depends(require_admin), db: Session = Depends(get_db
     stock_count = db.scalar(
         select(func.count()).select_from(Stock).where(Stock.active.is_(True))
     ) or 0
+    # "Scored today" = stock_scoring rows updated today.
     scored_today = db.scalar(
-        select(func.count()).select_from(StockRecommendation)
-        .where(StockRecommendation.score_date == date.today())
+        select(func.count(func.distinct(StockScoring.stock_id)))
+        .where(func.date(StockScoring.updated_at) == date.today())
     ) or 0
     open_positions = db.scalar(
         select(func.count()).select_from(PortfolioPosition)
@@ -174,41 +173,23 @@ def override_stock(
     if req.last_close is not None:
         new_price = Decimal(str(req.last_close))
 
-        # 1) Update today's market_daily row, creating it if missing.
-        md_today = db.execute(
-            select(StockMarketDaily)
-            .where(StockMarketDaily.stock_id == stock.id,
-                   StockMarketDaily.trading_date == today)
-        ).scalar_one_or_none()
-        if md_today:
-            md_today.close_price = new_price
-        else:
-            db.add(StockMarketDaily(
-                stock_id=stock.id, trading_date=today, close_price=new_price,
-            ))
-
-        # 2) Compute last_change_pct vs the most recent previous trading day.
+        # 1) Compute last_change_pct vs prev close from stock_history_quote.
         last_change_pct: Optional[Decimal] = None
         prev = db.execute(
-            select(StockMarketDaily.close_price)
-            .where(StockMarketDaily.stock_id == stock.id,
-                   StockMarketDaily.trading_date < today,
-                   StockMarketDaily.close_price.isnot(None))
-            .order_by(desc(StockMarketDaily.trading_date)).limit(1)
+            select(StockHistoryQuote.close_price)
+            .where(StockHistoryQuote.stock_id == stock.id,
+                   StockHistoryQuote.trading_date < today,
+                   StockHistoryQuote.close_price.isnot(None))
+            .order_by(desc(StockHistoryQuote.trading_date)).limit(1)
         ).scalar_one_or_none()
         if prev and prev > 0:
             last_change_pct = (new_price - prev) / prev * Decimal("100")
 
-        # 3) Snapshot (old).
-        snap = {"last_close": new_price, "last_updated": datetime.utcnow()}
-        if last_change_pct is not None:
-            snap["last_change_pct"] = last_change_pct
-        _upsert_snapshot(db, stock.id, snap)
         changes["last_close"] = float(new_price)
         if last_change_pct is not None:
             changes["last_change_pct"] = float(last_change_pct)
 
-        # 4) Round-2 dual-write: stock_history_quote (today's close).
+        # 2) Write today's history row (creating if missing).
         hq_stmt = pg_insert(StockHistoryQuote).values(
             stock_id=stock.id, trading_date=today,
             close_price=new_price, change_pct=last_change_pct,
@@ -220,7 +201,7 @@ def override_stock(
         )
         db.execute(hq_stmt)
 
-        # 5) Round-2 dual-write: stock_quotes (canonical row).
+        # 3) Update canonical stock_quotes price block.
         ch_abs = (new_price - prev) if (prev and prev > 0) else None
         sq_stmt = pg_insert(StockQuote).values(
             stock_id=stock.id, current_price=new_price,
@@ -287,13 +268,18 @@ def override_stock(
                 scraped_at=datetime.utcnow(),
             ))
 
-        # Mirror into the snapshot for the screener UI.
-        snap_an = {"last_updated": datetime.utcnow()}
+        # Mirror analyst values onto the canonical stock_quotes row.
+        sq_an = {"stock_id": stock.id, "last_updated": datetime.utcnow()}
         if target_dec is not None:
-            snap_an["analyst_target"] = target_dec
+            sq_an["analyst_target"] = target_dec
         if upside_pct is not None:
-            snap_an["analyst_upside_pct"] = upside_pct
-        _upsert_snapshot(db, stock.id, snap_an)
+            sq_an["analyst_upside_pct"] = upside_pct
+        if len(sq_an) > 2:  # only fire if we have something to set
+            sq_an_stmt = pg_insert(StockQuote).values(**sq_an).on_conflict_do_update(
+                index_elements=["stock_id"],
+                set_={k: v for k, v in sq_an.items() if k != "stock_id"},
+            )
+            db.execute(sq_an_stmt)
 
         if req.analyst_target is not None:
             changes["analyst_target"] = float(target_dec)
@@ -363,17 +349,6 @@ def import_execute(
         match_columns=req.match_columns,
         ignore_blank_values=req.ignore_blank_values,
     )
-
-
-def _upsert_snapshot(db: Session, stock_id: int, payload: dict):
-    """PG-flavoured upsert that won't blow away unrelated columns."""
-    record = {"stock_id": stock_id, **payload}
-    stmt = pg_insert(StockLatestSnapshot).values(**record)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["stock_id"],
-        set_={k: stmt.excluded[k] for k in record if k != "stock_id"},
-    )
-    db.execute(stmt)
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date
 from typing import Optional
 
 import httpx
@@ -10,10 +11,9 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    Exchange, Stock, StockAnalystConsensus, StockBrokerQuote, StockLatestSnapshot,
-    StockMarketDaily, StockNews, StockRecommendation, StockTechnicals,
-    # Round-3 read targets:
+    Exchange, Stock, StockAnalystConsensus, StockNews,
     StockQuote, StockHistoryQuote, StockCurQuote,
+    StockFinRatios, StockFinStatement, StockMktTechnicals, StockScoring,
 )
 from .auth import get_db
 from .schemas import (
@@ -54,7 +54,7 @@ def _row_to_summary(r) -> StockSummary:
 
 # Round 3: _SUMMARY_COLS now sources from stock_quotes (canonical row).
 # Joining stock_quotes is O(1) per row — no DISTINCT ON needed since it's
-# already denormalised. Old StockLatestSnapshot can be removed in Round 4.
+# Joining stock_quotes is O(1) per row — already denormalised.
 _SUMMARY_COLS = (
     Stock.id, Stock.ticker, Stock.company_name, Stock.sector, Stock.industry,
     Stock.country, Stock.currency,
@@ -174,18 +174,23 @@ def stock_detail(exchange: str, ticker: str, db: Session = Depends(get_db)):
     if not row:
         raise HTTPException(404, "Stock not found")
 
-    # Detail-only context: latest market_daily for beta/forward_pe/EV/revenue_ttm,
-    # latest technicals for SMAs, latest analyst for count/rating.
-    # (Round 4 will replace these with reads from the new tables.)
-    md = db.execute(
-        select(StockMarketDaily)
-        .where(StockMarketDaily.stock_id == row.id)
-        .order_by(desc(StockMarketDaily.trading_date)).limit(1)
+    # Detail-only context: latest financials for forward_pe / EV / revenue_ttm,
+    # latest technicals for SMA / beta, latest analyst for count/rating.
+    fin_ratios = db.execute(
+        select(StockFinRatios)
+        .where(StockFinRatios.stock_id == row.id)
+        .order_by(desc(StockFinRatios.period_end), desc(StockFinRatios.id)).limit(1)
+    ).scalars().first()
+    fin_stmt = db.execute(
+        select(StockFinStatement)
+        .where(StockFinStatement.stock_id == row.id,
+               StockFinStatement.is_estimate.is_(False))
+        .order_by(desc(StockFinStatement.period_end), desc(StockFinStatement.id)).limit(1)
     ).scalars().first()
     tech = db.execute(
-        select(StockTechnicals)
-        .where(StockTechnicals.stock_id == row.id)
-        .order_by(desc(StockTechnicals.trading_date)).limit(1)
+        select(StockMktTechnicals)
+        .where(StockMktTechnicals.stock_id == row.id)
+        .order_by(desc(StockMktTechnicals.trading_date)).limit(1)
     ).scalars().first()
     analyst = db.execute(
         select(StockAnalystConsensus)
@@ -198,11 +203,11 @@ def stock_detail(exchange: str, ticker: str, db: Session = Depends(get_db)):
         **summary.model_dump(),
         isin=row.isin, founded_year=row.founded_year, employees=row.employees,
         website=row.website,
-        beta=_f(md.beta) if md else None,
-        forward_pe=_f(md.forward_pe) if md else None,
+        beta=_f(tech.beta) if tech else None,
+        forward_pe=_f(fin_ratios.pe_forward) if fin_ratios else None,
         week_52_high=_f(row.week_52_high), week_52_low=_f(row.week_52_low),
-        enterprise_value=_f(md.enterprise_value) if md else None,
-        revenue_ttm=_f(md.revenue_ttm) if md else None,
+        enterprise_value=_f(fin_ratios.snapshot_market_cap) if fin_ratios else None,
+        revenue_ttm=_f(fin_stmt.revenue) if fin_stmt else None,
         sma_50=_f(tech.sma_50) if tech else None,
         sma_200=_f(tech.sma_200) if tech else None,
         analyst_target=_f(row.analyst_target),
@@ -223,30 +228,33 @@ def stock_detail(exchange: str, ticker: str, db: Session = Depends(get_db)):
 @router.get("/{exchange}/{ticker}/score", response_model=ScoreBreakdown)
 def stock_score(exchange: str, ticker: str, db: Session = Depends(get_db)):
     row = db.execute(
-        select(StockRecommendation, Stock.ticker, Exchange.code.label("exchange_code"))
-        .join(Stock, Stock.id == StockRecommendation.stock_id)
+        select(StockScoring, Stock.ticker, Exchange.code.label("exchange_code"))
+        .join(Stock, Stock.id == StockScoring.stock_id)
         .join(Exchange, Stock.exchange_id == Exchange.id)
         .where(func.lower(Exchange.code) == exchange.lower(), func.upper(Stock.ticker) == ticker.upper())
-        .order_by(desc(StockRecommendation.score_date)).limit(1)
+        .order_by(desc(StockScoring.updated_at)).limit(1)
     ).first()
     if not row:
         raise HTTPException(404, "No score yet for this stock — run the scoring job")
-    rec: StockRecommendation = row[0]
-    reasoning = rec.reasoning or {}
+    rec: StockScoring = row[0]
+    inputs = rec.inputs_snapshot or {}
+    # ScoreBreakdown still wants 7 component scores; map new schema + recover
+    # fundamental/technical/analyst from inputs_snapshot when present.
     return ScoreBreakdown(
-        ticker=row.ticker, exchange_code=row.exchange_code, score_date=rec.score_date,
-        fundamental_score=_f(rec.fundamental_score) or 0.0,
-        valuation_score=_f(rec.valuation_score) or 0.0,
-        momentum_score=_f(rec.momentum_score) or 0.0,
-        technical_score=_f(rec.technical_score) or 0.0,
-        analyst_score=_f(rec.analyst_score) or 0.0,
-        quality_score=_f(rec.quality_score) or 0.0,
-        risk_score=_f(rec.risk_score) or 0.0,
+        ticker=row.ticker, exchange_code=row.exchange_code,
+        score_date=rec.updated_at.date() if rec.updated_at else date.today(),
+        fundamental_score=float(inputs.get("fundamental_score") or 0.0),
+        valuation_score=_f(rec.score_valuation) or 0.0,
+        momentum_score=_f(rec.score_momentum) or 0.0,
+        technical_score=float(inputs.get("technical_score") or 0.0),
+        analyst_score=float(inputs.get("analyst_score") or 0.0),
+        quality_score=_f(rec.score_quality) or 0.0,
+        risk_score=_f(rec.score_risk) or 0.0,
         composite_score=_f(rec.composite_score) or 0.0,
-        verdict=rec.verdict,
-        pros=reasoning.get("pros", []) or [],
-        cons=reasoning.get("cons", []) or [],
-        model_version=rec.model_version or "v1.0",
+        verdict=rec.verdict or "WATCH",
+        pros=rec.pros or [],
+        cons=rec.cons or [],
+        model_version=rec.model_version or "v1.1",
     )
 
 
