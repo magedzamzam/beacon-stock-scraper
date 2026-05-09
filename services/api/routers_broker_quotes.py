@@ -33,7 +33,20 @@ broker_quotes_router = APIRouter(prefix="/stocks", tags=["broker_quotes"])
 _GATEWAY_URL = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
 
 
-def _serialize_quote(row: StockBrokerQuote, broker_name: Optional[str] = None) -> dict:
+def _serialize_quote(row, broker_name: Optional[str] = None) -> dict:
+    """Serialize a quote row. Accepts either StockCurQuote (Round-3 reads) or
+    StockBrokerQuote (legacy). The broker change fields are renamed on
+    StockCurQuote to broker_change_*; the API still returns change_abs / change_pct
+    for client compat (those names are baked into frontend types).
+    """
+    # StockCurQuote uses broker_change_*; StockBrokerQuote uses change_*.
+    # Use getattr so we work with either model.
+    change_abs = getattr(row, "broker_change_abs", None)
+    if change_abs is None:
+        change_abs = getattr(row, "change_abs", None)
+    change_pct = getattr(row, "broker_change_pct", None)
+    if change_pct is None:
+        change_pct = getattr(row, "change_pct", None)
     return {
         "broker_id": row.broker_id,
         "broker_name": broker_name,
@@ -45,8 +58,8 @@ def _serialize_quote(row: StockBrokerQuote, broker_name: Optional[str] = None) -
         "high_price": str(row.high_price) if row.high_price is not None else None,
         "low_price": str(row.low_price) if row.low_price is not None else None,
         "close_price": str(row.close_price) if row.close_price is not None else None,
-        "change_abs": str(row.change_abs) if row.change_abs is not None else None,
-        "change_pct": str(row.change_pct) if row.change_pct is not None else None,
+        "change_abs": str(change_abs) if change_abs is not None else None,
+        "change_pct": str(change_pct) if change_pct is not None else None,
         "volume": str(row.volume) if row.volume is not None else None,
         "currency": row.currency,
         "market_status": row.market_status,
@@ -60,14 +73,17 @@ def list_broker_quotes(
     _: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """All persisted broker quotes for a stock (newest per broker)."""
+    """All persisted broker quotes for a stock (newest per broker).
+
+    Round 3: reads from stock_cur_quote (parallel table).
+    """
     if db.get(Stock, stock_id) is None:
         raise HTTPException(404, "Stock not found")
     rows = db.execute(
-        select(StockBrokerQuote, Broker.name, Broker.code)
-        .join(Broker, StockBrokerQuote.broker_id == Broker.id)
-        .where(StockBrokerQuote.stock_id == stock_id)
-        .order_by(StockBrokerQuote.fetched_at.desc())
+        select(StockCurQuote, Broker.name, Broker.code)
+        .join(Broker, StockCurQuote.broker_id == Broker.id)
+        .where(StockCurQuote.stock_id == stock_id)
+        .order_by(StockCurQuote.fetched_at.desc())
     ).all()
     return [{**_serialize_quote(r, name), "broker_code": code} for (r, name, code) in rows]
 

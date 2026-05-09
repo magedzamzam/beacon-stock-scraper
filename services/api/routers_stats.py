@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from shared.db import (
     AccountBalanceSnapshot, Broker, BrokerPositionSnapshot, PortfolioPosition,
-    Stock, StockLatestSnapshot, TradingAccount, User,
+    Stock, StockLatestSnapshot, StockQuote, TradingAccount, User,
 )
 
 from .auth import get_current_user, get_db
@@ -48,10 +48,11 @@ def _compute_manual_stats(
     db: Session, account: TradingAccount,
 ) -> tuple[Optional[Decimal], Optional[Decimal], int, Optional[str]]:
     """Equity & unrealized P/L for a manual account, from local data only."""
+    # Round 3: read current price from stock_quotes (canonical row).
     rows = db.execute(
-        select(PortfolioPosition, Stock, StockLatestSnapshot)
+        select(PortfolioPosition, Stock, StockQuote)
         .join(Stock, PortfolioPosition.stock_id == Stock.id)
-        .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
+        .outerjoin(StockQuote, StockQuote.stock_id == Stock.id)
         .where(
             PortfolioPosition.account_id == account.id,
             PortfolioPosition.is_open.is_(True),
@@ -65,7 +66,7 @@ def _compute_manual_stats(
     counted = 0
     currency_hint: Optional[str] = account.currency
     for (p, s, snap) in rows:
-        current = snap.last_close if snap else None
+        current = snap.current_price if snap else None
         if current is None:
             continue  # skip rather than guess
         equity += Decimal(str(current)) * Decimal(str(p.quantity))

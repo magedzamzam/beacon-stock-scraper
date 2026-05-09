@@ -157,16 +157,18 @@ async def run_account_stats_snapshot():
             try:
                 with SessionLocal() as s:
                     if broker.kind == "manual":
+                        # Round 3: read canonical price from stock_quotes
+                        from shared.db import StockQuote as _SQ
                         rows = s.execute(
-                            select(PortfolioPosition, Stock, StockLatestSnapshot)
+                            select(PortfolioPosition, Stock, _SQ)
                             .join(Stock, PortfolioPosition.stock_id == Stock.id)
-                            .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
+                            .outerjoin(_SQ, _SQ.stock_id == Stock.id)
                             .where(PortfolioPosition.account_id == acct.id,
                                    PortfolioPosition.is_open.is_(True))
                         ).all()
                         equity = Decimal("0"); unrealized = Decimal("0"); counted = 0
                         for (p, _stock, snap) in rows:
-                            cur = snap.last_close if snap else None
+                            cur = snap.current_price if snap else None
                             if cur is None:
                                 continue
                             equity += Decimal(str(cur)) * Decimal(str(p.quantity))

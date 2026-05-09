@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from shared.db import (
-    Exchange, Stock, StockLatestSnapshot, User, Watchlist, WatchlistItem,
+    Exchange, Stock, StockLatestSnapshot, StockQuote, User, Watchlist, WatchlistItem,
 )
 from .auth import get_current_user, get_db
 from .schemas import (
@@ -24,19 +24,21 @@ def _f(v) -> Optional[float]:
 
 
 def _stock_summary(db: Session, stock_id: int) -> StockSummary:
+    # Round 3: read from stock_quotes (canonical row). API field names
+    # last_close/last_change_pct preserved for client compat.
     row = db.execute(
         select(
             Stock.id, Stock.ticker, Stock.company_name, Stock.sector, Stock.industry,
             Stock.country, Stock.currency,
             Exchange.code.label("exchange_code"),
-            StockLatestSnapshot.last_close, StockLatestSnapshot.last_change_pct,
-            StockLatestSnapshot.market_cap, StockLatestSnapshot.pe_ratio,
-            StockLatestSnapshot.dividend_yield_pct, StockLatestSnapshot.rsi_14,
-            StockLatestSnapshot.composite_score, StockLatestSnapshot.verdict,
-            StockLatestSnapshot.last_updated,
+            StockQuote.current_price, StockQuote.change_pct,
+            StockQuote.market_cap, StockQuote.pe_ratio,
+            StockQuote.dividend_yield_pct, StockQuote.rsi_14,
+            StockQuote.composite_score, StockQuote.verdict,
+            StockQuote.last_updated,
         )
         .join(Exchange, Stock.exchange_id == Exchange.id)
-        .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
+        .outerjoin(StockQuote, StockQuote.stock_id == Stock.id)
         .where(Stock.id == stock_id)
     ).first()
     if not row:
@@ -45,7 +47,7 @@ def _stock_summary(db: Session, stock_id: int) -> StockSummary:
         id=row.id, ticker=row.ticker, exchange_code=row.exchange_code,
         company_name=row.company_name, sector=row.sector, industry=row.industry,
         country=row.country, currency=row.currency,
-        last_close=_f(row.last_close), last_change_pct=_f(row.last_change_pct),
+        last_close=_f(row.current_price), last_change_pct=_f(row.change_pct),
         market_cap=_f(row.market_cap), pe_ratio=_f(row.pe_ratio),
         dividend_yield_pct=_f(row.dividend_yield_pct), rsi_14=_f(row.rsi_14),
         composite_score=_f(row.composite_score), verdict=row.verdict,

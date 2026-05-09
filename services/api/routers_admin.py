@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 from shared.db import (
     Exchange, PortfolioPosition, ScrapeRun, Stock, StockAnalystConsensus,
     StockLatestSnapshot, StockMarketDaily, StockRecommendation, User,
+    # Round-3 read targets:
+    StockQuote, StockHistoryQuote,
 )
 from .auth import get_current_user, get_db
 from .import_tool import build_import_catalog, build_preview, execute_import, save_upload_preview
@@ -207,7 +209,6 @@ def override_stock(
             changes["last_change_pct"] = float(last_change_pct)
 
         # 4) Round-2 dual-write: stock_history_quote (today's close).
-        from shared.db import StockHistoryQuote, StockQuote
         hq_stmt = pg_insert(StockHistoryQuote).values(
             stock_id=stock.id, trading_date=today,
             close_price=new_price, change_pct=last_change_pct,
@@ -244,9 +245,10 @@ def override_stock(
         if req.last_close is not None:
             latest_close = Decimal(str(req.last_close))
         else:
+            # Round 3: read canonical price from stock_quotes
             latest_close = db.execute(
-                select(StockLatestSnapshot.last_close)
-                .where(StockLatestSnapshot.stock_id == stock.id)
+                select(StockQuote.current_price)
+                .where(StockQuote.stock_id == stock.id)
             ).scalar_one_or_none()
 
         upside_pct: Optional[Decimal] = None
@@ -425,18 +427,19 @@ def admin_list_stocks(
     _: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """List stocks for the admin /admin/stocks page. Joins exchange + snapshot."""
+    """List stocks for the admin /admin/stocks page. Joins exchange + canonical quote (Round 3)."""
     stmt = (
         select(
             Stock.id, Stock.ticker, Stock.company_name, Stock.sector, Stock.industry,
             Stock.currency, Stock.country, Stock.isin, Stock.active,
             Stock.is_scraping_enabled,
             Exchange.code.label("exchange_code"),
-            StockLatestSnapshot.last_close, StockLatestSnapshot.last_updated,
+            StockQuote.current_price.label("last_close"),
+            StockQuote.last_updated,
         )
         .select_from(Stock)
         .join(Exchange, Stock.exchange_id == Exchange.id)
-        .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
+        .outerjoin(StockQuote, StockQuote.stock_id == Stock.id)
     )
     if q:
         like = f"%{q.lower()}%"

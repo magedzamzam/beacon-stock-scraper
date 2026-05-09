@@ -193,17 +193,18 @@ async def get_positions(
     broker = db.get(Broker, acct.broker_id)
 
     if broker.kind == "manual":
-        from shared.db import PortfolioPosition, StockLatestSnapshot
+        # Round 3: read current price from stock_quotes (canonical row).
+        from shared.db import PortfolioPosition, StockQuote
         rows = db.execute(
-            select(PortfolioPosition, Stock, Exchange, StockLatestSnapshot)
+            select(PortfolioPosition, Stock, Exchange, StockQuote)
             .join(Stock, PortfolioPosition.stock_id == Stock.id)
             .join(Exchange, Stock.exchange_id == Exchange.id)
-            .outerjoin(StockLatestSnapshot, StockLatestSnapshot.stock_id == Stock.id)
+            .outerjoin(StockQuote, StockQuote.stock_id == Stock.id)
             .where(PortfolioPosition.account_id == account_id, PortfolioPosition.is_open.is_(True))
         ).all()
         out = []
         for (p, s, e, snap) in rows:
-            current = snap.last_close if snap else None
+            current = snap.current_price if snap else None
             unrealized_pl = None
             unrealized_pl_pct = None
             if current is not None and p.avg_entry_price is not None:
