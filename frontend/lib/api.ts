@@ -302,6 +302,21 @@ export const api = {
   adminImportExecute: (payload: ImportExecuteRequest) =>
     request<ImportExecuteResult>("/admin/imports/execute", { method: "POST", body: JSON.stringify(payload) }),
 
+  // bulk csv import (stockanalysis.com exchange exports)
+  adminBulkImportPreview: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return request<BulkImportPreview>("/admin/imports/bulk/preview", { method: "POST", body: form });
+  },
+  adminBulkImportExecute: (file: File, exchangeId: number) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("exchange_id", String(exchangeId));
+    return request<BulkImportResult>("/admin/imports/bulk/execute", { method: "POST", body: form });
+  },
+  adminBulkImportHistory: (limit = 25) =>
+    request<BulkImportHistoryEntry[]>(`/admin/imports/bulk/history?limit=${limit}`),
+
   // ===== Brokers / accounts =====
   listBrokers: () =>
     request<BrokerInfo[]>("/accounts/brokers"),
@@ -648,4 +663,56 @@ export interface ImportExecuteResult {
   errors: number;
   row_logs: ImportRowLog[];
   finished_at: string;
+}
+
+// ===== Bulk CSV import (stockanalysis.com exchange exports) =====
+export interface BulkImportPreview {
+  headers: string[];
+  header_count: number;
+  row_count: number;
+  has_symbol_column: boolean;
+  rows_with_no_symbol: number;
+  sample_tickers: string[];
+  samples: Array<{
+    ticker: string | null;
+    company_name: string | null;
+    sector: string | null;
+    stock_price: string | null;
+    market_cap: string | null;
+    pe_ratio: string | null;
+    last_report_date: string | null;
+  }>;
+}
+
+export interface BulkImportRowLog {
+  row_number: number;
+  action: string;   // inserted | updated | skipped | error
+  message: string;
+}
+
+export interface BulkImportResult {
+  import_id: number;
+  status: string;   // ok | failed
+  rows_total: number;
+  rows_inserted: number;
+  rows_updated: number;
+  rows_skipped: number;
+  rows_errored: number;
+  row_logs: BulkImportRowLog[];
+}
+
+export interface BulkImportHistoryEntry {
+  id: number;
+  exchange_code: string;
+  user_email: string | null;
+  filename: string | null;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  rows_total: number;
+  rows_inserted: number;
+  rows_updated: number;
+  rows_skipped: number;
+  rows_errored: number;
+  error_message: string | null;
 }

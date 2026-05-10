@@ -582,6 +582,50 @@ class StockScoring(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class StockBulkImport(Base):
+    """Audit row for a single bulk-CSV import job."""
+    __tablename__ = "stock_bulk_imports"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    exchange_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("exchanges.id", ondelete="RESTRICT"), nullable=False,
+    )
+    user_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="SET NULL"),
+    )
+    filename: Mapped[Optional[str]] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    rows_total: Mapped[int] = mapped_column(Integer, default=0)
+    rows_inserted: Mapped[int] = mapped_column(Integer, default=0)
+    rows_updated: Mapped[int] = mapped_column(Integer, default=0)
+    rows_skipped: Mapped[int] = mapped_column(Integer, default=0)
+    rows_errored: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    summary: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+
+class StockBulkImportRaw(Base):
+    """Raw CSV row preserved per-stock per-import.
+
+    The bulk importer maps ~220 of the 248 stockanalysis.com columns to
+    structured tables. The ~30 unmapped columns (Z-Score, F-Score, 20MA,
+    insider ownership, etc.) live here as jsonb so a future migration can
+    extract them without re-uploading the CSV.
+    """
+    __tablename__ = "stock_bulk_import_raw"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    import_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("stock_bulk_imports.id", ondelete="CASCADE"), nullable=False,
+    )
+    stock_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"),
+    )
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    raw_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # ---------- Engine factory ----------
 _settings = get_settings()
 _engine = create_engine(_settings.database_url_sync, pool_pre_ping=True, pool_size=10)

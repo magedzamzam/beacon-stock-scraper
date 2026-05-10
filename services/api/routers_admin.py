@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -15,9 +15,11 @@ from sqlalchemy.orm import Session
 
 from shared.db import (
     Exchange, PortfolioPosition, ScrapeRun, Stock, StockAnalystConsensus, User,
-    StockQuote, StockHistoryQuote, StockScoring,
+    StockQuote, StockHistoryQuote, StockScoring, StockBulkImport,
 )
 from .auth import get_current_user, get_db
+from .bulk_import import execute_bulk_import as bulk_execute
+from .bulk_import import preview_bulk_import as bulk_preview
 from .import_tool import build_import_catalog, build_preview, execute_import, save_upload_preview
 from .schemas import (
     AdminStatusOut, ImportCatalogOut, ImportExecuteOut, ImportExecuteRequest, ImportPreviewOut,
@@ -349,6 +351,97 @@ def import_execute(
         match_columns=req.match_columns,
         ignore_blank_values=req.ignore_blank_values,
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin: bulk CSV importer (stockanalysis.com exchange exports)
+# ---------------------------------------------------------------------------
+# Unlike the generic per-table CSV importer above, this one knows about the
+# 248-column stockanalysis.com format and fans each row across stocks +
+# stock_quotes + stock_history_quote + stock_fin_* + stock_mkt_* in one go.
+# ---------------------------------------------------------------------------
+@router.post("/imports/bulk/preview")
+async def import_bulk_preview(
+    file: UploadFile = File(...),
+    _: User = Depends(require_admin),
+):
+    """Inspect a CSV before importing — header count, sample rows, ticker count."""
+    body = await file.read()
+    if not body:
+        raise HTTPException(400, "Empty file")
+    return bulk_preview(body)
+
+
+class BulkImportExecuteResponse(BaseModel):
+    import_id: int
+    status: str
+    rows_total: int
+    rows_inserted: int
+    rows_updated: int
+    rows_skipped: int
+    rows_errored: int
+    row_logs: list[dict]
+
+
+@router.post("/imports/bulk/execute", response_model=BulkImportExecuteResponse)
+async def import_bulk_execute(
+    file: UploadFile = File(...),
+    exchange_id: int = Form(...),
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Run the bulk import. Requires an exchange — every row in the CSV is
+    assumed to belong to it (the file is exchange-specific by design).
+    """
+    body = await file.read()
+    if not body:
+        raise HTTPException(400, "Empty file")
+
+    exchange = db.get(Exchange, exchange_id)
+    if exchange is None:
+        raise HTTPException(404, f"Unknown exchange id={exchange_id}")
+
+    return bulk_execute(
+        db,
+        exchange_id=exchange_id,
+        user_id=user.id,
+        filename=file.filename,
+        file_bytes=body,
+    )
+
+
+@router.get("/imports/bulk/history")
+def import_bulk_history(
+    limit: int = 25,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """List recent bulk imports — newest first."""
+    rows = db.execute(
+        select(StockBulkImport, Exchange.code, User.email)
+        .join(Exchange, Exchange.id == StockBulkImport.exchange_id)
+        .outerjoin(User, User.id == StockBulkImport.user_id)
+        .order_by(desc(StockBulkImport.started_at))
+        .limit(min(max(limit, 1), 100))
+    ).all()
+    return [
+        {
+            "id": r[0].id,
+            "exchange_code": r[1],
+            "user_email": r[2],
+            "filename": r[0].filename,
+            "started_at": r[0].started_at,
+            "finished_at": r[0].finished_at,
+            "status": r[0].status,
+            "rows_total": r[0].rows_total,
+            "rows_inserted": r[0].rows_inserted,
+            "rows_updated": r[0].rows_updated,
+            "rows_skipped": r[0].rows_skipped,
+            "rows_errored": r[0].rows_errored,
+            "error_message": r[0].error_message,
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

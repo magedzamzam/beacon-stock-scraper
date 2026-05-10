@@ -2,14 +2,15 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/lib/auth-store";
-import { LayoutDashboard, Database, FileUp, History, SlidersHorizontal } from "lucide-react";
+import { LayoutDashboard, Database, FileUp, FileSpreadsheet, History, SlidersHorizontal } from "lucide-react";
 
 const TABS = [
-  { href: "/admin",          label: "Overview",   icon: LayoutDashboard, exact: true },
-  { href: "/admin/stocks",   label: "Stocks",     icon: Database },
-  { href: "/admin/imports",  label: "CSV import", icon: FileUp },
-  { href: "/admin/history",  label: "History",    icon: History },
-  { href: "/admin/settings", label: "Settings",   icon: SlidersHorizontal },
+  { href: "/admin",             label: "Overview",    icon: LayoutDashboard, exact: true },
+  { href: "/admin/stocks",      label: "Stocks",      icon: Database },
+  { href: "/admin/imports",     label: "CSV import",  icon: FileUp },
+  { href: "/admin/bulk-import", label: "Bulk import", icon: FileSpreadsheet },
+  { href: "/admin/history",     label: "History",     icon: History },
+  { href: "/admin/settings",    label: "Settings",    icon: SlidersHorizontal },
 ];
 
 
