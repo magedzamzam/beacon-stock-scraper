@@ -212,11 +212,20 @@ export interface AIProviderSetting {
   display_name?: string | null;
   enabled: boolean;
   api_key_set: boolean;
+  /** Backward-compatible alias used by older UI code. */
+  api_key_present?: boolean;
   model_name?: string | null;
   last_tested_at?: string | null;
   last_test_status?: string | null;
   last_test_message?: string | null;
   [key: string]: any;
+}
+
+export interface AIProviderUpsert {
+  enabled?: boolean;
+  api_key?: string | null;
+  model_name?: string | null;
+  display_name?: string | null;
 }
 
 export interface AIPromptTemplate {
@@ -229,6 +238,7 @@ export interface AIPromptTemplate {
   token_budget?: number | null;
   created_at?: string | null;
   updated_at?: string | null;
+  scope?: "stock" | "portfolio" | string;
   // Backward-compatible aliases for older UI code.
   key?: string;
   label?: string;
