@@ -225,15 +225,17 @@ async def run_account_stats_snapshot():
 async def run_broker_quote_refresh():
     """Hourly refresh of live quotes for stocks with a broker mapping.
 
-    For each (stock, broker) tradeable mapping, hits the broker_gateway and
-    UPSERTs into stock_broker_quotes. Bad mappings (broker offline, symbol
-    no longer valid) are logged and skipped.
+    Uses the broker_gateway's batch endpoint: one HTTP call per broker (one
+    Capital.com session login per broker) instead of N calls. Before this
+    change, ~200 mappings = ~200 session POSTs and Capital.com 429'd the
+    whole batch.
     """
     cfg = _read_job_cfg("job.broker_quote_refresh")
     if not cfg.get("enabled", True):
         return
     rid, started = _start_run("job.broker_quote_refresh")
     try:
+        from collections import defaultdict
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from shared.db import (
             BrokerInstrument,
@@ -246,93 +248,123 @@ async def run_broker_quote_refresh():
                 .where(BrokerInstrument.is_tradeable.is_(True),
                        BrokerInstrument.stock_id.is_not(None))
             ).scalars().all()
+            # (stock_id, broker_id, broker_symbol)
             mapping_data = [(m.stock_id, m.broker_id, m.broker_symbol) for m in mappings]
 
+        # Bucket by broker_id: one batch request per broker
+        by_broker: dict[int, list[tuple[int, str]]] = defaultdict(list)
+        for stock_id, broker_id, broker_symbol in mapping_data:
+            by_broker[broker_id].append((stock_id, broker_symbol))
+
         ok = failed = 0
-        async with httpx.AsyncClient(timeout=20) as client:
-            for (stock_id, broker_id, broker_symbol) in mapping_data:
+        # Generous timeout — a 200-symbol batch through Capital.com can take
+        # tens of seconds because the adapter fetches one quote at a time.
+        async with httpx.AsyncClient(timeout=300) as client:
+            for broker_id, items in by_broker.items():
+                symbols = [sym for (_sid, sym) in items]
+                sym_to_stock = {sym: sid for (sid, sym) in items}
+
                 try:
-                    r = await client.get(f"{BROKER_GATEWAY_URL}/brokers/{broker_id}/quote/{broker_symbol}")
+                    r = await client.post(
+                        f"{BROKER_GATEWAY_URL}/brokers/{broker_id}/quotes/batch",
+                        json={"symbols": symbols},
+                    )
                     if r.status_code >= 400:
-                        failed += 1
+                        log.warning("batch_quote_failed",
+                                    broker_id=broker_id, status=r.status_code,
+                                    body=r.text[:200])
+                        failed += len(symbols)
                         continue
-                    payload = r.json()
+                    batch = r.json()
                 except Exception as exc:
-                    log.warning("quote_fetch_failed",
-                                stock_id=stock_id, broker_symbol=broker_symbol,
-                                error=str(exc))
-                    failed += 1
+                    log.warning("batch_quote_exception",
+                                broker_id=broker_id, error=str(exc))
+                    failed += len(symbols)
                     continue
 
-                def _dec(k):
-                    v = payload.get(k)
-                    return Decimal(str(v)) if v is not None else None
+                quotes = batch.get("quotes", {})
+                errors = batch.get("errors", {})
 
-                cq_values = {
-                    "stock_id": stock_id, "broker_id": broker_id,
-                    "broker_symbol": broker_symbol,
-                    "bid": _dec("bid"), "offer": _dec("offer"),
-                    "last_price": _dec("last_price"),
-                    "open_price": _dec("open_price"),
-                    "high_price": _dec("high_price"),
-                    "low_price": _dec("low_price"),
-                    "close_price": _dec("close_price"),
-                    "broker_change_abs": _dec("change_abs"),
-                    "broker_change_pct": _dec("change_pct"),
-                    "volume": _dec("volume"),
-                    "currency": payload.get("currency"),
-                    "market_status": payload.get("market_status"),
-                    "fetched_at": datetime.utcnow(),
-                }
-                try:
-                    with SessionLocal() as s:
-                        # Write to stock_cur_quote
-                        cq_stmt = pg_insert(StockCurQuote).values(**cq_values).on_conflict_do_update(
-                            index_elements=["stock_id", "broker_id"],
-                            set_={k: v for k, v in cq_values.items()
-                                  if k not in ("stock_id", "broker_id", "broker_symbol")},
-                        )
-                        s.execute(cq_stmt)
+                for symbol, payload in quotes.items():
+                    stock_id = sym_to_stock.get(symbol)
+                    if stock_id is None:
+                        continue
 
-                        # Refresh canonical stock_quotes price (preserve score/verdict)
-                        last_price = cq_values["last_price"]
-                        if last_price is not None:
-                            hist = s.execute(
-                                select(StockHistoryQuote.close_price)
-                                .where(StockHistoryQuote.stock_id == stock_id,
-                                       StockHistoryQuote.close_price.is_not(None))
-                                .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
-                            ).all()
-                            prev_close = hist[1].close_price if len(hist) >= 2 else None
-                            ch_abs = ch_pct = None
-                            if prev_close is not None and prev_close != 0:
-                                ch_abs = last_price - prev_close
-                                ch_pct = (ch_abs / prev_close) * 100
-                            sq_record = {
-                                "stock_id": stock_id,
-                                "current_price": last_price,
-                                "prev_close": prev_close,
-                                "change_abs": ch_abs,
-                                "change_pct": ch_pct,
-                                "price_source": "broker",
-                                "price_fetched_at": cq_values["fetched_at"],
-                                "last_updated": datetime.utcnow(),
-                            }
-                            sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
-                                index_elements=["stock_id"],
-                                set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                    def _dec(k, p=payload):
+                        v = p.get(k)
+                        return Decimal(str(v)) if v is not None else None
+
+                    cq_values = {
+                        "stock_id": stock_id, "broker_id": broker_id,
+                        "broker_symbol": symbol,
+                        "bid": _dec("bid"), "offer": _dec("offer"),
+                        "last_price": _dec("last_price"),
+                        "open_price": _dec("open_price"),
+                        "high_price": _dec("high_price"),
+                        "low_price": _dec("low_price"),
+                        "close_price": _dec("close_price"),
+                        "broker_change_abs": _dec("change_abs"),
+                        "broker_change_pct": _dec("change_pct"),
+                        "volume": _dec("volume"),
+                        "currency": payload.get("currency"),
+                        "market_status": payload.get("market_status"),
+                        "fetched_at": datetime.utcnow(),
+                    }
+                    try:
+                        with SessionLocal() as s:
+                            cq_stmt = pg_insert(StockCurQuote).values(**cq_values).on_conflict_do_update(
+                                index_elements=["stock_id", "broker_id"],
+                                set_={k: v for k, v in cq_values.items()
+                                      if k not in ("stock_id", "broker_id", "broker_symbol")},
                             )
-                            s.execute(sq_stmt)
+                            s.execute(cq_stmt)
 
-                        s.commit()
-                    ok += 1
-                except Exception as exc:
-                    log.warning("quote_db_failed",
-                                stock_id=stock_id, error=str(exc))
+                            # Refresh canonical stock_quotes (preserve score/verdict)
+                            last_price = cq_values["last_price"]
+                            if last_price is not None:
+                                hist = s.execute(
+                                    select(StockHistoryQuote.close_price)
+                                    .where(StockHistoryQuote.stock_id == stock_id,
+                                           StockHistoryQuote.close_price.is_not(None))
+                                    .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
+                                ).all()
+                                prev_close = hist[1].close_price if len(hist) >= 2 else None
+                                ch_abs = ch_pct = None
+                                if prev_close is not None and prev_close != 0:
+                                    ch_abs = last_price - prev_close
+                                    ch_pct = (ch_abs / prev_close) * 100
+                                sq_record = {
+                                    "stock_id": stock_id,
+                                    "current_price": last_price,
+                                    "prev_close": prev_close,
+                                    "change_abs": ch_abs,
+                                    "change_pct": ch_pct,
+                                    "price_source": "broker",
+                                    "price_fetched_at": cq_values["fetched_at"],
+                                    "last_updated": datetime.utcnow(),
+                                }
+                                sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
+                                    index_elements=["stock_id"],
+                                    set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                                )
+                                s.execute(sq_stmt)
+                            s.commit()
+                        ok += 1
+                    except Exception as exc:
+                        log.warning("quote_db_failed",
+                                    stock_id=stock_id, symbol=symbol, error=str(exc))
+                        failed += 1
+
+                # Per-symbol broker errors come back inside the batch payload
+                for symbol, msg in errors.items():
+                    log.warning("quote_broker_error",
+                                broker_id=broker_id, symbol=symbol, error=msg)
                     failed += 1
+
         _finish_run(rid, started, "ok",
                     summary={"updated": ok, "failed": failed,
-                             "total": len(mapping_data)})
+                             "total": len(mapping_data),
+                             "brokers": len(by_broker)})
     except Exception as exc:
         log.exception("broker_quote_refresh_failed", error=str(exc))
         _finish_run(rid, started, "failed", error=str(exc))

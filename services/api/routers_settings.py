@@ -210,9 +210,10 @@ async def run_job(
                 r2.raise_for_status()
                 summary = {"all": r1.json(), "portfolio": r2.json()}
         elif key == "job.broker_quote_refresh":
-            # Loops every tradeable broker_instrument, calls broker_gateway,
-            # UPSERTs into stock_cur_quote and refreshes stock_quotes.
+            # Calls broker_gateway's batch endpoint once per broker, then fans
+            # the responses out to stock_cur_quote + stock_quotes.
             # Mirrors scheduler logic but runs in-process for instant manual refresh.
+            from collections import defaultdict
             from decimal import Decimal as _D
             from sqlalchemy.dialects.postgresql import insert as _pg_insert
             from shared.db import (
@@ -226,83 +227,102 @@ async def run_job(
                        BrokerInstrument.stock_id.is_not(None))
             ).all()
 
+            # Bucket by broker_id — one batch call per broker
+            by_broker: dict[int, list[tuple[int, str]]] = defaultdict(list)
+            for (stock_id, broker_id, broker_symbol) in mapping_data:
+                by_broker[broker_id].append((stock_id, broker_symbol))
+
             ok_n = failed_n = 0
             gateway_url = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
-            async with httpx.AsyncClient(timeout=20) as client:
-                for (stock_id, broker_id, broker_symbol) in mapping_data:
+            async with httpx.AsyncClient(timeout=300) as client:
+                for broker_id, items in by_broker.items():
+                    symbols = [sym for (_sid, sym) in items]
+                    sym_to_stock = {sym: sid for (sid, sym) in items}
                     try:
-                        rq = await client.get(f"{gateway_url}/brokers/{broker_id}/quote/{broker_symbol}")
+                        rq = await client.post(
+                            f"{gateway_url}/brokers/{broker_id}/quotes/batch",
+                            json={"symbols": symbols},
+                        )
                         if rq.status_code >= 400:
-                            failed_n += 1
+                            failed_n += len(symbols)
                             continue
-                        payload = rq.json()
+                        batch = rq.json()
                     except Exception:
-                        failed_n += 1
+                        failed_n += len(symbols)
                         continue
 
-                    def _dec(k, p=payload):
-                        v = p.get(k)
-                        return _D(str(v)) if v is not None else None
+                    quotes = batch.get("quotes", {})
+                    errors = batch.get("errors", {})
+                    failed_n += len(errors)
 
-                    cur_values = {
-                        "stock_id": stock_id, "broker_id": broker_id,
-                        "broker_symbol": broker_symbol,
-                        "bid": _dec("bid"), "offer": _dec("offer"),
-                        "last_price": _dec("last_price"),
-                        "open_price": _dec("open_price"),
-                        "high_price": _dec("high_price"),
-                        "low_price": _dec("low_price"),
-                        "close_price": _dec("close_price"),
-                        "broker_change_abs": _dec("change_abs"),
-                        "broker_change_pct": _dec("change_pct"),
-                        "volume": _dec("volume"),
-                        "currency": payload.get("currency"),
-                        "market_status": payload.get("market_status"),
-                        "fetched_at": datetime.utcnow(),
-                    }
-                    try:
-                        cq_stmt = _pg_insert(StockCurQuote).values(**cur_values).on_conflict_do_update(
-                            index_elements=["stock_id", "broker_id"],
-                            set_={k: v for k, v in cur_values.items()
-                                  if k not in ("stock_id", "broker_id", "broker_symbol")},
-                        )
-                        db.execute(cq_stmt)
+                    for symbol, payload in quotes.items():
+                        stock_id = sym_to_stock.get(symbol)
+                        if stock_id is None:
+                            continue
 
-                        # Update canonical stock_quotes price (preserve score/verdict)
-                        last_p = cur_values["last_price"]
-                        if last_p is not None:
-                            hist = db.execute(
-                                select(StockHistoryQuote.close_price)
-                                .where(StockHistoryQuote.stock_id == stock_id,
-                                       StockHistoryQuote.close_price.is_not(None))
-                                .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
-                            ).all()
-                            prev_c = hist[1].close_price if len(hist) >= 2 else None
-                            ch_a = ch_p = None
-                            if prev_c is not None and prev_c != 0:
-                                ch_a = last_p - prev_c
-                                ch_p = (ch_a / prev_c) * 100
-                            sq_record = {
-                                "stock_id": stock_id,
-                                "current_price": last_p,
-                                "prev_close": prev_c,
-                                "change_abs": ch_a,
-                                "change_pct": ch_p,
-                                "price_source": "broker",
-                                "price_fetched_at": cur_values["fetched_at"],
-                                "last_updated": datetime.utcnow(),
-                            }
-                            sq_stmt = _pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
-                                index_elements=["stock_id"],
-                                set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                        def _dec(k, p=payload):
+                            v = p.get(k)
+                            return _D(str(v)) if v is not None else None
+
+                        cur_values = {
+                            "stock_id": stock_id, "broker_id": broker_id,
+                            "broker_symbol": symbol,
+                            "bid": _dec("bid"), "offer": _dec("offer"),
+                            "last_price": _dec("last_price"),
+                            "open_price": _dec("open_price"),
+                            "high_price": _dec("high_price"),
+                            "low_price": _dec("low_price"),
+                            "close_price": _dec("close_price"),
+                            "broker_change_abs": _dec("change_abs"),
+                            "broker_change_pct": _dec("change_pct"),
+                            "volume": _dec("volume"),
+                            "currency": payload.get("currency"),
+                            "market_status": payload.get("market_status"),
+                            "fetched_at": datetime.utcnow(),
+                        }
+                        try:
+                            cq_stmt = _pg_insert(StockCurQuote).values(**cur_values).on_conflict_do_update(
+                                index_elements=["stock_id", "broker_id"],
+                                set_={k: v for k, v in cur_values.items()
+                                      if k not in ("stock_id", "broker_id", "broker_symbol")},
                             )
-                            db.execute(sq_stmt)
-                        db.commit()
-                        ok_n += 1
-                    except Exception:
-                        db.rollback()
-                        failed_n += 1
-            summary = {"updated": ok_n, "failed": failed_n, "total": len(mapping_data)}
+                            db.execute(cq_stmt)
+
+                            last_p = cur_values["last_price"]
+                            if last_p is not None:
+                                hist = db.execute(
+                                    select(StockHistoryQuote.close_price)
+                                    .where(StockHistoryQuote.stock_id == stock_id,
+                                           StockHistoryQuote.close_price.is_not(None))
+                                    .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
+                                ).all()
+                                prev_c = hist[1].close_price if len(hist) >= 2 else None
+                                ch_a = ch_p = None
+                                if prev_c is not None and prev_c != 0:
+                                    ch_a = last_p - prev_c
+                                    ch_p = (ch_a / prev_c) * 100
+                                sq_record = {
+                                    "stock_id": stock_id,
+                                    "current_price": last_p,
+                                    "prev_close": prev_c,
+                                    "change_abs": ch_a,
+                                    "change_pct": ch_p,
+                                    "price_source": "broker",
+                                    "price_fetched_at": cur_values["fetched_at"],
+                                    "last_updated": datetime.utcnow(),
+                                }
+                                sq_stmt = _pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
+                                    index_elements=["stock_id"],
+                                    set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                                )
+                                db.execute(sq_stmt)
+                            db.commit()
+                            ok_n += 1
+                        except Exception:
+                            db.rollback()
+                            failed_n += 1
+            summary = {"updated": ok_n, "failed": failed_n,
+                       "total": len(mapping_data), "brokers": len(by_broker)}
         elif key == "job.account_stats_snapshot":
             # The scheduler holds the actual implementation; manual trigger
             # via API would require HTTP-based dispatch we haven't built. Mark

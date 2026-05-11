@@ -1,7 +1,9 @@
 """broker_gateway — only service that decrypts broker credentials and talks to broker APIs."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -62,6 +64,103 @@ def _broker_error_to_status(exc: BrokerError) -> int:
     if isinstance(exc, NetworkError):
         return 502
     return 500
+
+
+# ----------------------------------------------------------------------------
+# Adapter session cache
+# ----------------------------------------------------------------------------
+# Capital.com sessions expire after 10 minutes of inactivity. Without caching,
+# every /quote/... call constructs a fresh adapter -> POST /api/v1/session ->
+# get one quote -> aclose(). Hammering /api/v1/session this way triggers
+# 429 Too Many Requests from Capital.com's session endpoint.
+#
+# Strategy:
+#   * Keep one adapter per account_id, alive for up to 8 minutes (under the
+#     10-minute server-side TTL so we never race the expiry).
+#   * Guard cache lookups with a per-key asyncio.Lock so simultaneous quote
+#     requests on a cold cache only do ONE login.
+#   * Invalidate on AuthError (server-side session was killed) so the next
+#     call re-logs in.
+#
+# This is process-local. We run one broker_gateway container per environment,
+# so there's no cross-worker coordination problem.
+# ----------------------------------------------------------------------------
+
+_ADAPTER_TTL_SECONDS = 8 * 60  # under Capital.com's 10-minute idle limit
+
+
+class _CachedAdapter:
+    __slots__ = ("account_id", "broker", "adapter", "expires_at", "lock")
+
+    def __init__(self, account_id: int, broker: Broker, adapter: BrokerAdapter):
+        self.account_id = account_id
+        self.broker = broker
+        self.adapter = adapter
+        self.expires_at = time.monotonic() + _ADAPTER_TTL_SECONDS
+        # Per-entry lock — concurrent batch requests on the SAME account
+        # serialise through here. Different accounts run in parallel.
+        self.lock = asyncio.Lock()
+
+    def expired(self) -> bool:
+        return time.monotonic() >= self.expires_at
+
+
+_ADAPTER_CACHE: dict[int, _CachedAdapter] = {}
+_CACHE_LOCK = asyncio.Lock()  # only guards cache-dict mutations, not adapter use
+
+
+async def _get_cached_adapter(account_id: int) -> _CachedAdapter:
+    """Return a cached adapter for this account, building one if missing/expired.
+
+    On expiry we close the old client cleanly before replacing it.
+    """
+    async with _CACHE_LOCK:
+        entry = _ADAPTER_CACHE.get(account_id)
+        if entry is not None and not entry.expired():
+            return entry
+        # Discard stale entry (also close its client if present)
+        if entry is not None:
+            try:
+                await entry.adapter.aclose()
+            except Exception:
+                pass
+            _ADAPTER_CACHE.pop(account_id, None)
+
+        # Build a fresh one
+        _, broker, adapter = _build_adapter(account_id)
+        entry = _CachedAdapter(account_id, broker, adapter)
+        _ADAPTER_CACHE[account_id] = entry
+        return entry
+
+
+async def _invalidate_adapter(account_id: int) -> None:
+    """Drop the cache entry — called on auth errors so the next call re-logs in."""
+    async with _CACHE_LOCK:
+        entry = _ADAPTER_CACHE.pop(account_id, None)
+    if entry is not None:
+        try:
+            await entry.adapter.aclose()
+        except Exception:
+            pass
+
+
+def _serialize_quote(q, broker_symbol: str) -> dict:
+    """Common quote payload — used by single and batch endpoints."""
+    return {
+        "broker_symbol": getattr(q, "broker_symbol", broker_symbol),
+        "bid": str(q.bid) if q.bid is not None else None,
+        "offer": str(q.offer) if q.offer is not None else None,
+        "last_price": str(q.last_price) if q.last_price is not None else None,
+        "open_price": str(q.open_price) if q.open_price is not None else None,
+        "high_price": str(q.high_price) if q.high_price is not None else None,
+        "low_price": str(q.low_price) if q.low_price is not None else None,
+        "close_price": str(q.close_price) if q.close_price is not None else None,
+        "change_abs": str(q.change_abs) if q.change_abs is not None else None,
+        "change_pct": str(q.change_pct) if q.change_pct is not None else None,
+        "volume": str(q.volume) if q.volume is not None else None,
+        "currency": q.currency,
+        "market_status": q.market_status,
+    }
 
 
 def _record_connect_status(account_id: int, ok: bool, message: Optional[str]) -> None:
@@ -281,46 +380,120 @@ async def search_instruments(broker_id: int, q: str):
         await adapter.aclose()
 
 
-@app.get("/brokers/{broker_id}/quote/{broker_symbol:path}")
-async def get_quote(broker_id: int, broker_symbol: str):
-    """Live quote for a (broker, broker_symbol) pair.
-
-    Borrows any active account on this broker for the session token —
-    quotes themselves aren't account-specific. Returns 404 if the broker
-    adapter doesn't support live quotes (e.g. manual brokers).
-    """
-    if not broker_symbol:
-        raise HTTPException(400, "broker_symbol is required")
+def _resolve_quote_account(broker_id: int) -> int:
+    """Pick any active account for this broker — quotes aren't account-specific."""
     with SessionLocal() as session:
         acct = session.execute(
             select(TradingAccount)
             .where(TradingAccount.broker_id == broker_id, TradingAccount.is_active.is_(True))
             .limit(1)
         ).scalar_one_or_none()
-        if acct is None:
-            raise HTTPException(409, "No active account on this broker — connect one first")
-    _, broker, adapter = _build_adapter(acct.id)
-    try:
-        q = await adapter.get_quote(broker_symbol)
-        return {
-            "broker_id": broker_id,
-            "broker_symbol": q.broker_symbol,
-            "bid": str(q.bid) if q.bid is not None else None,
-            "offer": str(q.offer) if q.offer is not None else None,
-            "last_price": str(q.last_price) if q.last_price is not None else None,
-            "open_price": str(q.open_price) if q.open_price is not None else None,
-            "high_price": str(q.high_price) if q.high_price is not None else None,
-            "low_price": str(q.low_price) if q.low_price is not None else None,
-            "close_price": str(q.close_price) if q.close_price is not None else None,
-            "change_abs": str(q.change_abs) if q.change_abs is not None else None,
-            "change_pct": str(q.change_pct) if q.change_pct is not None else None,
-            "volume": str(q.volume) if q.volume is not None else None,
-            "currency": q.currency,
-            "market_status": q.market_status,
-        }
-    except NotImplementedError:
-        raise HTTPException(404, f"Broker '{broker.name}' does not support live quotes")
-    except BrokerError as exc:
-        raise HTTPException(_broker_error_to_status(exc), str(exc))
-    finally:
-        await adapter.aclose()
+    if acct is None:
+        raise HTTPException(409, "No active account on this broker — connect one first")
+    return acct.id
+
+
+@app.get("/brokers/{broker_id}/quote/{broker_symbol:path}")
+async def get_quote(broker_id: int, broker_symbol: str):
+    """Live quote for a (broker, broker_symbol) pair.
+
+    Uses the per-account adapter cache so we don't POST /api/v1/session on
+    every request. Falls back to a fresh login if the cached session has
+    been killed server-side (we'll get an AuthError and retry once).
+    """
+    if not broker_symbol:
+        raise HTTPException(400, "broker_symbol is required")
+    account_id = _resolve_quote_account(broker_id)
+
+    async def _fetch_one(entry: _CachedAdapter):
+        async with entry.lock:
+            return await entry.adapter.get_quote(broker_symbol)
+
+    # Try with cached adapter; on AuthError invalidate and retry once.
+    for attempt in (1, 2):
+        entry = await _get_cached_adapter(account_id)
+        try:
+            q = await _fetch_one(entry)
+            return {"broker_id": broker_id, **_serialize_quote(q, broker_symbol)}
+        except NotImplementedError:
+            raise HTTPException(404, f"Broker '{entry.broker.name}' does not support live quotes")
+        except AuthError:
+            await _invalidate_adapter(account_id)
+            if attempt == 2:
+                raise HTTPException(401, "Broker auth failed after retry")
+        except BrokerError as exc:
+            raise HTTPException(_broker_error_to_status(exc), str(exc))
+
+
+class BatchQuoteRequest(BaseModel):
+    symbols: list[str] = Field(..., min_length=1, max_length=500)
+
+
+@app.post("/brokers/{broker_id}/quotes/batch")
+async def get_quotes_batch(broker_id: int, body: BatchQuoteRequest):
+    """Fetch many quotes through ONE cached adapter session.
+
+    Per-symbol failures are reported in the response under `errors`, not as a
+    4xx. That way one bad ticker doesn't kill the batch — the caller logs the
+    error and moves on. Auth failure mid-batch invalidates the cache and the
+    rest of the batch retries through a fresh session.
+    """
+    if not body.symbols:
+        raise HTTPException(400, "symbols list is empty")
+    account_id = _resolve_quote_account(broker_id)
+
+    quotes: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    remaining = list(body.symbols)
+
+    # Use one cached adapter for the whole batch. If the session gets killed
+    # mid-batch (AuthError), invalidate the cache, grab a fresh adapter, and
+    # resume with the unprocessed symbols. The retry budget caps how many
+    # times we'll re-login in a single batch (otherwise a persistently bad
+    # session could loop forever).
+    retries_left = 2
+    while remaining and retries_left >= 0:
+        entry = await _get_cached_adapter(account_id)
+        async with entry.lock:
+            processed_this_pass: list[str] = []
+            auth_failed = False
+            for symbol in remaining:
+                try:
+                    q = await entry.adapter.get_quote(symbol)
+                    quotes[symbol] = _serialize_quote(q, symbol)
+                    processed_this_pass.append(symbol)
+                except NotImplementedError:
+                    raise HTTPException(
+                        404, f"Broker '{entry.broker.name}' does not support live quotes"
+                    )
+                except AuthError as exc:
+                    errors[symbol] = f"auth: {exc}"
+                    processed_this_pass.append(symbol)
+                    auth_failed = True
+                    break
+                except BrokerError as exc:
+                    errors[symbol] = str(exc)
+                    processed_this_pass.append(symbol)
+            remaining = [s for s in remaining if s not in processed_this_pass]
+        if auth_failed:
+            await _invalidate_adapter(account_id)
+            retries_left -= 1
+        else:
+            break  # finished cleanly
+
+    # Anything still in remaining means we burned the retry budget — mark them
+    # as failed so the caller knows.
+    for symbol in remaining:
+        errors.setdefault(symbol, "auth retries exhausted")
+
+    return {
+        "broker_id": broker_id,
+        "fetched_at": datetime.utcnow().isoformat(),
+        "ok_count": len(quotes),
+        "error_count": len(errors),
+        "quotes": quotes,
+        "errors": errors,
+    }
+
+
+
