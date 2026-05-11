@@ -226,6 +226,7 @@ export interface AIProviderUpsert {
   api_key?: string | null;
   model_name?: string | null;
   display_name?: string | null;
+  base_url?: string;
 }
 
 export interface AIPromptTemplate {
