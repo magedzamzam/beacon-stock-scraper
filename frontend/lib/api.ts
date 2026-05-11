@@ -206,79 +206,50 @@ export interface AuthResponse {
 }
 
 export interface AIProviderSetting {
-  id?: number;
   provider_key: string;
-  provider_name?: string | null;
-  display_name?: string | null;
+  provider_name: string;
   enabled: boolean;
-  api_key_set: boolean;
-  model_name?: string | null;
-  last_tested_at?: string | null;
-  last_test_status?: string | null;
-  last_test_message?: string | null;
-  [key: string]: any;
+  api_key_present: boolean;
+  model_name: string | null;
+  base_url: string | null;
+  last_tested_at: string | null;
+  last_test_status: string | null;
+  last_test_error: string | null;
+  updated_at: string | null;
 }
 
 export interface AIPromptTemplate {
-  id?: number;
-  template_key: string;
-  name: string;
-  description?: string | null;
-  prompt_text: string;
-  enabled: boolean;
-  token_budget?: number | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-  // Backward-compatible aliases for older UI code.
-  key?: string;
-  label?: string;
-  max_output_tokens?: number | null;
-  [key: string]: any;
+  key: string;
+  label: string;
+  scope: "stock" | "portfolio";
+  description: string | null;
+  system_prompt: string;
+  max_output_tokens: number;
+  updated_at: string | null;
 }
 
-export interface AIAnalysisRequest {
-  provider_keys: string[];
-  prompt_key: string;
-  account_id?: number | null;
-}
-
-export interface AIAnalysisResultItem {
+export interface AIAnalysisResult {
   provider_key: string;
-  provider_name?: string | null;
-  model_name?: string | null;
+  provider_name: string;
+  model_name: string;
   ok: boolean;
-  error?: string | null;
-  latency_ms?: number | null;
-  analysis?: Record<string, any> | null;
-  title?: string | null;
-  summary?: string | null;
-  recommendation?: string | null;
-  confidence?: number | null;
-  raw_text?: string | null;
-  [key: string]: any;
+  error: string | null;
+  latency_ms: number | null;
+  analysis: Record<string, any> | null;
 }
 
 export interface AIAnalysisResponse {
-  results: AIAnalysisResultItem[];
-  provider?: string | null;
-  model?: string | null;
-  request_type: "stock" | "portfolio" | string;
-  ticker?: string | null;
-  exchange_code?: string | null;
-  portfolio_id?: number | null;
-  account_id?: number | null;
-  action?: string | null;
-  decision?: string | null;
-  summary?: string | null;
-  thesis?: string[];
-  catalysts?: string[];
-  risks?: string[];
-  technical_view?: string | null;
-  financial_view?: string | null;
-  valuation_view?: string | null;
-  confidence?: number | null;
-  raw?: any;
-  [key: string]: any;
+  scope: "stock" | "portfolio";
+  prompt_key: string;
+  context: Record<string, any>;
+  results: AIAnalysisResult[];
+}
+
+export interface AIProviderUpsert {
+  enabled: boolean;
+  api_key?: string | null;
+  model_name?: string | null;
+  base_url?: string | null;
 }
 
 // ---------------- Endpoints ----------------
@@ -316,29 +287,14 @@ export const api = {
   refreshStock: (exchange: string, ticker: string) =>
     request<{ status: string }>(`/stocks/${exchange}/${ticker}/refresh`, { method: "POST" }),
 
-  // ai analysis
-  listAIProviders: () => request<AIProviderSetting[]>("/ai/providers"),
-  updateAIProvider: (provider_key: string, body: { enabled?: boolean; api_key?: string | null; model_name?: string | null }) =>
-    request<AIProviderSetting>(`/ai/providers/${encodeURIComponent(provider_key)}`, {
-      method: "PUT",
-      body: JSON.stringify(body),
-    }),
-  listAIPrompts: () => request<AIPromptTemplate[]>("/ai/prompts"),
-  updateAIPrompt: (template_key: string, body: { name?: string; description?: string | null; prompt_text?: string; enabled?: boolean; token_budget?: number | null }) =>
-    request<AIPromptTemplate>(`/ai/prompts/${encodeURIComponent(template_key)}`, {
-      method: "PUT",
-      body: JSON.stringify(body),
-    }),
-  analyzeStockAI: (exchange: string, ticker: string, body: AIAnalysisRequest) =>
-    request<AIAnalysisResponse>(`/ai/stocks/${exchange}/${ticker}/analyze`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  analyzePortfolioAI: (body: AIAnalysisRequest) =>
-    request<AIAnalysisResponse>("/ai/portfolio/analyze", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+  analyzeStock: (exchange: string, ticker: string, body: { provider_keys?: string[]; prompt_key?: string; account_id?: number | null }) =>
+    request<AIAnalysisResponse>(`/ai/analyze/stock/${exchange}/${ticker}`, { method: "POST", body: JSON.stringify(body) }),
+  analyzePortfolio: (body: { provider_keys?: string[]; prompt_key?: string; account_id?: number | null }) =>
+    request<AIAnalysisResponse>(`/ai/analyze/portfolio`, { method: "POST", body: JSON.stringify(body) }),
+  listAIProviders: () => request<AIProviderSetting[]>(`/ai/providers`),
+  saveAIProvider: (provider_key: string, body: AIProviderUpsert) =>
+    request<AIProviderSetting>(`/ai/providers/${encodeURIComponent(provider_key)}`, { method: "PUT", body: JSON.stringify(body) }),
+  listAIPrompts: () => request<AIPromptTemplate[]>(`/ai/prompts`),
 
   // watchlists
   listWatchlists: () => request<Watchlist[]>("/watchlists"),

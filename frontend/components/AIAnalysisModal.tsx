@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
-import { api, type AIAnalysisRequest, type AIAnalysisResponse, type AIAnalysisResultItem, type AIProviderSetting, type AIPromptTemplate, type Position, type StockDetail } from "@/lib/api";
+import { api, type AIAnalysisResponse, type AIProviderSetting, type AIPromptTemplate, type Position, type StockDetail } from "@/lib/api";
 import { fmtMoney, fmtPercent, fmtPrice } from "@/lib/utils";
 import { AlertCircle, BadgeCheck, Brain, CheckCircle2, Clock3, Loader2, Sparkles, X } from "lucide-react";
 
@@ -35,7 +35,7 @@ export default function AIAnalysisModal({
   const [error, setError] = useState<string | null>(null);
 
   const enabledProviders = useMemo(
-    () => (providers || []).filter((p) => p.enabled && (p.api_key_set ?? (p as any).api_key_present)),
+    () => (providers || []).filter((p) => p.enabled && p.api_key_present),
     [providers],
   );
 
@@ -59,14 +59,14 @@ export default function AIAnalysisModal({
     setError(null);
     setResult(null);
     try {
-      const body: AIAnalysisRequest = {
+      const body = {
         provider_keys: selectedProviders,
         prompt_key: promptKey,
         account_id: accountId ?? undefined,
       };
       const response = scope === "stock"
-        ? await api.analyzeStockAI(stock?.exchange_code || "", stock?.ticker || "", body)
-        : await api.analyzePortfolioAI(body);
+        ? await api.analyzeStock(stock?.exchange_code || "", stock?.ticker || "", body)
+        : await api.analyzePortfolio(body);
       setResult(response);
     } catch (e: any) {
       setError(e.message || "Analysis failed");
@@ -82,7 +82,7 @@ export default function AIAnalysisModal({
       : "All positions";
 
   const promptOptions = (prompts || []).filter((p) => p.scope === scope);
-  const currentPrompt = promptOptions.find((p) => p.template_key === promptKey) || promptOptions[0];
+  const currentPrompt = promptOptions.find((p) => p.key === promptKey) || promptOptions[0];
 
   return (
     <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
@@ -121,8 +121,8 @@ export default function AIAnalysisModal({
                     >
                       <div className="flex items-center justify-between gap-2">
                         <div>
-                          <div className="text-sm font-medium">{p.display_name || p.provider_name || p.provider_key}</div>
-                          <div className="text-[11px] text-ink-dim font-mono">{p.model_name || p.provider_key || "model"}</div>
+                          <div className="text-sm font-medium">{p.provider_name}</div>
+                          <div className="text-[11px] text-ink-dim font-mono">{p.model_name || "model"}</div>
                         </div>
                         <CheckCircle2 className={`size-4 ${active ? "text-verdict-buy" : "text-ink-dim"}`} />
                       </div>
@@ -136,11 +136,11 @@ export default function AIAnalysisModal({
               <div className="flex items-center gap-2 mb-3 text-sm font-semibold"><BadgeCheck className="size-4" /> Prompt</div>
               <select className="input" value={promptKey} onChange={(e) => setPromptKey(e.target.value)}>
                 {promptOptions.length === 0 && <option value={promptKey}>{DEFAULT_PROMPT_BY_SCOPE[scope]}</option>}
-                {promptOptions.map((prompt) => <option key={prompt.template_key} value={prompt.template_key}>{prompt.name}</option>)}
+                {promptOptions.map((prompt) => <option key={prompt.key} value={prompt.key}>{prompt.label}</option>)}
               </select>
               <div className="text-[11px] text-ink-dim mt-2">
                 {currentPrompt?.description || "Compact prompt"}
-                {currentPrompt && <span className="block mt-1 font-mono">max {currentPrompt.token_budget ?? 0} tokens</span>}
+                {currentPrompt && <span className="block mt-1 font-mono">max {currentPrompt.max_output_tokens} tokens</span>}
               </div>
             </div>
 
@@ -184,12 +184,12 @@ export default function AIAnalysisModal({
 
             {result && (
               <div className="space-y-3">
-                {result.results.map((r: AIAnalysisResultItem) => (
+                {result.results.map((r) => (
                   <div key={r.provider_key} className="rounded-2xl bg-bg-subtle p-4 ring-1 ring-border">
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <div className="font-semibold">{r.provider_name || r.provider_key}</div>
-                        <div className="text-xs text-ink-dim font-mono">{r.model_name || r.provider_key}</div>
+                        <div className="font-semibold">{r.provider_name}</div>
+                        <div className="text-xs text-ink-dim font-mono">{r.model_name}</div>
                       </div>
                       <div className="text-xs text-ink-muted flex items-center gap-2">
                         {r.latency_ms != null && <span className="flex items-center gap-1"><Clock3 className="size-3.5" /> {r.latency_ms} ms</span>}
