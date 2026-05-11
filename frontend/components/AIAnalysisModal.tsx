@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 import { api, type AIAnalysisRequest, type AIAnalysisResponse, type AIAnalysisResultItem, type AIProviderSetting, type AIPromptTemplate, type Position, type StockDetail } from "@/lib/api";
-import { fmtPercent, fmtPrice } from "@/lib/utils";
+import { fmtMoney, fmtPercent, fmtPrice } from "@/lib/utils";
 import { AlertCircle, BadgeCheck, Brain, CheckCircle2, Clock3, Loader2, Sparkles, X } from "lucide-react";
 
 const DEFAULT_PROMPT_BY_SCOPE: Record<"stock" | "portfolio", string> = {

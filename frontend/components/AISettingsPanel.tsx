@@ -3,17 +3,17 @@
 import { useEffect, useMemo, useState } from "react";
 import useSWR, { mutate } from "swr";
 import { api, type AIProviderSetting, type AIPromptTemplate, type AIProviderUpsert } from "@/lib/api";
-import { Check, Eye, EyeOff, KeyRound, PencilLine, Power, Save, Sparkles } from "lucide-react";
+import { Eye, EyeOff, KeyRound, PencilLine, Power, Save, Sparkles } from "lucide-react";
 
 const PROVIDER_ORDER = ["openai", "gemini", "anthropic", "xai"] as const;
 
 export default function AISettingsPanel() {
-  const { data: providers, isLoading: providersLoading } = useSWR("ai:providers", api.listAIProviders);
-  const { data: prompts, isLoading: promptsLoading } = useSWR("ai:prompts", api.listAIPrompts);
+  const { data: providers, isLoading: providersLoading } = useSWR<Awaited<ReturnType<typeof api.listAIProviders>>>("ai:providers", api.listAIProviders);
+  const { data: prompts, isLoading: promptsLoading } = useSWR<Awaited<ReturnType<typeof api.listAIPrompts>>>("ai:prompts", api.listAIPrompts);
 
   const sortedProviders = useMemo(() => {
     if (!providers) return [];
-    const map = new Map(providers.map((p) => [p.provider_key, p]));
+    const map = new Map((providers || []).map((p) => [p.provider_key, p]));
     return PROVIDER_ORDER.map((k) => map.get(k)).filter(Boolean) as AIProviderSetting[];
   }, [providers]);
 
@@ -46,13 +46,13 @@ export default function AISettingsPanel() {
         {promptsLoading && <div className="text-sm text-ink-muted py-2">Loading prompts…</div>}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {(prompts || []).map((prompt) => (
-            <div key={prompt.key} className="rounded-xl bg-bg-subtle p-3 ring-1 ring-border">
+            <div key={prompt.template_key || prompt.key} className="rounded-xl bg-bg-subtle p-3 ring-1 ring-border">
               <div className="flex items-center justify-between gap-2">
-                <div className="font-medium text-sm">{prompt.label}</div>
-                <span className="badge bg-bg-elevated text-ink-muted text-[10px] uppercase">{prompt.scope}</span>
+                <div className="font-medium text-sm">{prompt.label || prompt.name || prompt.key || prompt.template_key}</div>
+                <span className="badge bg-bg-elevated text-ink-muted text-[10px] uppercase">{prompt.scope || "stock"}</span>
               </div>
               <p className="text-xs text-ink-muted mt-1">{prompt.description}</p>
-              <div className="text-[11px] text-ink-dim mt-2 font-mono">max {prompt.max_output_tokens} tokens</div>
+              <div className="text-[11px] text-ink-dim mt-2 font-mono">max {(prompt.max_output_tokens ?? prompt.token_budget ?? 0)} tokens</div>
             </div>
           ))}
         </div>
@@ -63,19 +63,19 @@ export default function AISettingsPanel() {
 
 function ProviderCard({ provider }: { provider: AIProviderSetting }) {
   const [enabled, setEnabled] = useState(provider.enabled);
-  const [modelName, setModelName] = useState(provider.model_name || "");
-  const [baseUrl, setBaseUrl] = useState(provider.base_url || "");
+  const [modelName, setModelName] = useState(provider.model_name ?? "");
+  const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [savedAt, setSavedAt] = useState<string | null>(provider.updated_at);
+  const [savedAt, setSavedAt] = useState<string | null>(provider.updated_at ?? null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setEnabled(provider.enabled);
-    setModelName(provider.model_name || "");
-    setBaseUrl(provider.base_url || "");
-    setSavedAt(provider.updated_at);
+    setModelName(provider.model_name ?? "");
+    setBaseUrl(provider.base_url ?? "");
+    setSavedAt(provider.updated_at ?? null);
   }, [provider.enabled, provider.model_name, provider.base_url, provider.updated_at]);
 
   async function save() {
@@ -91,7 +91,7 @@ function ProviderCard({ provider }: { provider: AIProviderSetting }) {
       const updated = await api.saveAIProvider(provider.provider_key, body);
       mutate("ai:providers");
       setApiKey("");
-      setSavedAt(updated.updated_at);
+      setSavedAt(updated.updated_at ?? null);
     } catch (e: any) {
       setError(e.message || "Failed to save");
     } finally {
@@ -104,7 +104,7 @@ function ProviderCard({ provider }: { provider: AIProviderSetting }) {
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">
-            <h3 className="font-semibold">{provider.provider_name}</h3>
+            <h3 className="font-semibold">{provider.display_name || provider.provider_name || provider.provider_key}</h3>
             {provider.enabled ? (
               <span className="badge bg-verdict-buy/15 text-verdict-buy text-[10px]">enabled</span>
             ) : (
@@ -112,7 +112,7 @@ function ProviderCard({ provider }: { provider: AIProviderSetting }) {
             )}
           </div>
           <div className="text-[11px] text-ink-dim mt-1">
-            {provider.api_key_present ? "API key saved" : "No API key saved yet"}
+            {Boolean(provider.api_key_set ?? provider.api_key_present) ? "API key saved" : "No API key saved yet"}
             {savedAt && <span> · updated {new Date(savedAt).toLocaleString()}</span>}
           </div>
         </div>
@@ -128,7 +128,7 @@ function ProviderCard({ provider }: { provider: AIProviderSetting }) {
       <div className="space-y-3 mt-4">
         <div>
           <label className="label">Model</label>
-          <input className="input mt-1" value={modelName} onChange={(e) => setModelName(e.target.value)} placeholder={provider.model_name || "model name"} />
+          <input className="input mt-1" value={modelName} onChange={(e: any) => setModelName(e.target.value)} placeholder={provider.model_name || "model name"} />
         </div>
         <div>
           <label className="label">API key</label>
@@ -138,8 +138,8 @@ function ProviderCard({ provider }: { provider: AIProviderSetting }) {
                 className="input pr-10"
                 type={showKey ? "text" : "password"}
                 value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder={provider.api_key_present ? "leave blank to keep current key" : "paste key here"}
+                onChange={(e: any) => setApiKey(e.target.value)}
+                placeholder={Boolean(provider.api_key_set ?? provider.api_key_present) ? "leave blank to keep current key" : "paste key here"}
               />
               <KeyRound className="absolute right-3 top-1/2 -translate-y-1/2 size-4 text-ink-dim" />
             </div>
@@ -150,7 +150,7 @@ function ProviderCard({ provider }: { provider: AIProviderSetting }) {
         </div>
         <div>
           <label className="label">Base URL (optional)</label>
-          <input className="input mt-1" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder={provider.base_url || "provider endpoint"} />
+          <input className="input mt-1" value={baseUrl} onChange={(e: any) => setBaseUrl(e.target.value)} placeholder={provider.base_url || "provider endpoint"} />
         </div>
         {error && <div className="text-xs text-verdict-avoid">{error}</div>}
       </div>
