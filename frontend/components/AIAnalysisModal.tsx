@@ -64,9 +64,14 @@ export default function AIAnalysisModal({
         prompt_key: promptKey,
         account_id: accountId ?? undefined,
       };
-      const response = scope === "stock"
-        ? await api.analyzeStockAI(stock?.exchange_code || "", stock?.ticker || "", body)
-        : await api.analyzePortfolio(body);
+      const response =
+		  scope === "stock"
+			? await api.analyzeStockAI(
+				stock?.exchange_code || "",
+				stock?.ticker || "",
+				providerKeys,
+			  )
+			: await api.analyzePortfolioAI(providerKeys);
       setResult(response);
     } catch (e: any) {
       setError(e.message || "Analysis failed");
