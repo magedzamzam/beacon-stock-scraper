@@ -205,6 +205,54 @@ export interface AuthResponse {
   user: User;
 }
 
+export interface AIProviderSetting {
+  id?: number;
+  provider_key: string;
+  provider_name?: string | null;
+  display_name?: string | null;
+  enabled: boolean;
+  api_key_set: boolean;
+  model_name?: string | null;
+  last_tested_at?: string | null;
+  last_test_status?: string | null;
+  last_test_message?: string | null;
+  [key: string]: any;
+}
+
+export interface AIPromptTemplate {
+  id?: number;
+  template_key: string;
+  name: string;
+  description?: string | null;
+  prompt_text: string;
+  enabled: boolean;
+  token_budget?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  [key: string]: any;
+}
+
+export interface AIAnalysisResponse {
+  provider: string;
+  model: string;
+  request_type: "stock" | "portfolio" | string;
+  ticker?: string | null;
+  exchange_code?: string | null;
+  portfolio_id?: number | null;
+  action?: string | null;
+  decision?: string | null;
+  summary: string;
+  thesis?: string[];
+  catalysts?: string[];
+  risks?: string[];
+  technical_view?: string | null;
+  financial_view?: string | null;
+  valuation_view?: string | null;
+  confidence?: number | null;
+  raw?: any;
+  [key: string]: any;
+}
+
 // ---------------- Endpoints ----------------
 export const api = {
   // auth
@@ -239,6 +287,30 @@ export const api = {
     request<NewsItem[]>(`/stocks/${exchange}/${ticker}/news?limit=${limit}`),
   refreshStock: (exchange: string, ticker: string) =>
     request<{ status: string }>(`/stocks/${exchange}/${ticker}/refresh`, { method: "POST" }),
+
+  // ai analysis
+  listAIProviders: () => request<AIProviderSetting[]>("/ai/providers"),
+  updateAIProvider: (provider_key: string, body: { enabled?: boolean; api_key?: string | null; model_name?: string | null }) =>
+    request<AIProviderSetting>(`/ai/providers/${encodeURIComponent(provider_key)}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  listAIPrompts: () => request<AIPromptTemplate[]>("/ai/prompts"),
+  updateAIPrompt: (template_key: string, body: { name?: string; description?: string | null; prompt_text?: string; enabled?: boolean; token_budget?: number | null }) =>
+    request<AIPromptTemplate>(`/ai/prompts/${encodeURIComponent(template_key)}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  analyzeStockAI: (exchange: string, ticker: string, provider_keys?: string[]) =>
+    request<AIAnalysisResponse>(`/ai/stocks/${exchange}/${ticker}/analyze`, {
+      method: "POST",
+      body: JSON.stringify({ provider_keys }),
+    }),
+  analyzePortfolioAI: (provider_keys?: string[]) =>
+    request<AIAnalysisResponse>("/ai/portfolio/analyze", {
+      method: "POST",
+      body: JSON.stringify({ provider_keys }),
+    }),
 
   // watchlists
   listWatchlists: () => request<Watchlist[]>("/watchlists"),
