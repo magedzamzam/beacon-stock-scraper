@@ -229,19 +229,47 @@ export interface AIPromptTemplate {
   token_budget?: number | null;
   created_at?: string | null;
   updated_at?: string | null;
+  // Backward-compatible aliases for older UI code.
+  key?: string;
+  label?: string;
+  max_output_tokens?: number | null;
+  [key: string]: any;
+}
+
+export interface AIAnalysisRequest {
+  provider_keys: string[];
+  prompt_key: string;
+  account_id?: number | null;
+}
+
+export interface AIAnalysisResultItem {
+  provider_key: string;
+  provider_name?: string | null;
+  model_name?: string | null;
+  ok: boolean;
+  error?: string | null;
+  latency_ms?: number | null;
+  analysis?: Record<string, any> | null;
+  title?: string | null;
+  summary?: string | null;
+  recommendation?: string | null;
+  confidence?: number | null;
+  raw_text?: string | null;
   [key: string]: any;
 }
 
 export interface AIAnalysisResponse {
-  provider: string;
-  model: string;
+  results: AIAnalysisResultItem[];
+  provider?: string | null;
+  model?: string | null;
   request_type: "stock" | "portfolio" | string;
   ticker?: string | null;
   exchange_code?: string | null;
   portfolio_id?: number | null;
+  account_id?: number | null;
   action?: string | null;
   decision?: string | null;
-  summary: string;
+  summary?: string | null;
   thesis?: string[];
   catalysts?: string[];
   risks?: string[];
@@ -301,15 +329,15 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
-  analyzeStockAI: (exchange: string, ticker: string, provider_keys?: string[]) =>
+  analyzeStockAI: (exchange: string, ticker: string, body: AIAnalysisRequest) =>
     request<AIAnalysisResponse>(`/ai/stocks/${exchange}/${ticker}/analyze`, {
       method: "POST",
-      body: JSON.stringify({ provider_keys }),
+      body: JSON.stringify(body),
     }),
-  analyzePortfolioAI: (provider_keys?: string[]) =>
+  analyzePortfolioAI: (body: AIAnalysisRequest) =>
     request<AIAnalysisResponse>("/ai/portfolio/analyze", {
       method: "POST",
-      body: JSON.stringify({ provider_keys }),
+      body: JSON.stringify(body),
     }),
 
   // watchlists
