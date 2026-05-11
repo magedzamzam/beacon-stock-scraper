@@ -65,8 +65,8 @@ export default function AIAnalysisModal({
         account_id: accountId ?? undefined,
       };
       const response = scope === "stock"
-        ? await api.analyzeStockAI(stock?.exchange_code || "", stock?.ticker || "", body)
-        : await api.analyzePortfolioAI(body);
+        ? await api.analyzeStockAI(stock?.exchange_code || "", stock?.ticker || "", body.provider_keys)
+        : await api.analyzePortfolioAI(body.provider_keys);
       setResult(response);
     } catch (e: any) {
       setError(e.message || "Analysis failed");
