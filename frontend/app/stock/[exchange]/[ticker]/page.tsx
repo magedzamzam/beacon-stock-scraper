@@ -10,8 +10,9 @@ import { api, type BrokerQuoteRow as BrokerQuoteData } from "@/lib/api";
 import { useAuth } from "@/lib/auth-store";
 import { fmtNumber, fmtPercent, fmtMoney, fmtPrice, fmtDate, changeColor, sentimentBadgeClass } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
+import AIAnalysisModal from "@/components/AIAnalysisModal";
 import {
-  RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2, ShoppingCart, Link2,
+  RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2, ShoppingCart, Link2, Sparkles,
   Radio, Wifi, WifiOff, TrendingUp, TrendingDown,
 } from "lucide-react";
 
@@ -23,6 +24,7 @@ export default function StockDetailPage() {
   const [overriding, setOverriding] = useState(false);
   const [ordering, setOrdering] = useState(false);
   const [mapping, setMapping] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const { user } = useAuth();
 
   const { data: stock } = useSWR(
@@ -139,6 +141,9 @@ export default function StockDetailPage() {
               {!watchlists?.length && <div className="px-3 py-2 text-xs text-ink-muted">No watchlists</div>}
             </div>
           </div>
+          <button className="btn-ghost" onClick={() => setAnalyzing(true)}>
+            <Sparkles className="size-4" /> Analyze stock
+          </button>
           <button className="btn-primary" onClick={() => setOrdering(true)}>
             <ShoppingCart className="size-4" /> Place order
           </button>
@@ -342,6 +347,12 @@ export default function StockDetailPage() {
           onClose={() => setMapping(false)}
         />
       )}
+      <AIAnalysisModal
+        open={analyzing}
+        onClose={() => setAnalyzing(false)}
+        scope="stock"
+        stock={stock as any}
+      />
     </div>
   );
 }

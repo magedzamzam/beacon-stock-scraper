@@ -1,0 +1,745 @@
+"""AI provider settings + on-demand stock/portfolio analysis."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from datetime import datetime
+from typing import Any, Optional
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
+
+from shared.db import (
+    AIProviderSetting, AIPromptTemplate, Exchange, PortfolioPosition, Stock,
+    StockAnalystConsensus, StockFinRatios, StockFinStatement, StockMktTechnicals,
+    StockNews, StockQuote, User,
+)
+from .auth import get_current_user, get_db
+from .routers_portfolio import _build_position_out
+from .routers_stocks import _row_to_summary
+from .routers_watchlists import _stock_summary
+from .schemas import (
+    AIAnalysisResponse, AIAnalysisResult, AIAnalysisRequest, AIProviderSettingOut,
+    AIProviderSettingUpsert, AIPromptTemplateOut,
+)
+
+router = APIRouter(prefix="/ai", tags=["ai"])
+
+
+PROVIDERS: dict[str, dict[str, Any]] = {
+    "openai": {
+        "label": "ChatGPT",
+        "default_model": "gpt-4.1-mini",
+        "base_url": "https://api.openai.com/v1",
+        "chat_path": "/chat/completions",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "system_header": None,
+    },
+    "gemini": {
+        "label": "Gemini",
+        "default_model": "gemini-2.5-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "chat_path": "/models/{model}:generateContent",
+        "auth_header": "x-goog-api-key",
+        "auth_prefix": None,
+        "system_header": None,
+    },
+    "anthropic": {
+        "label": "Claude",
+        "default_model": "claude-sonnet-4-latest",
+        "base_url": "https://api.anthropic.com/v1",
+        "chat_path": "/messages",
+        "auth_header": "x-api-key",
+        "auth_prefix": None,
+        "system_header": "anthropic-version",
+        "system_header_value": "2023-06-01",
+    },
+    "xai": {
+        "label": "Grok",
+        "default_model": "grok-4-fast",
+        "base_url": "https://api.x.ai/v1",
+        "chat_path": "/chat/completions",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "system_header": None,
+    },
+}
+
+PROMPTS: dict[str, dict[str, Any]] = {
+    "stock_brief": {
+        "key": "stock_brief",
+        "label": "Stock analysis",
+        "scope": "stock",
+        "description": "Compact single-stock analysis with a short verdict and reasons.",
+        "system_prompt": (
+            "Return only valid JSON. Keep every field short. Use the fewest possible tokens. "
+            "No markdown, no preamble, no commentary."
+        ),
+        "max_output_tokens": 240,
+    },
+    "portfolio_brief": {
+        "key": "portfolio_brief",
+        "label": "Portfolio analysis",
+        "scope": "portfolio",
+        "description": (
+            "Compact portfolio review with per-position actions, focused on HOLD / BUY_MORE / SELL."
+        ),
+        "system_prompt": (
+            "Return only valid JSON. Keep every field short. Use the fewest possible tokens. "
+            "No markdown, no preamble, no commentary."
+        ),
+        "max_output_tokens": 360,
+    },
+}
+
+
+class AIProviderSettingUpsertLocal(BaseModel):
+    enabled: bool = False
+    api_key: Optional[str] = None
+    model_name: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+class AIAnalysisPositionOut(BaseModel):
+    position_id: int
+    ticker: str
+    exchange_code: str
+    company_name: str
+    quantity: float
+    avg_entry_price: float
+    current_price: Optional[float] = None
+    unrealized_pl_pct: Optional[float] = None
+    position_verdict: Optional[str] = None
+    position_confidence: Optional[float] = None
+
+
+class AIAnalysisContextOut(BaseModel):
+    scope: str
+    prompt_key: str
+    stock: Optional[dict[str, Any]] = None
+    portfolio: Optional[dict[str, Any]] = None
+    positions: list[AIAnalysisPositionOut] = []
+
+
+class AIAnalysisRequestBody(AIAnalysisRequest):
+    pass
+
+
+class AIAnalysisResponseOut(AIAnalysisResponse):
+    pass
+
+
+class AIProviderSettingSeed(BaseModel):
+    provider_key: str
+    provider_name: str
+    enabled: bool
+    api_key_present: bool
+    model_name: Optional[str] = None
+    base_url: Optional[str] = None
+    last_tested_at: Optional[datetime] = None
+    last_test_status: Optional[str] = None
+    last_test_error: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+
+def _provider_defaults(provider_key: str) -> dict[str, Any]:
+    meta = PROVIDERS[provider_key]
+    return {
+        "provider_key": provider_key,
+        "provider_name": meta["label"],
+        "enabled": False,
+        "api_key": None,
+        "model_name": meta["default_model"],
+        "base_url": meta["base_url"],
+        "last_tested_at": None,
+        "last_test_status": None,
+        "last_test_error": None,
+        "updated_at": None,
+    }
+
+
+def _provider_row_out(row: AIProviderSetting | None, provider_key: str) -> AIProviderSettingSeed:
+    meta = PROVIDERS[provider_key]
+    if row is None:
+        defaults = _provider_defaults(provider_key)
+        return AIProviderSettingSeed(
+            provider_key=provider_key,
+            provider_name=meta["label"],
+            enabled=False,
+            api_key_present=False,
+            model_name=defaults["model_name"],
+            base_url=defaults["base_url"],
+            last_tested_at=None,
+            last_test_status=None,
+            last_test_error=None,
+            updated_at=None,
+        )
+    return AIProviderSettingSeed(
+        provider_key=provider_key,
+        provider_name=meta["label"],
+        enabled=bool(row.enabled),
+        api_key_present=bool(row.api_key),
+        model_name=row.model_name or meta["default_model"],
+        base_url=row.base_url or meta["base_url"],
+        last_tested_at=row.last_tested_at,
+        last_test_status=row.last_test_status,
+        last_test_error=row.last_test_error,
+        updated_at=row.updated_at,
+    )
+
+
+def _upsert_provider(db: Session, user: User, provider_key: str, body: AIProviderSettingUpsertLocal) -> AIProviderSetting:
+    meta = PROVIDERS[provider_key]
+    existing = db.execute(
+        select(AIProviderSetting).where(
+            AIProviderSetting.user_id == user.id,
+            AIProviderSetting.provider_key == provider_key,
+        )
+    ).scalar_one_or_none()
+    api_key = body.api_key
+    if api_key in (None, "") and existing is not None:
+        api_key = existing.api_key
+    model_name = body.model_name or (existing.model_name if existing and existing.model_name else meta["default_model"])
+    base_url = body.base_url or (existing.base_url if existing and existing.base_url else meta["base_url"])
+    stmt = pg_insert(AIProviderSetting).values(
+        user_id=user.id,
+        provider_key=provider_key,
+        provider_name=meta["label"],
+        enabled=body.enabled,
+        api_key=api_key,
+        model_name=model_name,
+        base_url=base_url,
+        updated_at=datetime.utcnow(),
+        updated_by=user.id,
+    ).on_conflict_do_update(
+        index_elements=["user_id", "provider_key"],
+        set_={
+            "provider_name": meta["label"],
+            "enabled": body.enabled,
+            "api_key": api_key,
+            "model_name": model_name,
+            "base_url": base_url,
+            "updated_at": datetime.utcnow(),
+            "updated_by": user.id,
+        },
+    )
+    db.execute(stmt)
+    db.commit()
+    row = db.execute(
+        select(AIProviderSetting).where(
+            AIProviderSetting.user_id == user.id,
+            AIProviderSetting.provider_key == provider_key,
+        )
+    ).scalar_one()
+    return row
+
+
+def _sanitize_json_text(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _extract_text(payload: dict[str, Any], provider_key: str) -> str:
+    if provider_key in {"openai", "xai"}:
+        choices = payload.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or {}
+            return msg.get("content") or ""
+        return ""
+    if provider_key == "anthropic":
+        chunks = payload.get("content") or []
+        texts = []
+        for chunk in chunks:
+            if isinstance(chunk, dict) and chunk.get("type") == "text":
+                texts.append(chunk.get("text") or "")
+        return "".join(texts)
+    if provider_key == "gemini":
+        candidates = payload.get("candidates") or []
+        if candidates:
+            content = candidates[0].get("content") or {}
+            parts = content.get("parts") or []
+            texts = [p.get("text") for p in parts if isinstance(p, dict) and p.get("text")]
+            return "".join(texts)
+    return payload.get("text") or payload.get("output_text") or ""
+
+
+async def _call_provider(provider_key: str, cfg: AIProviderSetting, prompt: str, max_tokens: int) -> dict[str, Any]:
+    meta = PROVIDERS[provider_key]
+    api_key = cfg.api_key or ""
+    model = cfg.model_name or meta["default_model"]
+    base_url = (cfg.base_url or meta["base_url"]).rstrip("/")
+    timeout = httpx.Timeout(60.0, connect=15.0)
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "beacon-ai/1.0",
+    }
+    if meta["auth_header"] == "Authorization":
+        headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        headers[meta["auth_header"]] = api_key
+    if meta.get("system_header"):
+        headers[meta["system_header"]] = meta.get("system_header_value", "")
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if provider_key in {"openai", "xai"}:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "Return only JSON. Keep it short."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+                "max_tokens": max_tokens,
+            }
+            url = f"{base_url}{meta['chat_path']}"
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+        if provider_key == "anthropic":
+            payload = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": "Return only JSON. Keep it short.",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+            }
+            url = f"{base_url}{meta['chat_path']}"
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+        if provider_key == "gemini":
+            payload = {
+                "systemInstruction": {
+                    "parts": [{"text": "Return only JSON. Keep it short."}],
+                },
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "maxOutputTokens": max_tokens,
+                },
+            }
+            url = f"{base_url}{meta['chat_path'].format(model=model.lstrip('/'))}"
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    raise HTTPException(500, f"Unsupported provider '{provider_key}'")
+
+
+def _build_stock_context(db: Session, exchange: str, ticker: str) -> dict[str, Any]:
+    row = db.execute(
+        select(
+            Stock.id, Stock.ticker, Stock.company_name, Stock.sector, Stock.industry,
+            Stock.country, Stock.currency, Exchange.code.label("exchange_code"),
+            StockQuote.current_price, StockQuote.change_pct, StockQuote.market_cap,
+            StockQuote.pe_ratio, StockQuote.dividend_yield_pct, StockQuote.rsi_14,
+            StockQuote.composite_score, StockQuote.verdict, StockQuote.last_updated,
+            StockQuote.prev_close, StockQuote.change_abs, StockQuote.price_source,
+            StockQuote.price_fetched_at, StockQuote.week_52_high, StockQuote.week_52_low,
+            StockQuote.analyst_target, StockQuote.analyst_upside_pct,
+        )
+        .join(Exchange, Stock.exchange_id == Exchange.id)
+        .outerjoin(StockQuote, StockQuote.stock_id == Stock.id)
+        .where(
+            Exchange.code.ilike(exchange),
+            Stock.ticker.ilike(ticker),
+        )
+    ).first()
+    if not row:
+        raise HTTPException(404, "Stock not found")
+
+    analyst = db.execute(
+        select(StockAnalystConsensus)
+        .where(StockAnalystConsensus.stock_id == row.id)
+        .order_by(StockAnalystConsensus.consensus_date.desc())
+        .limit(1)
+    ).scalars().first()
+    fin_ratios = db.execute(
+        select(StockFinRatios)
+        .where(StockFinRatios.stock_id == row.id)
+        .order_by(StockFinRatios.period_end.desc(), StockFinRatios.id.desc())
+        .limit(1)
+    ).scalars().first()
+    fin_stmt = db.execute(
+        select(StockFinStatement)
+        .where(StockFinStatement.stock_id == row.id, StockFinStatement.is_estimate.is_(False))
+        .order_by(StockFinStatement.period_end.desc(), StockFinStatement.id.desc())
+        .limit(1)
+    ).scalars().first()
+    tech = db.execute(
+        select(StockMktTechnicals)
+        .where(StockMktTechnicals.stock_id == row.id)
+        .order_by(StockMktTechnicals.trading_date.desc())
+        .limit(1)
+    ).scalars().first()
+    news = db.execute(
+        select(StockNews)
+        .where(StockNews.stock_id == row.id)
+        .order_by(StockNews.news_date.desc().nullslast(), StockNews.id.desc())
+        .limit(5)
+    ).scalars().all()
+
+    summary = _row_to_summary(row)
+    stock = summary.model_dump()
+    stock.update({
+        "isin": None,
+        "founded_year": None,
+        "employees": None,
+        "website": None,
+        "beta": float(tech.beta) if tech and tech.beta is not None else None,
+        "forward_pe": float(fin_ratios.pe_forward) if fin_ratios and fin_ratios.pe_forward is not None else None,
+        "week_52_high": float(row.week_52_high) if row.week_52_high is not None else None,
+        "week_52_low": float(row.week_52_low) if row.week_52_low is not None else None,
+        "enterprise_value": float(fin_ratios.snapshot_market_cap) if fin_ratios and fin_ratios.snapshot_market_cap is not None else None,
+        "revenue_ttm": float(fin_stmt.revenue) if fin_stmt and fin_stmt.revenue is not None else None,
+        "sma_50": float(tech.sma_50) if tech and tech.sma_50 is not None else None,
+        "sma_200": float(tech.sma_200) if tech and tech.sma_200 is not None else None,
+        "analyst_target": float(row.analyst_target) if row.analyst_target is not None else None,
+        "analyst_upside_pct": float(row.analyst_upside_pct) if row.analyst_upside_pct is not None else None,
+        "analyst_count": analyst.analyst_count if analyst else None,
+        "analyst_rating": analyst.rating if analyst else None,
+        "current_price": float(row.current_price) if row.current_price is not None else None,
+        "prev_close": float(row.prev_close) if row.prev_close is not None else None,
+        "change_abs": float(row.change_abs) if row.change_abs is not None else None,
+        "change_pct": float(row.change_pct) if row.change_pct is not None else None,
+        "price_source": row.price_source,
+        "price_fetched_at": row.price_fetched_at,
+        "news": [
+            {
+                "headline": n.headline,
+                "summary": n.summary,
+                "sentiment_label": n.sentiment_label,
+                "sentiment_score": float(n.sentiment_score) if n.sentiment_score is not None else None,
+            }
+            for n in news
+        ],
+    })
+    return stock
+
+
+def _build_portfolio_context(db: Session, user: User, account_id: Optional[int]) -> dict[str, Any]:
+    query = select(PortfolioPosition).where(
+        PortfolioPosition.user_id == user.id,
+        PortfolioPosition.is_open.is_(True),
+    )
+    if account_id is not None:
+        query = query.where(PortfolioPosition.account_id == account_id)
+    positions = db.execute(query.order_by(PortfolioPosition.created_at)).scalars().all()
+
+    items: list[dict[str, Any]] = []
+    total_cost = 0.0
+    total_value = 0.0
+    for pos in positions:
+        try:
+            out = _build_position_out(db, pos)
+        except HTTPException:
+            continue
+        if out is None:
+            continue
+        total_cost += out.cost_basis
+        if out.market_value is not None:
+            total_value += out.market_value
+        items.append({
+            "position_id": out.id,
+            "ticker": out.stock.ticker,
+            "exchange_code": out.stock.exchange_code,
+            "company_name": out.stock.company_name,
+            "quantity": out.quantity,
+            "avg_entry_price": out.avg_entry_price,
+            "current_price": out.stock.current_price,
+            "unrealized_pl_pct": out.unrealized_pl_pct,
+            "position_verdict": out.position_verdict,
+            "position_confidence": out.position_confidence,
+        })
+
+    total_pl = total_value - total_cost
+    total_pl_pct = (total_pl / total_cost * 100.0) if total_cost else 0.0
+    return {
+        "account_id": account_id,
+        "positions_count": len(items),
+        "total_cost": total_cost,
+        "total_value": total_value,
+        "total_pl_pct": total_pl_pct,
+        "positions": items,
+    }
+
+
+def _prompt_payload(scope: str, context: dict[str, Any]) -> str:
+    if scope == "stock":
+        stock = context["stock"]
+        news = stock.get("news") or []
+        return json.dumps({
+            "task": "Analyze one stock and return a compact JSON verdict.",
+            "output_schema": {
+                "ticker": "string",
+                "decision": "BUY|HOLD|SELL|WATCH",
+                "confidence": "0-100 integer",
+                "summary": "short string",
+                "thesis": ["brief bullet strings, max 3"],
+                "risks": ["brief bullet strings, max 3"],
+                "action": "short string",
+            },
+            "context": {
+                "ticker": stock.get("ticker"),
+                "exchange": stock.get("exchange_code"),
+                "company": stock.get("company_name"),
+                "sector": stock.get("sector"),
+                "industry": stock.get("industry"),
+                "currency": stock.get("currency"),
+                "current_price": stock.get("current_price"),
+                "change_pct": stock.get("change_pct"),
+                "composite_score": stock.get("composite_score"),
+                "verdict": stock.get("verdict"),
+                "pe_ratio": stock.get("pe_ratio"),
+                "market_cap": stock.get("market_cap"),
+                "rsi_14": stock.get("rsi_14"),
+                "sma_50": stock.get("sma_50"),
+                "sma_200": stock.get("sma_200"),
+                "analyst_target": stock.get("analyst_target"),
+                "analyst_upside_pct": stock.get("analyst_upside_pct"),
+                "analyst_count": stock.get("analyst_count"),
+                "analyst_rating": stock.get("analyst_rating"),
+                "recent_news": news[:3],
+            },
+            "instructions": [
+                "Use the fewest possible tokens.",
+                "Do not repeat the context verbatim.",
+                "No markdown.",
+                "Return JSON only.",
+            ],
+        }, separators=(",", ":"))
+
+    portfolio = context["portfolio"]
+    return json.dumps({
+        "task": "Analyze each open position and the overall portfolio in compact JSON.",
+        "output_schema": {
+            "portfolio_view": "HOLD|BUY_MORE|SELL|TRIM",
+            "confidence": "0-100 integer",
+            "summary": "short string",
+            "risks": ["brief bullet strings, max 3"],
+            "actions": ["brief bullet strings, max 3"],
+            "positions": [
+                {
+                    "ticker": "string",
+                    "decision": "HOLD|BUY_MORE|SELL|TRIM|STOP_LOSS",
+                    "confidence": "0-100 integer",
+                    "reason": "short string",
+                }
+            ],
+        },
+        "context": {
+            "account_id": portfolio.get("account_id"),
+            "positions_count": portfolio.get("positions_count"),
+            "total_cost": portfolio.get("total_cost"),
+            "total_value": portfolio.get("total_value"),
+            "total_pl_pct": portfolio.get("total_pl_pct"),
+            "positions": portfolio.get("positions"),
+        },
+        "instructions": [
+            "Use the fewest possible tokens.",
+            "Do not repeat the context verbatim.",
+            "No markdown.",
+            "Return JSON only.",
+        ],
+    }, separators=(",", ":"))
+
+
+def _parse_response_json(provider_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+    text = _extract_text(payload, provider_key)
+    if not text:
+        raise ValueError("Empty model response")
+    text = _sanitize_json_text(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Model returned non-JSON text: {text[:200]}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Model JSON response must be an object")
+    return data
+
+
+@router.get("/providers", response_model=list[AIProviderSettingSeed])
+def list_providers(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.execute(
+        select(AIProviderSetting).where(AIProviderSetting.user_id == user.id)
+    ).scalars().all()
+    by_key = {r.provider_key: r for r in rows}
+    return [_provider_row_out(by_key.get(key), key) for key in PROVIDERS]
+
+
+@router.put("/providers/{provider_key}", response_model=AIProviderSettingSeed)
+def save_provider(
+    provider_key: str,
+    body: AIProviderSettingUpsertLocal,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if provider_key not in PROVIDERS:
+        raise HTTPException(404, f"Unknown AI provider '{provider_key}'")
+    row = _upsert_provider(db, user, provider_key, body)
+    return _provider_row_out(row, provider_key)
+
+
+@router.get("/prompts", response_model=list[AIPromptTemplateOut])
+def list_prompts(_: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.execute(select(AIPromptTemplate).order_by(AIPromptTemplate.scope, AIPromptTemplate.key)).scalars().all()
+    if not rows:
+        return [AIPromptTemplateOut(**v) for v in PROMPTS.values()]
+    return [AIPromptTemplateOut.model_validate(row) for row in rows]
+
+
+async def _analyze_many(
+    user: User,
+    db: Session,
+    provider_keys: list[str],
+    scope: str,
+    prompt_key: str,
+    context: dict[str, Any],
+) -> list[AIAnalysisResult]:
+    prompt = _prompt_payload(scope, context)
+    prompt_meta = PROMPTS.get(prompt_key) or PROMPTS["stock_brief"]
+    max_tokens = int(prompt_meta["max_output_tokens"])
+
+    rows = db.execute(
+        select(AIProviderSetting).where(
+            AIProviderSetting.user_id == user.id,
+            AIProviderSetting.provider_key.in_(provider_keys),
+        )
+    ).scalars().all()
+    cfg_by_key = {r.provider_key: r for r in rows}
+
+    results: list[AIAnalysisResult] = []
+    for key in provider_keys:
+        meta = PROVIDERS[key]
+        cfg = cfg_by_key.get(key)
+        if cfg is None:
+            results.append(AIAnalysisResult(
+                provider_key=key,
+                provider_name=meta["label"],
+                model_name=meta["default_model"],
+                ok=False,
+                error="Provider is not configured",
+                latency_ms=None,
+                analysis=None,
+            ))
+            continue
+        if not cfg.enabled:
+            results.append(AIAnalysisResult(
+                provider_key=key,
+                provider_name=meta["label"],
+                model_name=cfg.model_name or meta["default_model"],
+                ok=False,
+                error="Provider is disabled",
+                latency_ms=None,
+                analysis=None,
+            ))
+            continue
+        if not cfg.api_key:
+            results.append(AIAnalysisResult(
+                provider_key=key,
+                provider_name=meta["label"],
+                model_name=cfg.model_name or meta["default_model"],
+                ok=False,
+                error="Missing API key",
+                latency_ms=None,
+                analysis=None,
+            ))
+            continue
+
+        started = time.perf_counter()
+        try:
+            raw = await _call_provider(key, cfg, prompt, max_tokens)
+            data = _parse_response_json(key, raw)
+            results.append(AIAnalysisResult(
+                provider_key=key,
+                provider_name=meta["label"],
+                model_name=cfg.model_name or meta["default_model"],
+                ok=True,
+                error=None,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                analysis=data,
+            ))
+        except Exception as exc:
+            results.append(AIAnalysisResult(
+                provider_key=key,
+                provider_name=meta["label"],
+                model_name=cfg.model_name or meta["default_model"],
+                ok=False,
+                error=str(exc),
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                analysis=None,
+            ))
+    return results
+
+
+@router.post("/analyze/stock/{exchange}/{ticker}", response_model=AIAnalysisResponseOut)
+async def analyze_stock(
+    exchange: str,
+    ticker: str,
+    body: AIAnalysisRequestBody,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    context = {"stock": _build_stock_context(db, exchange, ticker)}
+    selected = [k for k in (body.provider_keys or []) if k in PROVIDERS]
+    if not selected:
+        configured = db.execute(
+            select(AIProviderSetting.provider_key).where(
+                AIProviderSetting.user_id == user.id,
+                AIProviderSetting.enabled.is_(True),
+                AIProviderSetting.api_key.is_not(None),
+                AIProviderSetting.api_key != "",
+            )
+        ).scalars().all()
+        selected = [k for k in configured if k in PROVIDERS]
+    if not selected:
+        raise HTTPException(400, "No enabled AI providers found. Configure them in Profile first.")
+
+    results = await _analyze_many(user, db, selected, "stock", body.prompt_key, context)
+    return AIAnalysisResponseOut(scope="stock", prompt_key=body.prompt_key, context=context, results=results)
+
+
+@router.post("/analyze/portfolio", response_model=AIAnalysisResponseOut)
+async def analyze_portfolio(
+    body: AIAnalysisRequestBody,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    context = {"portfolio": _build_portfolio_context(db, user, body.account_id)}
+    selected = [k for k in (body.provider_keys or []) if k in PROVIDERS]
+    if not selected:
+        configured = db.execute(
+            select(AIProviderSetting.provider_key).where(
+                AIProviderSetting.user_id == user.id,
+                AIProviderSetting.enabled.is_(True),
+                AIProviderSetting.api_key.is_not(None),
+                AIProviderSetting.api_key != "",
+            )
+        ).scalars().all()
+        selected = [k for k in configured if k in PROVIDERS]
+    if not selected:
+        raise HTTPException(400, "No enabled AI providers found. Configure them in Profile first.")
+
+    results = await _analyze_many(user, db, selected, "portfolio", body.prompt_key, context)
+    return AIAnalysisResponseOut(scope="portfolio", prompt_key=body.prompt_key, context=context, results=results)
