@@ -5,14 +5,12 @@ import useSWR, { mutate } from "swr";
 import { api, type Portfolio } from "@/lib/api";
 import { fmtMoney, fmtNumber, fmtPercent, fmtPrice, changeColor, fmtDate } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
-import AIAnalysisModal from "@/components/AIAnalysisModal";
-import { Plus, Trash2, Briefcase, TrendingUp, Wallet, RefreshCw, X, Sparkles } from "lucide-react";
+import { Plus, Trash2, Briefcase, TrendingUp, Wallet, RefreshCw, X } from "lucide-react";
 
 export default function PortfolioPage() {
   const { data: portfolio, isLoading } = useSWR("portfolio", api.portfolio);
   const { data: accounts } = useSWR("accounts", () => api.listAccounts());
   const [adding, setAdding] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null);
 
   async function close(id: number) {
@@ -32,14 +30,9 @@ export default function PortfolioPage() {
               : "Single-account view: live broker positions or manual records."}
           </p>
         </div>
-        <div className="flex gap-2">
-          <button onClick={() => setAnalyzing(true)} className="btn-ghost">
-            <Sparkles className="size-4" /> Analyze
-          </button>
-          <button onClick={() => setAdding(true)} className="btn-primary">
-            <Plus className="size-4" /> Add position
-          </button>
-        </div>
+        <button onClick={() => setAdding(true)} className="btn-primary">
+          <Plus className="size-4" /> Add position
+        </button>
       </header>
 
       <div className="flex flex-wrap gap-2">
@@ -83,12 +76,6 @@ export default function PortfolioPage() {
           defaultAccountId={selectedAccount}
         />
       )}
-      <AIAnalysisModal
-        open={analyzing}
-        onClose={() => setAnalyzing(false)}
-        scope="portfolio"
-        accountId={selectedAccount}
-      />
     </div>
   );
 }

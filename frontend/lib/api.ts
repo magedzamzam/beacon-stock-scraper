@@ -205,53 +205,6 @@ export interface AuthResponse {
   user: User;
 }
 
-export interface AIProviderSetting {
-  provider_key: string;
-  provider_name: string;
-  enabled: boolean;
-  api_key_present: boolean;
-  model_name: string | null;
-  base_url: string | null;
-  last_tested_at: string | null;
-  last_test_status: string | null;
-  last_test_error: string | null;
-  updated_at: string | null;
-}
-
-export interface AIPromptTemplate {
-  key: string;
-  label: string;
-  scope: "stock" | "portfolio";
-  description: string | null;
-  system_prompt: string;
-  max_output_tokens: number;
-  updated_at: string | null;
-}
-
-export interface AIAnalysisResult {
-  provider_key: string;
-  provider_name: string;
-  model_name: string;
-  ok: boolean;
-  error: string | null;
-  latency_ms: number | null;
-  analysis: Record<string, any> | null;
-}
-
-export interface AIAnalysisResponse {
-  scope: "stock" | "portfolio";
-  prompt_key: string;
-  context: Record<string, any>;
-  results: AIAnalysisResult[];
-}
-
-export interface AIProviderUpsert {
-  enabled: boolean;
-  api_key?: string | null;
-  model_name?: string | null;
-  base_url?: string | null;
-}
-
 // ---------------- Endpoints ----------------
 export const api = {
   // auth
@@ -286,15 +239,6 @@ export const api = {
     request<NewsItem[]>(`/stocks/${exchange}/${ticker}/news?limit=${limit}`),
   refreshStock: (exchange: string, ticker: string) =>
     request<{ status: string }>(`/stocks/${exchange}/${ticker}/refresh`, { method: "POST" }),
-
-  analyzeStock: (exchange: string, ticker: string, body: { provider_keys?: string[]; prompt_key?: string; account_id?: number | null }) =>
-    request<AIAnalysisResponse>(`/ai/analyze/stock/${exchange}/${ticker}`, { method: "POST", body: JSON.stringify(body) }),
-  analyzePortfolio: (body: { provider_keys?: string[]; prompt_key?: string; account_id?: number | null }) =>
-    request<AIAnalysisResponse>(`/ai/analyze/portfolio`, { method: "POST", body: JSON.stringify(body) }),
-  listAIProviders: () => request<AIProviderSetting[]>(`/ai/providers`),
-  saveAIProvider: (provider_key: string, body: AIProviderUpsert) =>
-    request<AIProviderSetting>(`/ai/providers/${encodeURIComponent(provider_key)}`, { method: "PUT", body: JSON.stringify(body) }),
-  listAIPrompts: () => request<AIPromptTemplate[]>(`/ai/prompts`),
 
   // watchlists
   listWatchlists: () => request<Watchlist[]>("/watchlists"),

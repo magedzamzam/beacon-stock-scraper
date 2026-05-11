@@ -312,35 +312,6 @@ class AppSetting(Base):
     updated_by: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"))
 
 
-class AIProviderSetting(Base):
-    __tablename__ = "ai_provider_settings"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    provider_key: Mapped[str] = mapped_column(String(32), nullable=False)
-    provider_name: Mapped[str] = mapped_column(String(64), nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    api_key: Mapped[Optional[str]] = mapped_column(Text)
-    model_name: Mapped[Optional[str]] = mapped_column(String(120))
-    base_url: Mapped[Optional[str]] = mapped_column(Text)
-    last_tested_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    last_test_status: Mapped[Optional[str]] = mapped_column(String(16))
-    last_test_error: Mapped[Optional[str]] = mapped_column(Text)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_by: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"))
-    __table_args__ = (UniqueConstraint("user_id", "provider_key", name="ai_provider_settings_user_id_provider_key_key"),)
-
-
-class AIPromptTemplate(Base):
-    __tablename__ = "ai_prompt_templates"
-    key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    scope: Mapped[str] = mapped_column(String(32), nullable=False)
-    label: Mapped[str] = mapped_column(String(120), nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text)
-    system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
-    max_output_tokens: Mapped[int] = mapped_column(Integer, default=256)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
 class JobRun(Base):
     """Audit log of scheduled job executions, scheduled or manual."""
     __tablename__ = "job_runs"

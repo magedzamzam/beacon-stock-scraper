@@ -5,7 +5,6 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-store";
 import { fmtDate } from "@/lib/utils";
 import { Plus, Trash2, RefreshCw, Wifi, WifiOff, ShieldCheck } from "lucide-react";
-import AISettingsPanel from "@/components/AISettingsPanel";
 
 
 export default function ProfilePage() {
@@ -45,8 +44,6 @@ export default function ProfilePage() {
           {accounts?.map(acct => <AccountCard key={acct.id} acct={acct} />)}
         </div>
       </section>
-
-      <AISettingsPanel />
 
       {showAdd && (
         <AddAccountModal

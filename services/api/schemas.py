@@ -7,7 +7,7 @@ sync.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Optional, Literal, Any
+from typing import Optional, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -32,61 +32,6 @@ class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
-
-
-# ---------- AI ----------
-class AIProviderSettingUpsert(BaseModel):
-    enabled: bool = False
-    api_key: Optional[str] = None
-    model_name: Optional[str] = None
-    base_url: Optional[str] = None
-
-
-class AIProviderSettingOut(BaseModel):
-    provider_key: str
-    provider_name: str
-    enabled: bool
-    api_key_present: bool
-    model_name: Optional[str] = None
-    base_url: Optional[str] = None
-    last_tested_at: Optional[datetime] = None
-    last_test_status: Optional[str] = None
-    last_test_error: Optional[str] = None
-    updated_at: Optional[datetime] = None
-
-
-class AIPromptTemplateOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    key: str
-    label: str
-    scope: str
-    description: Optional[str] = None
-    system_prompt: str
-    max_output_tokens: int = 256
-    updated_at: Optional[datetime] = None
-
-
-class AIAnalysisResult(BaseModel):
-    provider_key: str
-    provider_name: str
-    model_name: str
-    ok: bool
-    error: Optional[str] = None
-    latency_ms: Optional[int] = None
-    analysis: Optional[dict[str, Any]] = None
-
-
-class AIAnalysisRequest(BaseModel):
-    provider_keys: list[str] = []
-    prompt_key: str = "stock_brief"
-    account_id: Optional[int] = None
-
-
-class AIAnalysisResponse(BaseModel):
-    scope: str
-    prompt_key: str
-    context: dict[str, Any]
-    results: list[AIAnalysisResult]
 
 
 # ---------- Stocks ----------
