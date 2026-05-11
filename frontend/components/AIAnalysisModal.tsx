@@ -184,7 +184,15 @@ export default function AIAnalysisModal({
 
             {result && (
               <div className="space-y-3">
-                {result.results.map((r) => (
+                {result.results.map((r: {
+					  provider_key: string;
+					  provider_name?: string;
+					  title?: string;
+					  summary?: string;
+					  recommendation?: string;
+					  confidence?: number;
+					  raw_text?: string;
+					}) => (
                   <div key={r.provider_key} className="rounded-2xl bg-bg-subtle p-4 ring-1 ring-border">
                     <div className="flex items-start justify-between gap-2">
                       <div>
