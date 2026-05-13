@@ -77,25 +77,33 @@ PROMPTS: dict[str, dict[str, Any]] = {
         "key": "stock_brief",
         "label": "Stock analysis",
         "scope": "stock",
-        "description": "Compact single-stock analysis with a short verdict and reasons.",
+        "description": "Compact single-stock analysis with an independent verdict and reasons.",
         "system_prompt": (
-            "Return only valid JSON. Keep every field short. Use the fewest possible tokens. "
-            "No markdown, no preamble, no commentary."
+            "You are an independent equity analyst. Form your own view of the stock "
+            "using public knowledge of the company, sector, valuation norms, and macro "
+            "context. Do NOT assume any third-party verdicts, scores, technical "
+            "indicators, or analyst targets — none are provided. Return only valid "
+            "JSON. Keep every field short. Use the fewest possible tokens. No markdown, "
+            "no preamble, no commentary."
         ),
-        "max_output_tokens": 240,
+        "max_output_tokens": 600,
     },
     "portfolio_brief": {
         "key": "portfolio_brief",
         "label": "Portfolio analysis",
         "scope": "portfolio",
         "description": (
-            "Compact portfolio review with per-position actions, focused on HOLD / BUY_MORE / SELL."
+            "Compact portfolio review with independent per-position actions."
         ),
         "system_prompt": (
-            "Return only valid JSON. Keep every field short. Use the fewest possible tokens. "
+            "You are an independent portfolio strategist. Evaluate each position on "
+            "its own merits using public knowledge of the company, sector, and macro "
+            "context. Identify concentration risk and diversification gaps. Do NOT "
+            "assume any third-party verdicts or scores — none are provided. Return "
+            "only valid JSON. Keep every field short. Use the fewest possible tokens. "
             "No markdown, no preamble, no commentary."
         ),
-        "max_output_tokens": 360,
+        "max_output_tokens": 800,
     },
 }
 
@@ -329,15 +337,29 @@ async def _call_provider(provider_key: str, cfg: AIProviderSetting, prompt: str,
             return resp.json()
 
         if provider_key == "gemini":
+            # Gemini 2.5/3 Flash have "thinking" enabled by default, which
+            # silently eats from maxOutputTokens — leaving the visible JSON
+            # response truncated. We disable thinking for 2.5 Flash (the
+            # supported model that allows it) by setting thinkingBudget=0.
+            # For Gemini 3 models, thinking can't be fully disabled — only
+            # set to "low" — so we set thinkingLevel as a best effort and
+            # rely on the bumped max_tokens to cover both budgets.
+            generation_config: dict[str, Any] = {
+                "temperature": 0,
+                "maxOutputTokens": max_tokens,
+            }
+            model_lower = (model or "").lower()
+            if "2.5" in model_lower:
+                generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+            elif model_lower.startswith("gemini-3") or "3-flash" in model_lower or "3.1" in model_lower:
+                # gemini-3 family — minimum supported is "low"
+                generation_config["thinkingConfig"] = {"thinkingLevel": "low"}
             payload = {
                 "systemInstruction": {
                     "parts": [{"text": "Return only JSON. Keep it short."}],
                 },
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0,
-                    "maxOutputTokens": max_tokens,
-                },
+                "generationConfig": generation_config,
             }
             url = f"{base_url}{meta['chat_path'].format(model=model.lstrip('/'))}"
             resp = await client.post(url, headers=headers, json=payload)
@@ -606,15 +628,136 @@ def _prompt_payload(scope: str, context: dict[str, Any]) -> str:
     }, separators=(",", ":"))
 
 
+def _finish_reason(provider_key: str, payload: dict[str, Any]) -> Optional[str]:
+    """Pull the finish_reason / stop reason from the provider payload, if any.
+
+    A reason of 'MAX_TOKENS' / 'length' means the model hit its output cap
+    mid-response. We surface that as a distinct error so the operator knows
+    to bump max_output_tokens (or turn off Gemini thinking).
+    """
+    if provider_key in {"openai", "xai"}:
+        choices = payload.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            return choices[0].get("finish_reason")
+    if provider_key == "anthropic":
+        return payload.get("stop_reason")
+    if provider_key == "gemini":
+        candidates = payload.get("candidates") or []
+        if candidates and isinstance(candidates[0], dict):
+            return candidates[0].get("finishReason") or candidates[0].get("finish_reason")
+    return None
+
+
+def _attempt_repair_truncated_json(text: str) -> Optional[str]:
+    """Best-effort fix for JSON that ran out of tokens mid-response.
+
+    Walks the text tracking string/escape state and bracket depth, then
+    closes any unterminated string and appends the closing brackets/braces
+    in the right order. Returns None if the partial doesn't look salvageable
+    (e.g. it doesn't even contain a key:value pair we could keep).
+
+    This is a hail-mary so the user gets *something* back rather than a hard
+    fail. Garbage in, less-garbage out — the operator should still bump the
+    token cap if this fires often.
+    """
+    if not text:
+        return None
+    stack: list[str] = []  # 'object' or 'array'
+    in_string = False
+    escape = False
+    last_non_ws = ""
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("object")
+        elif ch == "[":
+            stack.append("array")
+        elif ch == "}" and stack and stack[-1] == "object":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "array":
+            stack.pop()
+        if not ch.isspace():
+            last_non_ws = ch
+
+    # Nothing to close, or never even opened anything — give up.
+    if not stack and not in_string:
+        return text if text.strip() else None
+    if not stack and in_string:
+        # A bare unterminated string isn't repairable into a JSON object.
+        return None
+
+    repaired = text
+    # Close any unterminated string
+    if in_string:
+        repaired += '"'
+    # If we cut off right after a key opener like `"summary":`, we need a
+    # placeholder value before the closer. Heuristic: if the last meaningful
+    # char is ':' or ',' we drop the trailing fragment.
+    if last_non_ws in (":", ","):
+        # Strip back to the last balanced position — easier than guessing
+        # what should follow the dangling key.
+        idx = max(repaired.rfind(","), repaired.rfind("{"), repaired.rfind("["))
+        if idx > 0:
+            repaired = repaired[:idx]
+    # Close remaining containers in reverse open order.
+    closers = {"object": "}", "array": "]"}
+    while stack:
+        repaired += closers[stack.pop()]
+    return repaired
+
+
 def _parse_response_json(provider_key: str, payload: dict[str, Any]) -> dict[str, Any]:
     text = _extract_text(payload, provider_key)
+    finish = (_finish_reason(provider_key, payload) or "").upper()
+    is_truncated = finish in {"MAX_TOKENS", "LENGTH"}
+
     if not text:
+        if is_truncated:
+            raise ValueError(
+                "Model output was empty because it hit the token limit "
+                "before producing visible text (likely Gemini thinking "
+                "consumed the whole budget). Increase max_output_tokens "
+                "on the prompt template."
+            )
         raise ValueError("Empty model response")
-    text = _sanitize_json_text(text)
+
+    cleaned = _sanitize_json_text(text)
     try:
-        data = json.loads(text)
+        data = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Model returned non-JSON text: {text[:200]}") from exc
+        # If the response was cut off mid-JSON we can sometimes patch it
+        # enough to extract a partial verdict — better than a hard fail.
+        if is_truncated:
+            repaired = _attempt_repair_truncated_json(cleaned)
+            if repaired:
+                try:
+                    data = json.loads(repaired)
+                    if isinstance(data, dict):
+                        data.setdefault(
+                            "_warning",
+                            "Response was truncated at the token limit and "
+                            "auto-repaired. Increase max_output_tokens for "
+                            "a complete answer.",
+                        )
+                        return data
+                except json.JSONDecodeError:
+                    pass
+            raise ValueError(
+                "Model response was truncated at the token limit "
+                f"(finishReason={finish}). Partial text: {cleaned[:200]}"
+            ) from exc
+        raise ValueError(f"Model returned non-JSON text: {cleaned[:200]}") from exc
+
     if not isinstance(data, dict):
         raise ValueError("Model JSON response must be an object")
     return data
