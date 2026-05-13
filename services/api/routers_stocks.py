@@ -318,11 +318,17 @@ def stock_news(
 
 # ---------------- Refresh (re-scrape one stock) ----------------
 @router.post("/{exchange}/{ticker}/refresh")
-async def refresh_stock(exchange: str, ticker: str):
-    if exchange.lower() not in {"adx", "dfm", "egx"}:
-        raise HTTPException(400, "Bad exchange")
+async def refresh_stock(exchange: str, ticker: str, db: Session = Depends(get_db)):
+    # Any exchange we have a row for is refreshable — the scraper looks up the
+    # per-exchange URL template (Round-8 work). NASDAQ/NYSE use /stocks/...,
+    # MENA exchanges use /quote/<code>/...
+    ex = db.execute(
+        select(Exchange).where(func.lower(Exchange.code) == exchange.lower())
+    ).scalar_one_or_none()
+    if ex is None:
+        raise HTTPException(400, f"Unknown exchange '{exchange}'")
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(f"{_SCRAPER_URL}/scrape/{exchange.lower()}/{ticker.upper()}")
+        r = await client.post(f"{_SCRAPER_URL}/scrape/{ex.code}/{ticker.upper()}")
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
         return r.json()
