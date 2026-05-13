@@ -256,13 +256,25 @@ async def run_broker_quote_refresh():
         for stock_id, broker_id, broker_symbol in mapping_data:
             by_broker[broker_id].append((stock_id, broker_symbol))
 
+        # Early exit when there's nothing to do — otherwise the audit row
+        # says "updated: 0" with no explanation and looks like a silent bug.
+        if not mapping_data:
+            _finish_run(rid, started, "ok", summary={
+                "updated": 0, "failed": 0, "total": 0, "brokers": 0,
+                "note": "No tradeable broker instruments to refresh.",
+            })
+            return
+
         ok = failed = 0
+        broker_diag: dict[int, dict] = {}
         # Generous timeout — a 200-symbol batch through Capital.com can take
         # tens of seconds because the adapter fetches one quote at a time.
         async with httpx.AsyncClient(timeout=300) as client:
             for broker_id, items in by_broker.items():
                 symbols = [sym for (_sid, sym) in items]
                 sym_to_stock = {sym: sid for (sid, sym) in items}
+                diag = {"symbols": len(symbols), "ok": 0, "failed": 0}
+                broker_diag[broker_id] = diag
 
                 try:
                     r = await client.post(
@@ -273,17 +285,26 @@ async def run_broker_quote_refresh():
                         log.warning("batch_quote_failed",
                                     broker_id=broker_id, status=r.status_code,
                                     body=r.text[:200])
+                        diag["failed"] = len(symbols)
+                        diag["http_status"] = r.status_code
+                        diag["error"] = r.text[:300]
                         failed += len(symbols)
                         continue
                     batch = r.json()
                 except Exception as exc:
                     log.warning("batch_quote_exception",
                                 broker_id=broker_id, error=str(exc))
+                    diag["failed"] = len(symbols)
+                    diag["error"] = f"{type(exc).__name__}: {exc}"
                     failed += len(symbols)
                     continue
 
                 quotes = batch.get("quotes", {})
                 errors = batch.get("errors", {})
+                diag["broker_errors"] = len(errors)
+                if errors:
+                    sample = list(errors.items())[:5]
+                    diag["error_samples"] = {k: v for k, v in sample}
 
                 for symbol, payload in quotes.items():
                     stock_id = sym_to_stock.get(symbol)
@@ -350,21 +371,26 @@ async def run_broker_quote_refresh():
                                 s.execute(sq_stmt)
                             s.commit()
                         ok += 1
+                        diag["ok"] += 1
                     except Exception as exc:
                         log.warning("quote_db_failed",
                                     stock_id=stock_id, symbol=symbol, error=str(exc))
                         failed += 1
+                        diag["failed"] += 1
+                        diag.setdefault("db_error", f"{type(exc).__name__}: {exc}")
 
                 # Per-symbol broker errors come back inside the batch payload
                 for symbol, msg in errors.items():
                     log.warning("quote_broker_error",
                                 broker_id=broker_id, symbol=symbol, error=msg)
                     failed += 1
+                    diag["failed"] += 1
 
         _finish_run(rid, started, "ok",
                     summary={"updated": ok, "failed": failed,
                              "total": len(mapping_data),
-                             "brokers": len(by_broker)})
+                             "brokers": len(by_broker),
+                             "broker_diagnostics": broker_diag})
     except Exception as exc:
         log.exception("broker_quote_refresh_failed", error=str(exc))
         _finish_run(rid, started, "failed", error=str(exc))

@@ -49,17 +49,17 @@ VALUES
         'stock_brief',
         'stock',
         'Stock analysis',
-        'Compact single-stock analysis with a short verdict and reasons.',
-        'Return only valid JSON. Keep every field short. Use the fewest possible tokens. No markdown, no preamble, no commentary.',
-        240
+        'Compact single-stock analysis with an independent verdict and reasons.',
+        'You are an independent equity analyst. Form your own view of the stock using public knowledge of the company, sector, valuation norms, and macro context. Do NOT assume any third-party verdicts, scores, technical indicators, or analyst targets — none are provided. Return only valid JSON. Keep every field short. Use the fewest possible tokens. No markdown, no preamble, no commentary.',
+        320
     ),
     (
         'portfolio_brief',
         'portfolio',
         'Portfolio analysis',
-        'Compact portfolio review with per-position actions.',
-        'Return only valid JSON. Keep every field short. Use the fewest possible tokens. No markdown, no preamble, no commentary.',
-        360
+        'Compact portfolio review with independent per-position actions.',
+        'You are an independent portfolio strategist. Evaluate each position on its own merits using public knowledge of the company, sector, and macro context. Identify concentration risk and diversification gaps. Do NOT assume any third-party verdicts or scores — none are provided. Return only valid JSON. Keep every field short. Use the fewest possible tokens. No markdown, no preamble, no commentary.',
+        420
     )
 ON CONFLICT (key) DO UPDATE
 SET scope = EXCLUDED.scope,

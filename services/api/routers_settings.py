@@ -227,102 +227,140 @@ async def run_job(
                        BrokerInstrument.stock_id.is_not(None))
             ).all()
 
-            # Bucket by broker_id — one batch call per broker
-            by_broker: dict[int, list[tuple[int, str]]] = defaultdict(list)
-            for (stock_id, broker_id, broker_symbol) in mapping_data:
-                by_broker[broker_id].append((stock_id, broker_symbol))
+            # If there are no tradeable mappings we can stop early and tell
+            # the operator clearly — otherwise the job mysteriously reports
+            # success with zero updates.
+            if not mapping_data:
+                summary = {
+                    "updated": 0, "failed": 0, "total": 0, "brokers": 0,
+                    "note": "No tradeable broker instruments. "
+                            "Either no broker is connected, or the "
+                            "broker_instruments rows for this user are "
+                            "missing / have is_tradeable=False.",
+                }
+            else:
+                # Bucket by broker_id — one batch call per broker
+                by_broker: dict[int, list[tuple[int, str]]] = defaultdict(list)
+                for (stock_id, broker_id, broker_symbol) in mapping_data:
+                    by_broker[broker_id].append((stock_id, broker_symbol))
 
-            ok_n = failed_n = 0
-            gateway_url = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
-            async with httpx.AsyncClient(timeout=300) as client:
-                for broker_id, items in by_broker.items():
-                    symbols = [sym for (_sid, sym) in items]
-                    sym_to_stock = {sym: sid for (sid, sym) in items}
-                    try:
-                        rq = await client.post(
-                            f"{gateway_url}/brokers/{broker_id}/quotes/batch",
-                            json={"symbols": symbols},
-                        )
-                        if rq.status_code >= 400:
+                ok_n = failed_n = 0
+                # Per-broker diagnostics so we can see which broker failed and how.
+                broker_diag: dict[int, dict[str, Any]] = {}
+                gateway_url = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
+                async with httpx.AsyncClient(timeout=300) as client:
+                    for broker_id, items in by_broker.items():
+                        symbols = [sym for (_sid, sym) in items]
+                        sym_to_stock = {sym: sid for (sid, sym) in items}
+                        diag = {"symbols": len(symbols), "ok": 0, "failed": 0}
+                        broker_diag[broker_id] = diag
+                        batch: Optional[dict] = None
+                        try:
+                            rq = await client.post(
+                                f"{gateway_url}/brokers/{broker_id}/quotes/batch",
+                                json={"symbols": symbols},
+                            )
+                            if rq.status_code >= 400:
+                                diag["failed"] = len(symbols)
+                                diag["http_status"] = rq.status_code
+                                diag["error"] = rq.text[:300]
+                                failed_n += len(symbols)
+                                continue
+                            batch = rq.json()
+                        except Exception as exc:
+                            diag["failed"] = len(symbols)
+                            diag["error"] = f"{type(exc).__name__}: {exc}"
                             failed_n += len(symbols)
                             continue
-                        batch = rq.json()
-                    except Exception:
-                        failed_n += len(symbols)
-                        continue
 
-                    quotes = batch.get("quotes", {})
-                    errors = batch.get("errors", {})
-                    failed_n += len(errors)
+                        quotes = batch.get("quotes", {})
+                        errors = batch.get("errors", {})
+                        diag["broker_errors"] = len(errors)
+                        if errors:
+                            # Keep a small sample so the UI shows what went wrong
+                            sample = list(errors.items())[:5]
+                            diag["error_samples"] = {k: v for k, v in sample}
+                        failed_n += len(errors)
+                        diag["failed"] += len(errors)
 
-                    for symbol, payload in quotes.items():
-                        stock_id = sym_to_stock.get(symbol)
-                        if stock_id is None:
-                            continue
+                        for symbol, payload in quotes.items():
+                            stock_id = sym_to_stock.get(symbol)
+                            if stock_id is None:
+                                continue
 
-                        def _dec(k, p=payload):
-                            v = p.get(k)
-                            return _D(str(v)) if v is not None else None
+                            def _dec(k, p=payload):
+                                v = p.get(k)
+                                return _D(str(v)) if v is not None else None
 
-                        cur_values = {
-                            "stock_id": stock_id, "broker_id": broker_id,
-                            "broker_symbol": symbol,
-                            "bid": _dec("bid"), "offer": _dec("offer"),
-                            "last_price": _dec("last_price"),
-                            "open_price": _dec("open_price"),
-                            "high_price": _dec("high_price"),
-                            "low_price": _dec("low_price"),
-                            "close_price": _dec("close_price"),
-                            "broker_change_abs": _dec("change_abs"),
-                            "broker_change_pct": _dec("change_pct"),
-                            "volume": _dec("volume"),
-                            "currency": payload.get("currency"),
-                            "market_status": payload.get("market_status"),
-                            "fetched_at": datetime.utcnow(),
-                        }
-                        try:
-                            cq_stmt = _pg_insert(StockCurQuote).values(**cur_values).on_conflict_do_update(
-                                index_elements=["stock_id", "broker_id"],
-                                set_={k: v for k, v in cur_values.items()
-                                      if k not in ("stock_id", "broker_id", "broker_symbol")},
-                            )
-                            db.execute(cq_stmt)
-
-                            last_p = cur_values["last_price"]
-                            if last_p is not None:
-                                hist = db.execute(
-                                    select(StockHistoryQuote.close_price)
-                                    .where(StockHistoryQuote.stock_id == stock_id,
-                                           StockHistoryQuote.close_price.is_not(None))
-                                    .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
-                                ).all()
-                                prev_c = hist[1].close_price if len(hist) >= 2 else None
-                                ch_a = ch_p = None
-                                if prev_c is not None and prev_c != 0:
-                                    ch_a = last_p - prev_c
-                                    ch_p = (ch_a / prev_c) * 100
-                                sq_record = {
-                                    "stock_id": stock_id,
-                                    "current_price": last_p,
-                                    "prev_close": prev_c,
-                                    "change_abs": ch_a,
-                                    "change_pct": ch_p,
-                                    "price_source": "broker",
-                                    "price_fetched_at": cur_values["fetched_at"],
-                                    "last_updated": datetime.utcnow(),
-                                }
-                                sq_stmt = _pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
-                                    index_elements=["stock_id"],
-                                    set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                            cur_values = {
+                                "stock_id": stock_id, "broker_id": broker_id,
+                                "broker_symbol": symbol,
+                                "bid": _dec("bid"), "offer": _dec("offer"),
+                                "last_price": _dec("last_price"),
+                                "open_price": _dec("open_price"),
+                                "high_price": _dec("high_price"),
+                                "low_price": _dec("low_price"),
+                                "close_price": _dec("close_price"),
+                                "broker_change_abs": _dec("change_abs"),
+                                "broker_change_pct": _dec("change_pct"),
+                                "volume": _dec("volume"),
+                                "currency": payload.get("currency"),
+                                "market_status": payload.get("market_status"),
+                                "fetched_at": datetime.utcnow(),
+                            }
+                            try:
+                                cq_stmt = _pg_insert(StockCurQuote).values(**cur_values).on_conflict_do_update(
+                                    index_elements=["stock_id", "broker_id"],
+                                    set_={k: v for k, v in cur_values.items()
+                                          if k not in ("stock_id", "broker_id", "broker_symbol")},
                                 )
-                                db.execute(sq_stmt)
-                            db.commit()
-                            ok_n += 1
-                        except Exception:
-                            db.rollback()
-                            failed_n += 1
-            summary = {"updated": ok_n, "failed": failed_n,
-                       "total": len(mapping_data), "brokers": len(by_broker)}
+                                db.execute(cq_stmt)
+
+                                last_p = cur_values["last_price"]
+                                if last_p is not None:
+                                    hist = db.execute(
+                                        select(StockHistoryQuote.close_price)
+                                        .where(StockHistoryQuote.stock_id == stock_id,
+                                               StockHistoryQuote.close_price.is_not(None))
+                                        .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
+                                    ).all()
+                                    prev_c = hist[1].close_price if len(hist) >= 2 else None
+                                    ch_a = ch_p = None
+                                    if prev_c is not None and prev_c != 0:
+                                        ch_a = last_p - prev_c
+                                        ch_p = (ch_a / prev_c) * 100
+                                    sq_record = {
+                                        "stock_id": stock_id,
+                                        "current_price": last_p,
+                                        "prev_close": prev_c,
+                                        "change_abs": ch_a,
+                                        "change_pct": ch_p,
+                                        "price_source": "broker",
+                                        "price_fetched_at": cur_values["fetched_at"],
+                                        "last_updated": datetime.utcnow(),
+                                    }
+                                    sq_stmt = _pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
+                                        index_elements=["stock_id"],
+                                        set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+                                    )
+                                    db.execute(sq_stmt)
+                                db.commit()
+                                ok_n += 1
+                                diag["ok"] += 1
+                            except Exception as db_exc:
+                                db.rollback()
+                                failed_n += 1
+                                diag["failed"] += 1
+                                # First DB error per broker — useful when bulk
+                                # of failures share the same cause.
+                                diag.setdefault(
+                                    "db_error",
+                                    f"{type(db_exc).__name__}: {db_exc}",
+                                )
+
+                summary = {"updated": ok_n, "failed": failed_n,
+                           "total": len(mapping_data), "brokers": len(by_broker),
+                           "broker_diagnostics": broker_diag}
         elif key == "job.account_stats_snapshot":
             # The scheduler holds the actual implementation; manual trigger
             # via API would require HTTP-based dispatch we haven't built. Mark

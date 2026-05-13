@@ -465,10 +465,14 @@ def _build_portfolio_context(db: Session, user: User, account_id: Optional[int])
             "ticker": out.stock.ticker,
             "exchange_code": out.stock.exchange_code,
             "company_name": out.stock.company_name,
+            "sector": out.stock.sector,
+            "industry": out.stock.industry,
             "quantity": out.quantity,
             "avg_entry_price": out.avg_entry_price,
-            "current_price": out.stock.current_price,
+            "current_price": out.stock.last_close,
             "unrealized_pl_pct": out.unrealized_pl_pct,
+            # Kept for backward compat with other consumers of this context
+            # (the AI prompt builder ignores these).
             "position_verdict": out.position_verdict,
             "position_confidence": out.position_confidence,
         })
@@ -486,81 +490,118 @@ def _build_portfolio_context(db: Session, user: User, account_id: Optional[int])
 
 
 def _prompt_payload(scope: str, context: dict[str, Any]) -> str:
+    """Build the JSON payload sent to the LLM.
+
+    Important design choice: the prompt MUST NOT include our system's derived
+    signals (composite_score, verdict, RSI, SMAs, analyst_target, etc.). The
+    point of asking an LLM is to get an independent second opinion. Feeding
+    it our findings turns it into a rubber-stamp.
+
+    What we send instead: just the identifiers (ticker / exchange / company /
+    sector) and basic market facts (current price, change %, market cap,
+    currency). Recent news headlines are included so the model has a freshness
+    signal it couldn't reasonably know about from training data alone. The
+    model is then instructed to evaluate the stock using its OWN knowledge
+    and reasoning — fundamentals, valuation, sector trends, macro context.
+    """
     if scope == "stock":
         stock = context["stock"]
-        news = stock.get("news") or []
+        # Just headlines — no sentiment, no scoring. The model decides what
+        # matters and weighs them itself.
+        news_headlines = [
+            n.get("headline") for n in (stock.get("news") or [])
+            if n.get("headline")
+        ][:5]
         return json.dumps({
-            "task": "Analyze one stock and return a compact JSON verdict.",
+            "task": "Analyze the stock independently. Use your own knowledge of "
+                    "the company, sector, valuation norms, macro context, and "
+                    "any relevant fundamentals. Do not assume any signals are "
+                    "implied by the inputs below — they are identification "
+                    "only, not a starting point for the analysis.",
             "output_schema": {
                 "ticker": "string",
                 "decision": "BUY|HOLD|SELL|WATCH",
                 "confidence": "0-100 integer",
-                "summary": "short string",
-                "thesis": ["brief bullet strings, max 3"],
-                "risks": ["brief bullet strings, max 3"],
-                "action": "short string",
+                "summary": "short string — the core thesis",
+                "thesis": ["brief bullet strings, max 3 — why this decision"],
+                "risks": ["brief bullet strings, max 3 — what could go wrong"],
+                "action": "short string — what the user should do next",
             },
-            "context": {
+            "stock_identification": {
                 "ticker": stock.get("ticker"),
                 "exchange": stock.get("exchange_code"),
                 "company": stock.get("company_name"),
                 "sector": stock.get("sector"),
                 "industry": stock.get("industry"),
+                "country": stock.get("country"),
                 "currency": stock.get("currency"),
-                "current_price": stock.get("current_price"),
-                "change_pct": stock.get("change_pct"),
-                "composite_score": stock.get("composite_score"),
-                "verdict": stock.get("verdict"),
-                "pe_ratio": stock.get("pe_ratio"),
-                "market_cap": stock.get("market_cap"),
-                "rsi_14": stock.get("rsi_14"),
-                "sma_50": stock.get("sma_50"),
-                "sma_200": stock.get("sma_200"),
-                "analyst_target": stock.get("analyst_target"),
-                "analyst_upside_pct": stock.get("analyst_upside_pct"),
-                "analyst_count": stock.get("analyst_count"),
-                "analyst_rating": stock.get("analyst_rating"),
-                "recent_news": news[:3],
             },
+            "current_market_snapshot": {
+                "price": stock.get("current_price"),
+                "day_change_pct": stock.get("change_pct"),
+                "market_cap": stock.get("market_cap"),
+            },
+            "recent_news_headlines": news_headlines,
             "instructions": [
-                "Use the fewest possible tokens.",
-                "Do not repeat the context verbatim.",
-                "No markdown.",
-                "Return JSON only.",
+                "Form your own view using publicly available information you know about.",
+                "Do not rely on or repeat back any third-party analyst targets or scores.",
+                "If you lack enough information for a confident view, set decision to WATCH and explain why in summary.",
+                "Use the fewest possible tokens. No markdown. Return JSON only.",
             ],
         }, separators=(",", ":"))
 
+    # Portfolio scope — same principle: identify each position, give cost
+    # basis and current price (so the model knows the user's economics), and
+    # let the model evaluate each one on its own merits.
     portfolio = context["portfolio"]
+    positions_out = []
+    for p in portfolio.get("positions") or []:
+        positions_out.append({
+            "ticker": p.get("ticker"),
+            "exchange": p.get("exchange_code"),
+            "company": p.get("company_name"),
+            "sector": p.get("sector"),
+            "industry": p.get("industry"),
+            "quantity": p.get("quantity"),
+            "avg_entry_price": p.get("avg_entry_price"),
+            "current_price": p.get("current_price"),
+            "unrealized_pl_pct": p.get("unrealized_pl_pct"),
+            # NOTE: position_verdict deliberately omitted — that's our system's
+            # opinion, the model should form its own.
+        })
+
     return json.dumps({
-        "task": "Analyze each open position and the overall portfolio in compact JSON.",
+        "task": "Analyze the portfolio and each position independently. Use "
+                "your own knowledge of each company, sector, current valuation, "
+                "and macro context. Identify concentration risk, "
+                "diversification gaps, and per-position rebalancing actions. "
+                "Do not assume any signals are implied by the inputs below.",
         "output_schema": {
             "portfolio_view": "HOLD|BUY_MORE|SELL|TRIM",
             "confidence": "0-100 integer",
-            "summary": "short string",
-            "risks": ["brief bullet strings, max 3"],
-            "actions": ["brief bullet strings, max 3"],
+            "summary": "short string — overall portfolio thesis",
+            "risks": ["brief bullet strings, max 3 — portfolio-level risks"],
+            "actions": ["brief bullet strings, max 3 — recommended changes"],
             "positions": [
                 {
                     "ticker": "string",
                     "decision": "HOLD|BUY_MORE|SELL|TRIM|STOP_LOSS",
                     "confidence": "0-100 integer",
-                    "reason": "short string",
+                    "reason": "short string — independent rationale",
                 }
             ],
         },
-        "context": {
-            "account_id": portfolio.get("account_id"),
+        "portfolio_snapshot": {
             "positions_count": portfolio.get("positions_count"),
             "total_cost": portfolio.get("total_cost"),
             "total_value": portfolio.get("total_value"),
             "total_pl_pct": portfolio.get("total_pl_pct"),
-            "positions": portfolio.get("positions"),
         },
+        "positions": positions_out,
         "instructions": [
-            "Use the fewest possible tokens.",
-            "Do not repeat the context verbatim.",
-            "No markdown.",
-            "Return JSON only.",
+            "Form your own view per position using publicly available information you know about.",
+            "Consider sector diversification and concentration risk for the portfolio view.",
+            "Use the fewest possible tokens. No markdown. Return JSON only.",
         ],
     }, separators=(",", ":"))
 
