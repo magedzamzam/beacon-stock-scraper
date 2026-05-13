@@ -55,6 +55,6 @@ async def scrape_all(background: BackgroundTasks, req: Optional[ScrapeAllRequest
 
 @app.post("/scrape/{exchange}/{ticker}")
 async def scrape_single(exchange: str, ticker: str):
-    if exchange.lower() not in {"adx", "dfm", "egx"}:
-        raise HTTPException(400, "exchange must be one of: adx, dfm, egx")
+    if exchange.lower() not in {"adx", "dfm", "egx", "nasdaq", "nyse"}:
+        raise HTTPException(400, "exchange must be one of: adx, dfm, egx, nyse, nasdaq")
     return await scrape_by_ticker(exchange, ticker)
