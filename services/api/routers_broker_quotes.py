@@ -2,6 +2,7 @@
 
 Endpoints:
     GET  /stocks/{stock_id}/broker_quotes        list all latest quotes
+                                                 (auto-refreshes if stale/missing)
     POST /stocks/{stock_id}/broker_quotes/refresh refresh one or all (manual)
 
 The hourly periodic refresh lives in the scheduler.
@@ -9,7 +10,7 @@ The hourly periodic refresh lives in the scheduler.
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -30,6 +31,10 @@ from .auth import get_current_user, get_db
 broker_quotes_router = APIRouter(prefix="/stocks", tags=["broker_quotes"])
 
 _GATEWAY_URL = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
+# Auto-refresh threshold — if the newest persisted quote is older than this
+# we re-fetch on page load. Long enough that opening 10 tabs doesn't hammer
+# Capital.com; short enough that the user sees a live-looking price.
+_AUTO_REFRESH_AGE = timedelta(minutes=5)
 
 
 def _serialize_quote(row: "StockCurQuote", broker_name: Optional[str] = None) -> dict:
@@ -59,17 +64,50 @@ def _serialize_quote(row: "StockCurQuote", broker_name: Optional[str] = None) ->
 
 
 @broker_quotes_router.get("/{stock_id}/broker_quotes")
-def list_broker_quotes(
+async def list_broker_quotes(
     stock_id: int,
     _: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """All persisted broker quotes for a stock (newest per broker).
 
-    Round 3: reads from stock_cur_quote (parallel table).
+    Auto-refresh: if any tradeable broker mapping has no persisted quote OR
+    the quote is older than _AUTO_REFRESH_AGE, fetch fresh quotes through
+    the gateway (which has its own cached adapter session) before returning.
+    That way the stock detail page always shows a live-looking price even
+    when the hourly job is broken — at the cost of one Capital.com call
+    per stale mapping per page load.
     """
     if db.get(Stock, stock_id) is None:
         raise HTTPException(404, "Stock not found")
+
+    # Decide which mappings need refreshing
+    mappings = db.execute(
+        select(BrokerInstrument)
+        .where(BrokerInstrument.stock_id == stock_id,
+               BrokerInstrument.is_tradeable.is_(True),
+               BrokerInstrument.broker_symbol.is_not(None))
+    ).scalars().all()
+
+    if mappings:
+        now = datetime.utcnow()
+        threshold = now - _AUTO_REFRESH_AGE
+        latest_by_broker = {
+            r.broker_id: r.fetched_at for r in db.execute(
+                select(StockCurQuote).where(StockCurQuote.stock_id == stock_id)
+            ).scalars().all()
+        }
+        for m in mappings:
+            last = latest_by_broker.get(m.broker_id)
+            if last is None or last < threshold:
+                # Fire and forget per-mapping refresh. Errors from the gateway
+                # (broker down, symbol unmapped, auth issue) come back as None
+                # and we just fall through to whatever's in stock_cur_quote.
+                try:
+                    await _refresh_one(db, stock_id, m.broker_id, m.broker_symbol)
+                except Exception:
+                    pass
+
     rows = db.execute(
         select(StockCurQuote, Broker.name, Broker.code)
         .join(Broker, StockCurQuote.broker_id == Broker.id)

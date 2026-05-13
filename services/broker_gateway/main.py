@@ -426,7 +426,11 @@ async def get_quote(broker_id: int, broker_symbol: str):
 
 
 class BatchQuoteRequest(BaseModel):
-    symbols: list[str] = Field(..., min_length=1, max_length=500)
+    # NOTE: allow an empty symbol list. Callers can hit this endpoint with
+    # whatever set of mappings they have; if a broker is connected but has
+    # zero tradeable instruments yet, we'd rather return an empty batch than
+    # 422 and break the loop. max_length still bounds the per-call cost.
+    symbols: list[str] = Field(default_factory=list, max_length=500)
 
 
 @app.post("/brokers/{broker_id}/quotes/batch")
@@ -439,7 +443,13 @@ async def get_quotes_batch(broker_id: int, body: BatchQuoteRequest):
     rest of the batch retries through a fresh session.
     """
     if not body.symbols:
-        raise HTTPException(400, "symbols list is empty")
+        return {
+            "broker_id": broker_id,
+            "fetched_at": datetime.utcnow().isoformat(),
+            "ok_count": 0, "error_count": 0,
+            "quotes": {}, "errors": {},
+            "note": "Empty symbols list — nothing to do.",
+        }
     account_id = _resolve_quote_account(broker_id)
 
     quotes: dict[str, dict] = {}

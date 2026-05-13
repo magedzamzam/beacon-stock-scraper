@@ -224,7 +224,8 @@ async def run_job(
                 select(BrokerInstrument.stock_id, BrokerInstrument.broker_id,
                        BrokerInstrument.broker_symbol)
                 .where(BrokerInstrument.is_tradeable.is_(True),
-                       BrokerInstrument.stock_id.is_not(None))
+                       BrokerInstrument.stock_id.is_not(None),
+                       BrokerInstrument.broker_symbol.is_not(None))
             ).all()
 
             # If there are no tradeable mappings we can stop early and tell
@@ -251,6 +252,8 @@ async def run_job(
                 async with httpx.AsyncClient(timeout=300) as client:
                     for broker_id, items in by_broker.items():
                         symbols = [sym for (_sid, sym) in items]
+                        if not symbols:
+                            continue
                         sym_to_stock = {sym: sid for (sid, sym) in items}
                         diag = {"symbols": len(symbols), "ok": 0, "failed": 0}
                         broker_diag[broker_id] = diag
