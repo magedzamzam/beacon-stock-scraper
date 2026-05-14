@@ -144,6 +144,39 @@ class StockDetail(StockSummary):
     # When current_price was last refreshed.
     price_fetched_at: Optional[datetime] = None
 
+    # ----- Earnings & share structure -----
+    # Populated from the bulk-imported CSV (stockanalysis.com). Frontend uses
+    # `data_imported_at` to show the user how fresh the figures are — bulk
+    # imports happen manually so stale data is a real concern.
+    earnings: Optional["EarningsBlock"] = None
+    share_structure: Optional["ShareStructureBlock"] = None
+
+
+class EarningsBlock(BaseModel):
+    last_earnings_date: Optional[date] = None
+    next_earnings_date: Optional[date] = None
+    earnings_time: Optional[str] = None
+    est_revenue: Optional[float] = None
+    est_revenue_growth_pct: Optional[float] = None
+    est_eps: Optional[float] = None
+    # Days until next earnings (negative = past). Computed on the fly to avoid
+    # cache invalidation pain. Null when next_earnings_date is null.
+    days_to_next: Optional[int] = None
+    # Days since last earnings. Negative = future.
+    days_since_last: Optional[int] = None
+    data_imported_at: Optional[datetime] = None
+
+
+class ShareStructureBlock(BaseModel):
+    shares_change_yoy_pct: Optional[float] = None
+    shares_change_qoq_pct: Optional[float] = None
+    insiders_pct: Optional[float] = None
+    institutional_pct: Optional[float] = None
+    # Derived at read time: 100 - insiders - institutional. Null if either
+    # input is null (would be misleading otherwise).
+    retail_pct: Optional[float] = None
+    period_end: Optional[date] = None
+
 
 class ScoreBreakdown(BaseModel):
     ticker: str
@@ -343,3 +376,7 @@ class ImportExecuteOut(BaseModel):
     errors: int
     row_logs: list[ImportRowLogOut] = []
     finished_at: datetime
+
+
+# Resolve forward refs declared on StockDetail (earnings, share_structure).
+StockDetail.model_rebuild()

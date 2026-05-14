@@ -47,7 +47,7 @@ export default function ScreenerPage() {
 
   const activeFiltersCount = useMemo(() => {
     let n = 0;
-    (["q","exchange","sector","industry","verdict","min_score","max_pe","min_dividend"] as const).forEach((k) => {
+    (["q","exchange","sector","industry","verdict","min_score","max_pe","min_dividend","earnings_within_days_future","earnings_within_days_past"] as const).forEach((k) => {
       if (params[k] !== undefined && params[k] !== "") n++;
     });
     return n;
@@ -126,6 +126,51 @@ export default function ScreenerPage() {
               <input type="number" min={0} step={0.1} className="input"
                      value={params.min_dividend ?? ""} onChange={(e) => update("min_dividend", e.target.value ? Number(e.target.value) : undefined)} />
             </Field>
+
+            {/* Earnings window — split into "next N days" and "last N days".
+                Setting either filters the screener; you can set both. */}
+            <Field label="Reporting in next (days)">
+              <input
+                type="number" min={0} max={365} className="input"
+                placeholder="e.g. 3"
+                value={params.earnings_within_days_future ?? ""}
+                onChange={(e) => update(
+                  "earnings_within_days_future",
+                  e.target.value ? Number(e.target.value) : undefined,
+                )}
+              />
+            </Field>
+            <Field label="Reported in last (days)">
+              <input
+                type="number" min={0} max={365} className="input"
+                placeholder="e.g. 2"
+                value={params.earnings_within_days_past ?? ""}
+                onChange={(e) => update(
+                  "earnings_within_days_past",
+                  e.target.value ? Number(e.target.value) : undefined,
+                )}
+              />
+            </Field>
+            <div className="flex gap-1 flex-wrap pt-1">
+              {/* Quick presets — these are the cases the user mentioned. */}
+              {([
+                { label: "Next 3d", future: 3, past: undefined },
+                { label: "Next 7d", future: 7, past: undefined },
+                { label: "Last 2d", future: undefined, past: 2 },
+                { label: "Last 7d", future: undefined, past: 7 },
+              ]).map(p => (
+                <button
+                  key={p.label}
+                  onClick={() => {
+                    update("earnings_within_days_future", p.future);
+                    update("earnings_within_days_past", p.past);
+                  }}
+                  className="text-[10px] px-2 py-0.5 rounded border border-border bg-bg-subtle text-ink-muted hover:text-ink"
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
           </div>
         </aside>
 

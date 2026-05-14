@@ -6,14 +6,14 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Area, AreaChart,
   RadarChart, PolarGrid, PolarAngleAxis, Radar, PolarRadiusAxis,
 } from "recharts";
-import { api, type BrokerQuoteRow as BrokerQuoteData } from "@/lib/api";
+import { api, type BrokerQuoteRow as BrokerQuoteData, type EarningsBlock, type ShareStructureBlock } from "@/lib/api";
 import { useAuth } from "@/lib/auth-store";
 import { fmtNumber, fmtPercent, fmtMoney, fmtPrice, fmtDate, changeColor, sentimentBadgeClass } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import AIAnalysisModal from "@/components/AIAnalysisModal";
 import {
   RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2, ShoppingCart, Link2, Sparkles,
-  Radio, Wifi, WifiOff, TrendingUp, TrendingDown,
+  Radio, Wifi, WifiOff, TrendingUp, TrendingDown, CalendarClock,
 } from "lucide-react";
 
 export default function StockDetailPage() {
@@ -292,6 +292,17 @@ export default function StockDetailPage() {
             </dl>
           </div>
 
+          {/* Earnings & shares — populated by bulk CSV import. Either block may
+              be absent (CSV didn't have data for this stock yet); render only
+              the parts we have. */}
+          {(stock.earnings || stock.share_structure) && (
+            <EarningsAndSharesCard
+              earnings={stock.earnings}
+              shareStructure={stock.share_structure}
+              currency={stock.currency || ""}
+            />
+          )}
+
           <div className="card p-4">
             <h3 className="text-sm font-semibold mb-3">Company</h3>
             <dl className="space-y-2 text-sm">
@@ -363,6 +374,226 @@ function Stat({ label, value }: { label: string; value: any }) {
       <dt className="text-ink-muted">{label}</dt>
       <dd className="text-right font-mono">{value}</dd>
     </>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Earnings & shares card — bulk-import populated. Both blocks can be null
+// (CSV didn't have data for this stock), in which case the parent skips
+// rendering us at all, but inside the card each subsection is also null-safe
+// so a stock with only earnings (no share structure) renders cleanly.
+// ---------------------------------------------------------------------------
+function EarningsAndSharesCard({
+  earnings, shareStructure, currency,
+}: {
+  earnings: EarningsBlock | null;
+  shareStructure: ShareStructureBlock | null;
+  currency: string;
+}) {
+  return (
+    <div className="card p-4 space-y-4">
+      <h3 className="text-sm font-semibold flex items-center gap-2">
+        <CalendarClock className="size-4" /> Earnings & shares
+      </h3>
+
+      {earnings && (
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-wide text-ink-muted flex items-center justify-between">
+            <span>Earnings calendar</span>
+            {earnings.data_imported_at && (
+              <span className="text-[10px] text-ink-dim normal-case font-normal">
+                imported {fmtDate(earnings.data_imported_at)}
+              </span>
+            )}
+          </div>
+
+          {/* Next earnings — call out the time-to-event prominently because
+              that's the screener filter's actual use case. */}
+          {earnings.next_earnings_date && (
+            <NextEarningsRow
+              date={earnings.next_earnings_date}
+              days={earnings.days_to_next}
+              time={earnings.earnings_time}
+            />
+          )}
+
+          {/* Estimates for that next event. */}
+          {(earnings.est_revenue != null
+            || earnings.est_revenue_growth_pct != null
+            || earnings.est_eps != null) && (
+            <dl className="grid grid-cols-2 gap-y-2 text-sm pt-1">
+              {earnings.est_revenue != null && (
+                <Stat label="Est. revenue" value={fmtMoney(earnings.est_revenue, currency, true)} />
+              )}
+              {earnings.est_revenue_growth_pct != null && (
+                <Stat
+                  label="Est. revenue growth"
+                  value={
+                    <span className={changeColor(earnings.est_revenue_growth_pct)}>
+                      {fmtPercent(earnings.est_revenue_growth_pct)}
+                    </span>
+                  }
+                />
+              )}
+              {earnings.est_eps != null && (
+                <Stat label="Est. EPS" value={fmtNumber(earnings.est_eps, { digits: 2 })} />
+              )}
+            </dl>
+          )}
+
+          {earnings.last_earnings_date && (
+            <dl className="grid grid-cols-2 gap-y-2 text-sm pt-1">
+              <Stat
+                label="Last earnings"
+                value={
+                  <span>
+                    {fmtDate(earnings.last_earnings_date)}
+                    {earnings.days_since_last != null && earnings.days_since_last >= 0 && (
+                      <span className="text-ink-muted ml-1">({earnings.days_since_last}d ago)</span>
+                    )}
+                  </span>
+                }
+              />
+            </dl>
+          )}
+        </div>
+      )}
+
+      {shareStructure && (
+        <div className="space-y-2 pt-1 border-t border-border/40">
+          <div className="text-[10px] uppercase tracking-wide text-ink-muted">
+            Share structure
+          </div>
+
+          {/* Insider / institutional / retail bar. Retail is computed
+              server-side (100 - insiders - institutional). */}
+          {(shareStructure.insiders_pct != null
+            || shareStructure.institutional_pct != null
+            || shareStructure.retail_pct != null) && (
+            <OwnershipBar
+              insiders={shareStructure.insiders_pct}
+              institutional={shareStructure.institutional_pct}
+              retail={shareStructure.retail_pct}
+            />
+          )}
+
+          {/* Share count changes — negative is good (buyback). */}
+          {(shareStructure.shares_change_yoy_pct != null
+            || shareStructure.shares_change_qoq_pct != null) && (
+            <dl className="grid grid-cols-2 gap-y-2 text-sm pt-2">
+              {shareStructure.shares_change_yoy_pct != null && (
+                <Stat
+                  label="Shares Δ (YoY)"
+                  value={
+                    <span className={
+                      shareStructure.shares_change_yoy_pct < 0
+                        ? "text-emerald-500"  // dilution decrease = buyback = good
+                        : shareStructure.shares_change_yoy_pct > 0
+                        ? "text-rose-500"
+                        : ""
+                    }>
+                      {fmtPercent(shareStructure.shares_change_yoy_pct)}
+                    </span>
+                  }
+                />
+              )}
+              {shareStructure.shares_change_qoq_pct != null && (
+                <Stat
+                  label="Shares Δ (QoQ)"
+                  value={
+                    <span className={
+                      shareStructure.shares_change_qoq_pct < 0
+                        ? "text-emerald-500"
+                        : shareStructure.shares_change_qoq_pct > 0
+                        ? "text-rose-500"
+                        : ""
+                    }>
+                      {fmtPercent(shareStructure.shares_change_qoq_pct)}
+                    </span>
+                  }
+                />
+              )}
+            </dl>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function NextEarningsRow({
+  date, days, time,
+}: { date: string; days: number | null; time: string | null }) {
+  // Color the days-to chip by urgency. The screener filter most often picks
+  // "earnings in next 3 days" — call those out in amber, anything sooner
+  // (today / tomorrow) in red.
+  const tone =
+    days == null ? "" :
+    days < 0 ? "text-ink-muted" :       // already past — calendar lagging
+    days <= 1 ? "bg-rose-500/15 text-rose-400" :
+    days <= 3 ? "bg-amber-500/15 text-amber-400" :
+    days <= 7 ? "bg-brand/15 text-brand" :
+    "bg-bg-subtle text-ink-muted";
+  return (
+    <div className="flex items-center justify-between gap-2 bg-bg-subtle/40 rounded px-2 py-1.5">
+      <div>
+        <div className="text-xs text-ink-muted">Next earnings</div>
+        <div className="text-sm font-medium">{fmtDate(date)}</div>
+        {time && <div className="text-[11px] text-ink-dim">{time}</div>}
+      </div>
+      {days != null && (
+        <span className={`text-xs font-medium px-2 py-1 rounded ${tone}`}>
+          {days === 0 ? "today"
+            : days === 1 ? "tomorrow"
+            : days < 0 ? `${-days}d past`
+            : `in ${days}d`}
+        </span>
+      )}
+    </div>
+  );
+}
+
+
+function OwnershipBar({
+  insiders, institutional, retail,
+}: {
+  insiders: number | null;
+  institutional: number | null;
+  retail: number | null;
+}) {
+  // Bar widths. We trust the values to roughly sum to 100, but clamp to
+  // [0, 100] anyway in case the CSV is inconsistent.
+  const i = Math.max(0, Math.min(100, insiders ?? 0));
+  const inst = Math.max(0, Math.min(100, institutional ?? 0));
+  const r = Math.max(0, Math.min(100, retail ?? 0));
+  return (
+    <div className="space-y-1.5">
+      <div className="h-2 w-full rounded overflow-hidden bg-bg-subtle flex">
+        {i > 0 && <div style={{ width: `${i}%` }} className="bg-amber-500/70" title={`Insiders ${i.toFixed(1)}%`} />}
+        {inst > 0 && <div style={{ width: `${inst}%` }} className="bg-sky-500/70" title={`Institutional ${inst.toFixed(1)}%`} />}
+        {r > 0 && <div style={{ width: `${r}%` }} className="bg-emerald-500/70" title={`Retail ${r.toFixed(1)}%`} />}
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-xs">
+        <OwnershipLegend dot="bg-amber-500/70" label="Insiders" value={insiders} />
+        <OwnershipLegend dot="bg-sky-500/70" label="Institut." value={institutional} />
+        <OwnershipLegend dot="bg-emerald-500/70" label="Retail" value={retail} />
+      </div>
+    </div>
+  );
+}
+
+
+function OwnershipLegend({ dot, label, value }: { dot: string; label: string; value: number | null }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className={`size-2 rounded-full ${dot}`} />
+      <span className="text-ink-muted">{label}</span>
+      <span className="ml-auto font-mono text-[11px]">
+        {value != null ? `${value.toFixed(1)}%` : "—"}
+      </span>
+    </div>
   );
 }
 

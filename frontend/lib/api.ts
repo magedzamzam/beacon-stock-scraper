@@ -88,6 +88,27 @@ export interface ScoreBreakdown {
   model_version: string;
 }
 
+export interface EarningsBlock {
+  last_earnings_date: string | null;
+  next_earnings_date: string | null;
+  earnings_time: string | null;
+  est_revenue: number | null;
+  est_revenue_growth_pct: number | null;
+  est_eps: number | null;
+  days_to_next: number | null;
+  days_since_last: number | null;
+  data_imported_at: string | null;
+}
+
+export interface ShareStructureBlock {
+  shares_change_yoy_pct: number | null;
+  shares_change_qoq_pct: number | null;
+  insiders_pct: number | null;
+  institutional_pct: number | null;
+  retail_pct: number | null;
+  period_end: string | null;
+}
+
 export interface StockDetail extends StockSummary {
   isin: string | null;
   founded_year: number | null;
@@ -112,6 +133,9 @@ export interface StockDetail extends StockSummary {
   change_pct: number | null;
   price_source: "broker" | "scrape" | null;
   price_fetched_at: string | null;
+  // Earnings + share structure (from bulk CSV import). Either can be null.
+  earnings: EarningsBlock | null;
+  share_structure: ShareStructureBlock | null;
 }
 
 export interface PriceHistoryPoint {
@@ -147,6 +171,12 @@ export interface ScreenerParams {
   min_score?: number;
   max_pe?: number;
   min_dividend?: number;
+  // Earnings calendar window. Each can be set independently.
+  //   earnings_within_days_future=3 → companies with next earnings in next 3 days
+  //   earnings_within_days_past=2   → companies that reported in last 2 days
+  // Setting both OR-s them.
+  earnings_within_days_future?: number;
+  earnings_within_days_past?: number;
   sort_by?: string;
   sort_dir?: "asc" | "desc";
   limit?: number;

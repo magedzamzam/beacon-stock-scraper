@@ -498,9 +498,34 @@ class StockFinStatement(Base):
     eps_growth_3y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     eps_growth_5y: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     profitable_years: Mapped[Optional[int]] = mapped_column(Integer)
+    # Share structure (slow-moving, attached to the latest period snapshot)
+    shares_change_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    shares_change_qoq: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    shares_insiders_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    shares_institutional_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("stock_id", "period_end", "period_type", "is_estimate"),)
+
+
+class StockEarningsCalendar(Base):
+    """One row per stock — latest known earnings calendar + analyst estimates.
+
+    Populated by the bulk CSV importer. The screener filter
+    'earnings within N days' queries the indexed next_earnings_date column.
+    """
+    __tablename__ = "stock_earnings_calendar"
+    stock_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("stocks.id", ondelete="CASCADE"), primary_key=True,
+    )
+    last_earnings_date: Mapped[Optional[date]] = mapped_column(Date)
+    next_earnings_date: Mapped[Optional[date]] = mapped_column(Date)
+    earnings_time: Mapped[Optional[str]] = mapped_column(String(16))
+    est_revenue: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    est_revenue_growth_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    est_eps: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    source: Mapped[Optional[str]] = mapped_column(String(32), default="bulk_import")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class StockFinCashflow(Base):

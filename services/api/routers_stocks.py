@@ -7,12 +7,12 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from shared.db import (
     Exchange, Stock, StockAnalystConsensus, StockNews,
-    StockQuote, StockHistoryQuote, StockCurQuote,
+    StockQuote, StockHistoryQuote, StockCurQuote, StockEarningsCalendar,
     StockFinRatios, StockFinStatement, StockMktTechnicals, StockScoring,
 )
 from .auth import get_db
@@ -79,9 +79,15 @@ def screener(
     min_score: Optional[float] = None,
     max_pe: Optional[float] = None,
     min_dividend: Optional[float] = None,
+    # Earnings calendar filters. Either or both can be set:
+    #   earnings_within_days_future=3 → next_earnings_date BETWEEN today AND today+3
+    #   earnings_within_days_past=2   → last_earnings_date BETWEEN today-2 AND today
+    # When both are set the conditions are OR-ed: "in either window".
+    earnings_within_days_past: Optional[int] = Query(None, ge=0, le=365),
+    earnings_within_days_future: Optional[int] = Query(None, ge=0, le=365),
     sort_by: str = Query(
         "composite_score",
-        pattern="^(composite_score|market_cap|last_close|last_change_pct|dividend_yield_pct|pe_ratio|rsi_14|ticker)$",
+        pattern="^(composite_score|market_cap|last_close|last_change_pct|dividend_yield_pct|pe_ratio|rsi_14|ticker|next_earnings_date|last_earnings_date)$",
     ),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=500),
@@ -91,6 +97,7 @@ def screener(
         select(*_SUMMARY_COLS)
         .join(Exchange, Stock.exchange_id == Exchange.id)
         .outerjoin(StockQuote, StockQuote.stock_id == Stock.id)
+        .outerjoin(StockEarningsCalendar, StockEarningsCalendar.stock_id == Stock.id)
         .where(Stock.active.is_(True))
     )
     if q:
@@ -111,6 +118,25 @@ def screener(
     if min_dividend is not None:
         base = base.where(StockQuote.dividend_yield_pct >= min_dividend)
 
+    # Earnings window. Build a list of OR clauses and OR them together so
+    # both "past" and "future" can match.
+    if earnings_within_days_past is not None or earnings_within_days_future is not None:
+        from datetime import date as _date, timedelta as _td
+        today = _date.today()
+        clauses = []
+        if earnings_within_days_future is not None:
+            end = today + _td(days=earnings_within_days_future)
+            clauses.append(
+                StockEarningsCalendar.next_earnings_date.between(today, end)
+            )
+        if earnings_within_days_past is not None:
+            start = today - _td(days=earnings_within_days_past)
+            clauses.append(
+                StockEarningsCalendar.last_earnings_date.between(start, today)
+            )
+        if clauses:
+            base = base.where(or_(*clauses))
+
     total = db.execute(select(func.count()).select_from(base.subquery())).scalar() or 0
 
     sort_col_map = {
@@ -122,6 +148,8 @@ def screener(
         "pe_ratio": StockQuote.pe_ratio,
         "rsi_14": StockQuote.rsi_14,
         "ticker": Stock.ticker,
+        "next_earnings_date": StockEarningsCalendar.next_earnings_date,
+        "last_earnings_date": StockEarningsCalendar.last_earnings_date,
     }
     col = sort_col_map[sort_by]
     base = base.order_by(desc(col).nullslast() if sort_dir == "desc" else col.asc().nullslast())
@@ -197,6 +225,59 @@ def stock_detail(exchange: str, ticker: str, db: Session = Depends(get_db)):
         .where(StockAnalystConsensus.stock_id == row.id)
         .order_by(desc(StockAnalystConsensus.consensus_date)).limit(1)
     ).scalars().first()
+    earnings_row = db.execute(
+        select(StockEarningsCalendar)
+        .where(StockEarningsCalendar.stock_id == row.id)
+    ).scalars().first()
+
+    # Earnings block: dates + estimates + computed "days from today" deltas.
+    # We compute days_to_next / days_since_last server-side so the frontend
+    # doesn't have to redo the math, and so the screener filter and the detail
+    # page agree on what 'today' means.
+    earnings_block = None
+    if earnings_row is not None:
+        from datetime import date as _date
+        today = _date.today()
+        d_next = (earnings_row.next_earnings_date - today).days if earnings_row.next_earnings_date else None
+        d_last = (today - earnings_row.last_earnings_date).days if earnings_row.last_earnings_date else None
+        from .schemas import EarningsBlock
+        earnings_block = EarningsBlock(
+            last_earnings_date=earnings_row.last_earnings_date,
+            next_earnings_date=earnings_row.next_earnings_date,
+            earnings_time=earnings_row.earnings_time,
+            est_revenue=_f(earnings_row.est_revenue),
+            est_revenue_growth_pct=_f(earnings_row.est_revenue_growth_pct),
+            est_eps=_f(earnings_row.est_eps),
+            days_to_next=d_next,
+            days_since_last=d_last,
+            data_imported_at=earnings_row.updated_at,
+        )
+
+    # Share structure block: read from latest non-estimate fin statement.
+    # Retail % is derived (100 - insiders - institutional) — never stored.
+    share_block = None
+    if fin_stmt is not None and (
+        fin_stmt.shares_insiders_pct is not None
+        or fin_stmt.shares_institutional_pct is not None
+        or fin_stmt.shares_change_yoy is not None
+        or fin_stmt.shares_change_qoq is not None
+    ):
+        retail = None
+        if (fin_stmt.shares_insiders_pct is not None
+                and fin_stmt.shares_institutional_pct is not None):
+            retail = 100.0 - float(fin_stmt.shares_insiders_pct) - float(fin_stmt.shares_institutional_pct)
+            # Clamp tiny rounding negatives — they're meaningless and look like bugs.
+            if -0.5 < retail < 0:
+                retail = 0.0
+        from .schemas import ShareStructureBlock
+        share_block = ShareStructureBlock(
+            shares_change_yoy_pct=_f(fin_stmt.shares_change_yoy),
+            shares_change_qoq_pct=_f(fin_stmt.shares_change_qoq),
+            insiders_pct=_f(fin_stmt.shares_insiders_pct),
+            institutional_pct=_f(fin_stmt.shares_institutional_pct),
+            retail_pct=retail,
+            period_end=fin_stmt.period_end,
+        )
 
     summary = _row_to_summary(row)
     return StockDetail(
@@ -221,6 +302,10 @@ def stock_detail(exchange: str, ticker: str, db: Session = Depends(get_db)):
         change_pct=_f(row.change_pct),
         price_source=row.price_source,
         price_fetched_at=row.price_fetched_at,
+        # Earnings + share structure (from bulk CSV import). Either may be null
+        # if the stock wasn't covered in the latest CSV upload.
+        earnings=earnings_block,
+        share_structure=share_block,
     )
 
 

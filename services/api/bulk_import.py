@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 from shared.db import (
     Exchange, Stock, StockBulkImport, StockBulkImportRaw,
     StockCurQuote,
+    StockEarningsCalendar,
     StockFinCashflow, StockFinRatios, StockFinStatement,
     StockHistoryQuote, StockMktDividends, StockMktTechnicals, StockQuote,
 )
@@ -284,7 +285,7 @@ def _upsert_fin_ratios(db: Session, stock_id: int, row: dict[str, Any]) -> None:
 
 
 def _upsert_fin_statement(db: Session, stock_id: int, row: dict[str, Any]) -> None:
-    """P&L items + growth metrics → stock_fin_statement (TTM)."""
+    """P&L items + growth metrics + share structure → stock_fin_statement (TTM)."""
     period_end = parse_date(_G(row, "Last Report Date")) or date.today()
     payload = {
         "last_report_date":  period_end,
@@ -305,16 +306,67 @@ def _upsert_fin_statement(db: Session, stock_id: int, row: dict[str, Any]) -> No
         "eps_growth_3y":             parse_number(_G(row, "EPS Growth 3Y")),
         "eps_growth_5y":             parse_number(_G(row, "EPS Growth 5Y")),
         "profitable_years":          parse_int(_G(row, "Profit Years")),
+        # Share structure
+        "shares_change_yoy":         parse_number(_G(row, "Shares Ch. (YoY)")),
+        "shares_change_qoq":         parse_number(_G(row, "Shares Ch. (QoQ)")),
+        "shares_insiders_pct":       parse_number(_G(row, "Shares Insiders")),
+        "shares_institutional_pct":  parse_number(_G(row, "Shares Institut.")),
         "scraped_at":                datetime.utcnow(),
     }
-    if not any(v is not None for v in (payload["revenue"], payload["net_income"],
-                                        payload["ebitda"], payload["eps_diluted"])):
+    # Gate the whole write only when we have NOTHING — revenue, EBITDA, EPS,
+    # AND no share-structure data. Allows rows that only have shares info
+    # (e.g. early-stage companies with no reported revenue yet).
+    if not any(v is not None for v in (
+        payload["revenue"], payload["net_income"],
+        payload["ebitda"], payload["eps_diluted"],
+        payload["shares_change_yoy"], payload["shares_change_qoq"],
+        payload["shares_insiders_pct"], payload["shares_institutional_pct"],
+    )):
         return
     stmt = pg_insert(StockFinStatement).values(
         stock_id=stock_id, period_end=period_end, period_type="TTM",
         is_estimate=False, **payload,
     ).on_conflict_do_update(
         index_elements=["stock_id", "period_end", "period_type", "is_estimate"],
+        set_=payload,
+    )
+    db.execute(stmt)
+
+
+def _upsert_earnings_calendar(db: Session, stock_id: int, row: dict[str, Any]) -> None:
+    """Earnings calendar + analyst estimates → stock_earnings_calendar.
+
+    The CSV gives us:
+        Last Earnings  / Earnings Date  → last_earnings_date
+                                          (these are identical in stockanalysis.com
+                                          exports, but we prefer Last Earnings)
+        Next Earnings                    → next_earnings_date
+        Earnings Time                    → 'Before Open' | 'After Close' | ...
+        Est. Revenue, Est. Rev. Growth   → forward estimates for the next event
+        Est. EPS
+
+    One row per stock (UPSERT on stock_id). If the CSV has no earnings data at
+    all for this row, we skip the write entirely.
+    """
+    payload = {
+        "last_earnings_date":     parse_date(_G(row, "Last Earnings", "Earnings Date")),
+        "next_earnings_date":     parse_date(_G(row, "Next Earnings")),
+        "earnings_time":          parse_str(_G(row, "Earnings Time")),
+        "est_revenue":            parse_number(_G(row, "Est. Revenue")),
+        "est_revenue_growth_pct": parse_number(_G(row, "Est. Rev. Growth", "Est. Revenue Growth")),
+        "est_eps":                parse_number(_G(row, "Est. EPS")),
+        "source":                 "bulk_import",
+        "updated_at":             datetime.utcnow(),
+    }
+    if not any(v is not None for v in (
+        payload["last_earnings_date"], payload["next_earnings_date"],
+        payload["earnings_time"], payload["est_revenue"],
+        payload["est_revenue_growth_pct"], payload["est_eps"],
+    )):
+        return
+    stmt = pg_insert(StockEarningsCalendar).values(stock_id=stock_id, **payload)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id"],
         set_=payload,
     )
     db.execute(stmt)
@@ -533,6 +585,7 @@ def execute_bulk_import(
                     _upsert_fin_cashflow(db, stock.id, row)
                     _upsert_dividends(db, stock.id, row)
                     _upsert_technicals(db, stock.id, row)
+                    _upsert_earnings_calendar(db, stock.id, row)
                     _recompute_quote(db, stock.id, row)
 
                     # Preserve the raw row for future re-mapping
