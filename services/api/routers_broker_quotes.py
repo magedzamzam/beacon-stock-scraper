@@ -252,8 +252,11 @@ async def stock_bars(
     If the stock has mappings on multiple brokers and the caller didn't pin
     one, we pick the first tradeable one. 409 if no mapping exists.
     """
-    if db.get(Stock, stock_id) is None:
-        raise HTTPException(404, "Stock not found")
+    stock_row = db.get(Stock, stock_id)
+    if stock_row is None:
+        # Be specific in the error — caller may be hitting this with a stale
+        # ID from a cached SWR response. Frontend should reload.
+        raise HTTPException(404, f"Stock id={stock_id} not found in database")
 
     q = select(BrokerInstrument).where(
         BrokerInstrument.stock_id == stock_id,
@@ -264,7 +267,28 @@ async def stock_bars(
         q = q.where(BrokerInstrument.broker_id == broker_id)
     mapping = db.execute(q.limit(1)).scalar_one_or_none()
     if mapping is None:
-        raise HTTPException(409, "No broker mapping for this stock")
+        # Distinguish the two failure modes the user actually cares about:
+        # (a) the stock has no broker mapping at all → user needs to "Map symbol"
+        # (b) the stock IS mapped but to a different broker than requested
+        if broker_id is not None:
+            any_mapping = db.execute(
+                select(BrokerInstrument).where(
+                    BrokerInstrument.stock_id == stock_id,
+                    BrokerInstrument.is_tradeable.is_(True),
+                    BrokerInstrument.broker_symbol.is_not(None),
+                ).limit(1)
+            ).scalar_one_or_none()
+            if any_mapping is not None:
+                raise HTTPException(
+                    409,
+                    f"{stock_row.ticker} has no tradeable mapping on broker_id={broker_id}. "
+                    f"It is mapped to broker_id={any_mapping.broker_id} ({any_mapping.broker_symbol}).",
+                )
+        raise HTTPException(
+            409,
+            f"No tradeable broker mapping for {stock_row.ticker}. "
+            f"Map this stock to a broker first under 'Map symbol'.",
+        )
 
     params = {
         "symbol": mapping.broker_symbol,
@@ -277,10 +301,21 @@ async def stock_bars(
         params["to_ts"] = to_ts
 
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            f"{_GATEWAY_URL}/brokers/{mapping.broker_id}/bars",
-            params=params,
-        )
+        try:
+            r = await client.get(
+                f"{_GATEWAY_URL}/brokers/{mapping.broker_id}/bars",
+                params=params,
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                502,
+                f"broker_gateway unreachable: {type(exc).__name__}: {exc}",
+            )
         if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+            # Pass the gateway's error verbatim so we can see "endpoint missing"
+            # vs "auth failed" vs "broker rate-limited".
+            raise HTTPException(
+                r.status_code,
+                f"broker_gateway returned {r.status_code}: {r.text[:300]}",
+            )
         return r.json()
