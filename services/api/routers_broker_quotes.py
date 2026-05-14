@@ -229,3 +229,58 @@ async def refresh_broker_quotes(
             refreshed.append({"broker_id": m.broker_id, "broker_symbol": m.broker_symbol})
 
     return {"refreshed": refreshed, "failed": failed}
+
+
+# ----------------------------------------------------------------------------
+# Bars endpoint — for the on-demand live chart at /stock/.../chart.
+# Resolves the stock's broker mapping, then proxies to broker_gateway's
+# /brokers/{id}/bars. Pure pass-through — nothing persisted.
+# ----------------------------------------------------------------------------
+@broker_quotes_router.get("/{stock_id}/bars")
+async def stock_bars(
+    stock_id: int,
+    resolution: str = "MINUTE_5",
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
+    max_bars: int = 200,
+    broker_id: Optional[int] = None,
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Historical bars for charting. Requires a broker mapping.
+
+    If the stock has mappings on multiple brokers and the caller didn't pin
+    one, we pick the first tradeable one. 409 if no mapping exists.
+    """
+    if db.get(Stock, stock_id) is None:
+        raise HTTPException(404, "Stock not found")
+
+    q = select(BrokerInstrument).where(
+        BrokerInstrument.stock_id == stock_id,
+        BrokerInstrument.is_tradeable.is_(True),
+        BrokerInstrument.broker_symbol.is_not(None),
+    )
+    if broker_id is not None:
+        q = q.where(BrokerInstrument.broker_id == broker_id)
+    mapping = db.execute(q.limit(1)).scalar_one_or_none()
+    if mapping is None:
+        raise HTTPException(409, "No broker mapping for this stock")
+
+    params = {
+        "symbol": mapping.broker_symbol,
+        "resolution": resolution,
+        "max_bars": str(max_bars),
+    }
+    if from_ts:
+        params["from_ts"] = from_ts
+    if to_ts:
+        params["to_ts"] = to_ts
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{_GATEWAY_URL}/brokers/{mapping.broker_id}/bars",
+            params=params,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        return r.json()

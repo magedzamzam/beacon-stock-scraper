@@ -313,3 +313,86 @@ class CapitalComAdapter(BrokerAdapter):
             market_status=snap.get("marketStatus"),
             raw=data,
         )
+
+    # ---- Historical bars (for the on-demand chart) -------------------------
+    # Capital.com's GET /api/v1/prices/{epic} supports:
+    #   resolution = MINUTE | MINUTE_5 | MINUTE_15 | MINUTE_30
+    #              | HOUR    | HOUR_4
+    #              | DAY     | WEEK     | MONTH
+    #   from / to  = ISO timestamps (YYYY-MM-DDTHH:MM:SS) — both optional
+    #   max        = number of bars (default 10, max 1000)
+    #
+    # Each price has open/close/high/low as {bid, ask} pairs. We return mid
+    # prices, matching what get_quote() uses for last_price.
+    _VALID_RESOLUTIONS = {
+        "MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30",
+        "HOUR", "HOUR_4",
+        "DAY", "WEEK", "MONTH",
+    }
+
+    async def get_bars(
+        self,
+        broker_symbol: str,
+        resolution: str = "MINUTE_5",
+        *,
+        from_ts: Optional[str] = None,
+        to_ts: Optional[str] = None,
+        max_bars: int = 200,
+    ) -> List[dict]:
+        """Fetch OHLC bars for an epic at a given resolution.
+
+        Returns a list of bar dicts shaped for the frontend:
+            [{"t": iso_ts, "o": float, "h": float, "l": float, "c": float, "v": int}, ...]
+        sorted oldest → newest. Empty list when the API returns no prices.
+        Network/auth errors propagate as BrokerError subclasses.
+        """
+        if not broker_symbol:
+            raise BrokerError("broker_symbol (epic) is required")
+        if resolution not in self._VALID_RESOLUTIONS:
+            raise BrokerError(
+                f"Unsupported resolution '{resolution}'. "
+                f"Allowed: {sorted(self._VALID_RESOLUTIONS)}"
+            )
+        # Capital's `max` cap is 1000; clamp here so a buggy caller can't 4xx us.
+        max_bars = max(1, min(int(max_bars), 1000))
+        params: Dict[str, str] = {"resolution": resolution, "max": str(max_bars)}
+        if from_ts:
+            params["from"] = from_ts
+        if to_ts:
+            params["to"] = to_ts
+
+        data = await self._request("GET", f"/api/v1/prices/{broker_symbol}", params=params)
+        prices = data.get("prices") or []
+
+        out: List[dict] = []
+        for p in prices:
+            # Each leg is {"bid": float, "ask": float}. Mid = (bid+ask)/2.
+            def _mid(leg: Optional[dict]) -> Optional[float]:
+                if not isinstance(leg, dict):
+                    return None
+                bid, ask = leg.get("bid"), leg.get("ask")
+                if bid is None and ask is None:
+                    return None
+                if bid is None:
+                    return float(ask)
+                if ask is None:
+                    return float(bid)
+                return (float(bid) + float(ask)) / 2.0
+
+            o = _mid(p.get("openPrice"))
+            h = _mid(p.get("highPrice"))
+            l = _mid(p.get("lowPrice"))
+            c = _mid(p.get("closePrice"))
+            # Drop bars where we couldn't recover an open or close — they're
+            # useless for charting and would confuse client-side rendering.
+            if o is None or c is None:
+                continue
+            out.append({
+                "t": p.get("snapshotTime") or p.get("snapshotTimeUTC"),
+                "o": o, "h": h, "l": l, "c": c,
+                "v": p.get("lastTradedVolume"),
+            })
+        # Capital returns newest-last already, but be defensive in case
+        # we ever switch the param ordering.
+        out.sort(key=lambda b: b["t"] or "")
+        return out

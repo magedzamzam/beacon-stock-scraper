@@ -11,9 +11,10 @@ import { useAuth } from "@/lib/auth-store";
 import { fmtNumber, fmtPercent, fmtMoney, fmtPrice, fmtDate, changeColor, sentimentBadgeClass } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
 import AIAnalysisModal from "@/components/AIAnalysisModal";
+import LiveChartModal from "@/components/LiveChartModal";
 import {
   RefreshCw, ExternalLink, Plus, Star, ThumbsUp, ThumbsDown, Newspaper, BarChart3, Settings2, ShoppingCart, Link2, Sparkles,
-  Radio, Wifi, WifiOff, TrendingUp, TrendingDown, CalendarClock,
+  Radio, Wifi, WifiOff, TrendingUp, TrendingDown, CalendarClock, Activity,
 } from "lucide-react";
 
 export default function StockDetailPage() {
@@ -1090,6 +1091,10 @@ function BrokerQuoteCard({
   );
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  // Live monitor modal is opened from this card because that's where the user
+  // already sees their broker mapping; if no quote is available the card
+  // doesn't render at all, so the button hides automatically.
+  const [liveMonitorOpen, setLiveMonitorOpen] = useState(false);
 
   async function refresh() {
     setRefreshing(true);
@@ -1135,10 +1140,21 @@ function BrokerQuoteCard({
         <h3 className="text-sm font-semibold flex items-center gap-2">
           <Radio className="size-4 text-brand" /> Live broker quote
         </h3>
-        <button onClick={refresh} disabled={refreshing} className="btn-ghost text-xs">
-          <RefreshCw className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} />
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Only meaningful when there's a tradeable mapping — and that's
+              the only case this whole card renders, so safe to always show. */}
+          <button
+            onClick={() => setLiveMonitorOpen(true)}
+            className="btn-ghost text-xs"
+            title="Open candlestick chart with live updates"
+          >
+            <Activity className="size-3.5" /> Live monitor
+          </button>
+          <button onClick={refresh} disabled={refreshing} className="btn-ghost text-xs">
+            <RefreshCw className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} />
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
       </div>
 
       {refreshError && (
@@ -1150,6 +1166,20 @@ function BrokerQuoteCard({
           <BrokerQuoteRow key={`${q.broker_id}-${q.broker_symbol}`} q={q} stockCurrency={currency} />
         ))}
       </div>
+
+      {liveMonitorOpen && (
+        <LiveChartModal
+          stockId={stockId}
+          ticker={ticker}
+          exchange={exchange}
+          currency={currency || ""}
+          /* If multiple brokers are mapped, the proxy picks the first one
+             when broker_id is omitted — that matches the quote card's row
+             order, so the chart aligns with whatever the user is looking at. */
+          brokerId={quotes[0]?.broker_id}
+          onClose={() => setLiveMonitorOpen(false)}
+        />
+      )}
     </div>
   );
 }

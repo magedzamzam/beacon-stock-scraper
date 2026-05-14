@@ -518,7 +518,51 @@ export const api = {
       { method: "POST" },
     );
   },
+
+  // Historical OHLC bars for the live chart. Backed by Capital.com's
+  // /api/v1/prices endpoint via broker_gateway. Pure pass-through — nothing
+  // is persisted. 409 when the stock has no broker mapping.
+  stockBars: (stock_id: number, params: BarsParams) => {
+    const qs = new URLSearchParams();
+    qs.set("resolution", params.resolution);
+    if (params.max_bars != null) qs.set("max_bars", String(params.max_bars));
+    if (params.from_ts) qs.set("from_ts", params.from_ts);
+    if (params.to_ts) qs.set("to_ts", params.to_ts);
+    if (params.broker_id != null) qs.set("broker_id", String(params.broker_id));
+    return request<BarsResponse>(`/stocks/${stock_id}/bars?${qs.toString()}`);
+  },
 };
+
+// ===== Bars (live chart) =====
+export type BarResolution =
+  | "MINUTE" | "MINUTE_5" | "MINUTE_15" | "MINUTE_30"
+  | "HOUR" | "HOUR_4"
+  | "DAY" | "WEEK" | "MONTH";
+
+export interface BarsParams {
+  resolution: BarResolution;
+  max_bars?: number;
+  from_ts?: string;
+  to_ts?: string;
+  broker_id?: number;
+}
+
+export interface OhlcBar {
+  t: string;               // Capital.com snapshot time, "YYYY/MM/DD HH:MM:SS"
+  o: number;
+  h: number | null;
+  l: number | null;
+  c: number;
+  v: number | null;
+}
+
+export interface BarsResponse {
+  broker_id: number;
+  symbol: string;
+  resolution: BarResolution;
+  fetched_at: string;
+  bars: OhlcBar[];
+}
 
 // ===== Live broker quote types =====
 export interface BrokerQuoteRow {

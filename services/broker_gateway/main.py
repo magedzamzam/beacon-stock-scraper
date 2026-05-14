@@ -507,3 +507,65 @@ async def get_quotes_batch(broker_id: int, body: BatchQuoteRequest):
 
 
 
+
+# ----------------------------------------------------------------------------
+# Historical bars (for the on-demand chart). Pass-through to the adapter.
+# Not persisted — frontend polls this endpoint and renders directly. Keeping
+# it out of the DB means the feature can be removed cleanly later.
+# ----------------------------------------------------------------------------
+_BARS_RESOLUTIONS = {
+    "MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30",
+    "HOUR", "HOUR_4",
+    "DAY", "WEEK", "MONTH",
+}
+
+
+@app.get("/brokers/{broker_id}/bars")
+async def get_bars(
+    broker_id: int,
+    symbol: str,
+    resolution: str = "MINUTE_5",
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
+    max_bars: int = 200,
+):
+    """Historical OHLC bars at a given resolution for an epic.
+
+    Uses the cached adapter so the chart doesn't trigger a fresh session per
+    timeframe change. Resolution validated against the Capital.com whitelist.
+    """
+    if not symbol:
+        raise HTTPException(400, "symbol is required")
+    if resolution not in _BARS_RESOLUTIONS:
+        raise HTTPException(
+            400,
+            f"Unsupported resolution. Allowed: {sorted(_BARS_RESOLUTIONS)}",
+        )
+    account_id = _resolve_quote_account(broker_id)
+
+    for attempt in (1, 2):
+        entry = await _get_cached_adapter(account_id)
+        try:
+            async with entry.lock:
+                if not hasattr(entry.adapter, "get_bars"):
+                    raise HTTPException(
+                        404,
+                        f"Broker '{entry.broker.name}' does not support historical bars",
+                    )
+                bars = await entry.adapter.get_bars(
+                    symbol, resolution=resolution,
+                    from_ts=from_ts, to_ts=to_ts, max_bars=max_bars,
+                )
+            return {
+                "broker_id": broker_id,
+                "symbol": symbol,
+                "resolution": resolution,
+                "fetched_at": datetime.utcnow().isoformat(),
+                "bars": bars,
+            }
+        except AuthError:
+            await _invalidate_adapter(account_id)
+            if attempt == 2:
+                raise HTTPException(401, "Broker auth failed after retry")
+        except BrokerError as exc:
+            raise HTTPException(_broker_error_to_status(exc), str(exc))

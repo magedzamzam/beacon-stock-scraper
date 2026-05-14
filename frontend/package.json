@@ -17,7 +17,8 @@
     "zustand": "5.0.1",
     "clsx": "2.1.1",
     "tailwind-merge": "2.5.4",
-    "swr": "2.2.5"
+    "swr": "2.2.5",
+    "lightweight-charts": "4.2.1"
   },
   "devDependencies": {
     "@types/node": "22.9.0",
