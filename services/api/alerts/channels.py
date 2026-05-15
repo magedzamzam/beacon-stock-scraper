@@ -87,11 +87,11 @@ class TelegramChannel(Channel):
         chat_id = self.config.get("chat_id")
         if not token or not chat_id:
             return False, "missing bot_token or chat_id"
-        #text_body = f"*{title}*\n\n{body or ''}".strip()
+        text_body = f"*{title}*\n\n{body or ''}".strip()
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = urllib.parse.urlencode({
             "chat_id": chat_id,
-            "text": body[:4000],
+            "text": text_body[:4000],
             # "parse_mode": "Markdown",
         }).encode("utf-8")
         try:
