@@ -508,8 +508,8 @@ class StockFinStatement(Base):
     shares_institutional_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     # Net Cash, Total Debt, and Shares Outstanding Calculation
     shares_outstanding: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
-    net_cash: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
-    total_debt: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    net_cash: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    total_debt: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("stock_id", "period_end", "period_type", "is_estimate"),)
