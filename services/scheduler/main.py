@@ -7,11 +7,12 @@ replace_existing=True. Admin UI edits propagate without restart.
 Each scheduled run writes a row to job_runs so the admin can audit it.
 
 Job kinds today:
-    job.scrape_daily_quotes      -> POST /scrape/all (mode='daily')  on scraper
-    job.scrape_fundamentals      -> POST /scrape/all (mode='full')   on scraper
+    job.scrape_news              -> POST /scrape/all on scraper (news only)
     job.score_recompute          -> POST /score/all/sync             on recommender
                                     + POST /score/portfolio/sync
     job.account_stats_snapshot   -> in-process (snapshot_all_accounts)
+    job.broker_quote_refresh     -> POST /brokers/{id}/quotes/batch on gateway
+    job.alerts_evaluate          -> in-process (api.alerts.engine.evaluate_all)
 """
 from __future__ import annotations
 
@@ -43,11 +44,11 @@ BROKER_GATEWAY_URL = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway
 # Default crons mirror routers_settings.KNOWN_JOBS so a fresh DB without
 # seeded settings still gets reasonable behaviour.
 DEFAULT_JOBS = {
-    "job.scrape_daily_quotes": "0 16 * * *",
-    "job.scrape_fundamentals": "0 3 1 * *",
+    "job.scrape_news":         "0 16 * * *",
     "job.score_recompute":     "30 16 * * *",
     "job.account_stats_snapshot": "15 */6 * * *",
     "job.broker_quote_refresh": "5 * * * *",
+    "job.alerts_evaluate":     "* * * * *",   # every minute
 }
 
 
@@ -91,31 +92,21 @@ async def _scrape_with_mode(mode: str, exchanges: list[str]):
         return r.json()
 
 
-async def run_scrape_daily_quotes():
-    """Light daily scrape: OHLC + technicals + analyst + news."""
-    cfg = _read_job_cfg("job.scrape_daily_quotes")
+async def run_scrape_news():
+    """Daily news scrape — runs the (now news-only) scraper across all
+    enabled stocks. Replaces job.scrape_daily_quotes + job.scrape_fundamentals
+    (those did the same thing after the scraper was trimmed to news-only).
+    """
+    cfg = _read_job_cfg("job.scrape_news")
     if not cfg.get("enabled", True):
         return
-    rid, started = _start_run("job.scrape_daily_quotes")
+    rid, started = _start_run("job.scrape_news")
     try:
+        # mode arg is kept for caller compatibility; the scraper ignores it.
         summary = await _scrape_with_mode("daily", cfg.get("exchanges") or [])
         _finish_run(rid, started, "ok", summary=summary)
     except Exception as exc:
-        log.exception("scrape_daily_quotes_failed", error=str(exc))
-        _finish_run(rid, started, "failed", error=str(exc))
-
-
-async def run_scrape_fundamentals():
-    """Heavy monthly scrape: full fundamentals + valuation."""
-    cfg = _read_job_cfg("job.scrape_fundamentals")
-    if not cfg.get("enabled", True):
-        return
-    rid, started = _start_run("job.scrape_fundamentals")
-    try:
-        summary = await _scrape_with_mode("full", cfg.get("exchanges") or [])
-        _finish_run(rid, started, "ok", summary=summary)
-    except Exception as exc:
-        log.exception("scrape_fundamentals_failed", error=str(exc))
+        log.exception("scrape_news_failed", error=str(exc))
         _finish_run(rid, started, "failed", error=str(exc))
 
 
@@ -399,12 +390,32 @@ async def run_broker_quote_refresh():
         _finish_run(rid, started, "failed", error=str(exc))
 
 
+async def run_alerts_evaluate():
+    """Per-minute alert evaluation.
+
+    Calls the shared engine directly. The scheduler image copies just the
+    api/alerts package (no fastapi import-time cost) — see Dockerfile.
+    """
+    cfg = _read_job_cfg("job.alerts_evaluate")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.alerts_evaluate")
+    try:
+        from api.alerts.engine import evaluate_all
+        with SessionLocal() as session:
+            summary = evaluate_all(session)
+        _finish_run(rid, started, "ok", summary=summary)
+    except Exception as exc:
+        log.exception("alerts_evaluate_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
+
+
 JOB_HANDLERS = {
-    "job.scrape_daily_quotes": run_scrape_daily_quotes,
-    "job.scrape_fundamentals": run_scrape_fundamentals,
+    "job.scrape_news": run_scrape_news,
     "job.score_recompute": run_score_recompute,
     "job.account_stats_snapshot": run_account_stats_snapshot,
     "job.broker_quote_refresh": run_broker_quote_refresh,
+    "job.alerts_evaluate": run_alerts_evaluate,
 }
 
 

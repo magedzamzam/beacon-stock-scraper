@@ -39,17 +39,12 @@ _RECOMMENDER_URL = os.environ.get("RECOMMENDER_URL", "http://recommender:8002")
 # Each entry describes a scheduled job to the UI. cron field validation is
 # light: we let APScheduler reject malformed crons at apply-time.
 KNOWN_JOBS: dict[str, dict[str, Any]] = {
-    "job.scrape_daily_quotes": {
-        "label": "Daily quote scrape",
-        "purpose": "OHLC + technicals + analyst consensus + news. Light, fast.",
+    "job.scrape_news": {
+        "label": "Daily news scrape",
+        "purpose": "Pulls news headlines for each stock. Financial / "
+                   "fundamental data comes from bulk CSV imports — not scraped.",
         "supports_exchanges": True,
         "default_cron": "0 16 * * *",
-    },
-    "job.scrape_fundamentals": {
-        "label": "Monthly fundamentals scrape",
-        "purpose": "Revenue, EPS, balance sheet, growth metrics. Heavy.",
-        "supports_exchanges": True,
-        "default_cron": "0 3 1 * *",
     },
     "job.score_recompute": {
         "label": "Recompute composite scores",
@@ -68,6 +63,13 @@ KNOWN_JOBS: dict[str, dict[str, Any]] = {
         "purpose": "Hourly: pulls bid/offer/OHLC from brokers for stocks with a mapping.",
         "supports_exchanges": False,
         "default_cron": "5 * * * *",
+    },
+    "job.alerts_evaluate": {
+        "label": "Alert evaluation",
+        "purpose": "Evaluates enabled alert rules and dispatches notifications. "
+                   "Runs every minute; per-rule interval/cooldown control fire rate.",
+        "supports_exchanges": False,
+        "default_cron": "* * * * *",
     },
 }
 
@@ -186,19 +188,11 @@ async def run_job(
     summary = None
     error = None
     try:
-        if key == "job.scrape_daily_quotes":
+        if key == "job.scrape_news":
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
                     f"{_SCRAPER_URL}/scrape/all",
                     json={"mode": "daily", "exchanges": exchanges or None},
-                )
-                r.raise_for_status()
-                summary = r.json()
-        elif key == "job.scrape_fundamentals":
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    f"{_SCRAPER_URL}/scrape/all",
-                    json={"mode": "full", "exchanges": exchanges or None},
                 )
                 r.raise_for_status()
                 summary = r.json()
@@ -375,6 +369,11 @@ async def run_job(
             db.commit()
             return {"status": "skipped",
                     "message": "Account snapshots run on the next scheduler tick."}
+        elif key == "job.alerts_evaluate":
+            # Run the alert engine in-process. evaluate_all is idempotent and
+            # cheap; the cooldown machinery prevents flapping.
+            from .alerts.engine import evaluate_all
+            summary = evaluate_all(db)
     except Exception as exc:
         error = str(exc)
 

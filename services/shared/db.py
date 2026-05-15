@@ -687,6 +687,76 @@ class StockBulkImportRaw(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+# =============================================================================
+# Alerts module (migration 012)
+# =============================================================================
+class AlertChannel(Base):
+    """Where an alert goes — email, telegram, webhook, sms."""
+    __tablename__ = "alert_channels"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AlertRule(Base):
+    """A rule that fires alerts when its condition is met."""
+    __tablename__ = "alert_rules"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    rule_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    stock_filter: Mapped[Optional[dict]] = mapped_column(JSONB)
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AlertRuleChannel(Base):
+    """M2M wiring of rules to channels."""
+    __tablename__ = "alert_rule_channels"
+    rule_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("alert_rules.id", ondelete="CASCADE"), primary_key=True,
+    )
+    channel_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("alert_channels.id", ondelete="CASCADE"), primary_key=True,
+    )
+
+
+class AlertEvent(Base):
+    """A fired alert — audit log + dedup state.
+
+    Dedup: when evaluating, we look up the most recent event per (rule_id,
+    stock_id) and skip firing if fired_at + cooldown_seconds > now.
+    """
+    __tablename__ = "alert_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("alert_rules.id", ondelete="CASCADE"), nullable=False,
+    )
+    stock_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("stocks.id", ondelete="SET NULL"),
+    )
+    fired_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[Optional[str]] = mapped_column(Text)
+    delivery: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+
 # ---------- Engine factory ----------
 _settings = get_settings()
 _engine = create_engine(_settings.database_url_sync, pool_pre_ping=True, pool_size=10)

@@ -403,6 +403,42 @@ export const api = {
   adminBulkImportHistory: (limit = 25) =>
     request<BulkImportHistoryEntry[]>(`/admin/imports/bulk/history?limit=${limit}`),
 
+  // ===== Alerts =====
+  alertsMeta: () => request<AlertsMeta>("/admin/alerts/meta"),
+  alertChannels: () => request<AlertChannelRow[]>("/admin/alerts/channels"),
+  createAlertChannel: (body: AlertChannelInput) =>
+    request<AlertChannelRow>("/admin/alerts/channels", {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  updateAlertChannel: (id: number, body: Partial<AlertChannelInput>) =>
+    request<AlertChannelRow>(`/admin/alerts/channels/${id}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  deleteAlertChannel: (id: number) =>
+    request<{ deleted: number }>(`/admin/alerts/channels/${id}`, { method: "DELETE" }),
+  alertRules: () => request<AlertRuleRow[]>("/admin/alerts/rules"),
+  createAlertRule: (body: AlertRuleInput) =>
+    request<AlertRuleRow>("/admin/alerts/rules", {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  updateAlertRule: (id: number, body: Partial<AlertRuleInput>) =>
+    request<AlertRuleRow>(`/admin/alerts/rules/${id}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  deleteAlertRule: (id: number) =>
+    request<{ deleted: number }>(`/admin/alerts/rules/${id}`, { method: "DELETE" }),
+  testFireAlertRule: (id: number) =>
+    request<{ delivery: Record<string, { status: string; error: string | null }> }>(
+      `/admin/alerts/rules/${id}/test-fire`, { method: "POST" },
+    ),
+  evaluateAlertsNow: () =>
+    request<AlertsEvaluateSummary>("/admin/alerts/evaluate-now", { method: "POST" }),
+  alertEvents: (limit = 50, ruleId?: number) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (ruleId != null) qs.set("rule_id", String(ruleId));
+    return request<AlertEventRow[]>(`/admin/alerts/events?${qs.toString()}`);
+  },
+
   // ===== Brokers / accounts =====
   listBrokers: () =>
     request<BrokerInfo[]>("/accounts/brokers"),
@@ -845,4 +881,92 @@ export interface BulkImportHistoryEntry {
   rows_skipped: number;
   rows_errored: number;
   error_message: string | null;
+}
+
+// ===== Alerts =====
+// One entry in a rule/channel schema — drives dynamic form rendering.
+export interface AlertSchemaField {
+  name: string;
+  type: "text" | "number" | "select" | "textarea" | "password";
+  label: string;
+  required?: boolean;
+  default?: string | number | boolean;
+  options?: string[];     // for type=select
+  placeholder?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+}
+
+export interface AlertRuleType {
+  key: string;
+  label: string;
+  description: string;
+  params_schema: AlertSchemaField[];
+}
+
+export interface AlertChannelType {
+  key: string;
+  label: string;
+  config_schema: AlertSchemaField[];
+}
+
+export interface AlertsMeta {
+  rules: AlertRuleType[];
+  channels: AlertChannelType[];
+}
+
+export interface AlertChannelInput {
+  name: string;
+  channel_type: string;
+  config: Record<string, unknown>;
+  is_active?: boolean;
+}
+
+export interface AlertChannelRow extends AlertChannelInput {
+  id: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AlertRuleInput {
+  name: string;
+  rule_type: string;
+  params: Record<string, unknown>;
+  stock_filter?: Record<string, unknown> | null;
+  interval_seconds: number;
+  cooldown_seconds: number;
+  is_enabled?: boolean;
+  channel_ids: number[];
+}
+
+export interface AlertRuleRow extends AlertRuleInput {
+  id: number;
+  is_enabled: boolean;
+  last_evaluated_at: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AlertEventRow {
+  id: number;
+  rule_id: number;
+  rule_name: string;
+  stock_id: number | null;
+  fired_at: string;
+  title: string;
+  body: string | null;
+  delivery: Record<string, { status: string; error: string | null }>;
+  snapshot: Record<string, unknown> | null;
+}
+
+export interface AlertsEvaluateSummary {
+  rules_total: number;
+  rules_evaluated: number;
+  rules_skipped_interval: number;
+  rules_errored: number;
+  alerts_fired: number;
+  alerts_skipped_cooldown: number;
 }
