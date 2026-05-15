@@ -105,10 +105,11 @@ class StockMetrics:
     # quality
     debt_to_equity: Optional[float] = None
     current_ratio: Optional[float] = None
-    cash_per_share: Optional[float] = None
+    fcf_yield: Optional[float] = None
     # risk
     beta: Optional[float] = None
     free_float_pct: Optional[float] = None
+    cash_per_share: Optional[float] = None
 
 
 @dataclass
@@ -302,6 +303,25 @@ def score_quality(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         else: s = 60
         parts.append(s)
         if m.current_ratio < 1: cons.append(f"Liquidity tight (current ratio {m.current_ratio:.2f})")
+        
+    if m.fcf_yield is not None:
+        if fcf_yield > 0.08:
+            # Strong: > 8% yield
+            s = 100.0
+            pros.append(f"Strong cash generator (FCF Yield {fcf_yield:.1%})")
+        elif fcf_yield > 0.03:
+            # Neutral/Stable: 3% - 8%
+            s = 70.0
+        elif 0 <= fcf_yield <= 0.03:
+            # Weak: 0% - 3%
+            s = 40.0
+            cons.append(f"Lean cash flow (FCF Yield {fcf_yield:.1%})")
+        else:
+            # Critical: Negative FCF
+            s = 10.0
+            cons.append(f"Negative Free Cash Flow — burning capital")
+            
+        parts.append(s)
 
     return sum(parts) / len(parts) if parts else 50.0
 
@@ -332,7 +352,30 @@ def score_risk(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
             parts.append(40)
         else:
             parts.append(15)
-
+    
+    if m.cash_per_share is not None and m.last_close:
+        # Calculate Net Cash as a % of Stock Price
+        # A negative percentage means debt exceeds cash
+        cash_position_pct = (m.cash_per_share / m.last_close) * 100
+        
+        if cash_position_pct < -50:
+            # Critical: Debt is > 50% of the market cap
+            s = 90.0
+            cons.append(f"Heavy net debt (Net Cash/Price: {cash_position_pct:.1f}%)")
+        elif cash_position_pct < -10:
+            # Weak/High Risk: Significant leverage
+            s = 60.0
+            cons.append(f"Significant leverage (Net Cash/Price: {cash_position_pct:.1f}%)")
+        elif cash_position_pct < 0:
+            # Neutral: Manageable debt
+            s = 30.0
+        else:
+            # Strong: Company is debt-free (Net Cash Positive)
+            s = 5.0
+            pros.append(f"Net cash positive ({m.cash_per_share:.2f}/share)")
+            
+        parts.append(s)
+        
     return sum(parts) / len(parts) if parts else 30.0
 
 

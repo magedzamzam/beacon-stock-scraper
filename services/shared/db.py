@@ -469,6 +469,7 @@ class StockFinRatios(Base):
     fcf_per_share: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     current_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     debt_to_equity: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    fcf_yield: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     snapshot_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     snapshot_market_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -505,6 +506,10 @@ class StockFinStatement(Base):
     shares_change_qoq: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     shares_insiders_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     shares_institutional_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    # Net Cash, Total Debt, and Shares Outstanding Calculation
+    shares_outstanding: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    net_cash: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    total_debt: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("stock_id", "period_end", "period_type", "is_estimate"),)

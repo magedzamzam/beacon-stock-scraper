@@ -119,9 +119,14 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
             net_margin = float(fin[0].net_income) / float(fin[0].revenue) * 100
         except ZeroDivisionError:
             pass
-
-    # --- ROE & debt/equity require balance-sheet data, not in new schema yet.
-    debt_eq = None
+            
+    # --- Derived: Net Cash per Share --
+    net_cpc = None
+    if fin and fin[0].net_cash and fin[0].shares_outstanding:
+        try:
+            net_cpc = float(fin[0].net_cash) / float(fin[0].shares_outstanding)
+        except ZeroDivisionError:
+            pass
 
     return StockMetrics(
         revenue_growth_pct=rev_growth,
@@ -148,6 +153,8 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
         current_ratio=_f(ratios.current_ratio if ratios else None),
         beta=_f(tech.beta if tech else None),
         free_float_pct=None,
+        fcf_yield=_f(ratios.fcf_yield if ratios else None),
+        cash_per_share=net_cpc,
     )
 
 

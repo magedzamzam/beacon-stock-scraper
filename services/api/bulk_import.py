@@ -274,6 +274,7 @@ def _upsert_fin_ratios(db: Session, stock_id: int, row: dict[str, Any]) -> None:
         "scraped_at": datetime.utcnow(),
         "current_ratio":    parse_number(_G(row, "Current Ratio")),
         "debt_to_equity":   parse_number(_G(row, "Debt / Equity")),
+        "fcf_yield": parse_number(_G(row, "FCF Yield")),
     }
     if not any(v is not None for v in payload.values() if not isinstance(v, datetime)):
         return
@@ -313,6 +314,10 @@ def _upsert_fin_statement(db: Session, stock_id: int, row: dict[str, Any]) -> No
         "shares_change_qoq":         parse_number(_G(row, "Shares Ch. (QoQ)")),
         "shares_insiders_pct":       parse_number(_G(row, "Shares Insiders")),
         "shares_institutional_pct":  parse_number(_G(row, "Shares Institut.")),
+        # Cash
+        "shares_outstanding":       parse_number(_G(row, "Shares")),
+        "net_cash":                 parse_number(_G(row, "Net Cash")),
+        "total_debt":               parse_number(_G(row, "Total Debt")),
         "scraped_at":                datetime.utcnow(),
     }
     # Gate the whole write only when we have NOTHING — revenue, EBITDA, EPS,
