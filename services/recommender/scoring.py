@@ -292,8 +292,8 @@ def score_quality(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         else:
             # 0 = 100, 1 = 60, 2 = 30, 3+ = 10
             s = clamp(100 - m.debt_to_equity * 30)
-            if m.debt_to_equity < 0.3: pros.append(f"Low leverage (D/E {m.debt_to_equity:.2f})")
-            elif m.debt_to_equity > 2: cons.append(f"High leverage (D/E {m.debt_to_equity:.2f})")
+            if m.debt_to_equity < 0.3: pros.append(f"Low leverage (Debt/Equity {m.debt_to_equity:.2f})")
+            elif m.debt_to_equity > 2: cons.append(f"High leverage (Debt/Equity {m.debt_to_equity:.2f})")
         parts.append(s)
 
     if m.current_ratio is not None:
@@ -305,17 +305,17 @@ def score_quality(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         if m.current_ratio < 1: cons.append(f"Liquidity tight (current ratio {m.current_ratio:.2f})")
         
     if m.fcf_yield is not None:
-        if fcf_yield > 0.08:
+        if m.fcf_yield > 0.08:
             # Strong: > 8% yield
             s = 100.0
-            pros.append(f"Strong cash generator (FCF Yield {fcf_yield:.1%})")
-        elif fcf_yield > 0.03:
+            pros.append(f"Strong cash generator (FCF Yield {m.fcf_yield:.1%})")
+        elif m.fcf_yield > 0.03:
             # Neutral/Stable: 3% - 8%
             s = 70.0
-        elif 0 <= fcf_yield <= 0.03:
+        elif 0 <= m.fcf_yield <= 0.03:
             # Weak: 0% - 3%
             s = 40.0
-            cons.append(f"Lean cash flow (FCF Yield {fcf_yield:.1%})")
+            cons.append(f"Lean cash flow (FCF Yield {m.fcf_yield:.1%})")
         else:
             # Critical: Negative FCF
             s = 10.0
