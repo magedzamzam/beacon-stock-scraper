@@ -64,8 +64,8 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     "xai": {
         "label": "Grok",
         "default_model": "grok-4-fast",
-        "base_url": "https://api.x.ai/v1",
-        "chat_path": "/responses",
+        "base_url": "https://api.x.ai",
+        "chat_path": "/v1/chat/completions",
         "auth_header": "Authorization",
         "auth_prefix": "Bearer",
         "system_header": None,
