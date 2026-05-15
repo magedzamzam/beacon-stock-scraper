@@ -121,13 +121,12 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
             pass
 
     # --- ROE & debt/equity require balance-sheet data, not in new schema yet.
-    roe = None
     debt_eq = None
 
     return StockMetrics(
         revenue_growth_pct=rev_growth,
         net_margin_pct=net_margin,
-        roe_pct=roe,
+        roe_pct=_f(ratios.roe if ratios else None),
         pe_ratio=_f(ratios.pe_ratio if ratios else None),
         pb_ratio=_f(ratios.pb_ratio if ratios else None),
         ev_ebitda=_f(ratios.ev_ebitda if ratios else None),
@@ -145,7 +144,8 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
         analyst_rating=ana.rating if ana else None,
         analyst_count=ana.analyst_count if ana else None,
         analyst_upside_pct=_f(ana.implied_upside_pct if ana else None),
-        debt_to_equity=debt_eq,
+        debt_to_equity=_f(ratios.debt_to_equity if ratios else None),
+        current_ratio=_f(ratios.current_ratio if ratios else None),
         beta=_f(tech.beta if tech else None),
         free_float_pct=None,
     )
