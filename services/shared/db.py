@@ -507,7 +507,7 @@ class StockFinStatement(Base):
     shares_insiders_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     shares_institutional_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     # Net Cash, Total Debt, and Shares Outstanding Calculation
-    shares_outstanding: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
+    shares_outstanding: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     net_cash: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     total_debt: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
