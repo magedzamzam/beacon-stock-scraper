@@ -91,7 +91,7 @@ class TelegramChannel(Channel):
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = urllib.parse.urlencode({
             "chat_id": chat_id,
-            "text": text_body[:4000],
+            "text": body[:4000],
             # "parse_mode": "Markdown",
         }).encode("utf-8")
         try:
