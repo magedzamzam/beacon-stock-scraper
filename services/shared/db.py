@@ -467,6 +467,8 @@ class StockFinRatios(Base):
     roic: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     sbc_revenue_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6))
     fcf_per_share: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    current_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    debt_to_equity: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     snapshot_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     snapshot_market_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
