@@ -7,7 +7,8 @@ replace_existing=True. Admin UI edits propagate without restart.
 Each scheduled run writes a row to job_runs so the admin can audit it.
 
 Job kinds today:
-    job.scrape_news              -> POST /scrape/all on scraper (news only)
+    job.scrape_daily             -> POST /scrape/all on scraper (mode=daily)
+    job.scrape_weekly            -> POST /scrape/all on scraper (mode=weekly)
     job.score_recompute          -> POST /score/all/sync             on recommender
                                     + POST /score/portfolio/sync
     job.account_stats_snapshot   -> in-process (snapshot_all_accounts)
@@ -44,11 +45,12 @@ BROKER_GATEWAY_URL = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway
 # Default crons mirror routers_settings.KNOWN_JOBS so a fresh DB without
 # seeded settings still gets reasonable behaviour.
 DEFAULT_JOBS = {
-    "job.scrape_news":         "0 16 * * *",
+    "job.scrape_daily":         "0 16 * * *",       # daily: overview page only
+    "job.scrape_weekly":        "0 3 * * 0",        # Sundays 03:00: deep scrape
     "job.score_recompute":     "30 16 * * *",
     "job.account_stats_snapshot": "15 */6 * * *",
     "job.broker_quote_refresh": "5 * * * *",
-    "job.alerts_evaluate":     "* * * * *",   # every minute
+    "job.alerts_evaluate":     "* * * * *",
 }
 
 
@@ -92,21 +94,35 @@ async def _scrape_with_mode(mode: str, exchanges: list[str]):
         return r.json()
 
 
-async def run_scrape_news():
-    """Daily news scrape — runs the (now news-only) scraper across all
-    enabled stocks. Replaces job.scrape_daily_quotes + job.scrape_fundamentals
-    (those did the same thing after the scraper was trimmed to news-only).
+async def run_scrape_daily():
+    """Daily-tier scrape: overview page only (price, change, news, today's
+    history row, refreshed quote cache).
     """
-    cfg = _read_job_cfg("job.scrape_news")
+    cfg = _read_job_cfg("job.scrape_daily")
     if not cfg.get("enabled", True):
         return
-    rid, started = _start_run("job.scrape_news")
+    rid, started = _start_run("job.scrape_daily")
     try:
-        # mode arg is kept for caller compatibility; the scraper ignores it.
         summary = await _scrape_with_mode("daily", cfg.get("exchanges") or [])
         _finish_run(rid, started, "ok", summary=summary)
     except Exception as exc:
-        log.exception("scrape_news_failed", error=str(exc))
+        log.exception("scrape_daily_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
+
+
+async def run_scrape_weekly():
+    """Weekly-tier scrape: all slow-changing pages (financials, ratios,
+    statistics, forecast, ratings). Heavy — runs once per week.
+    """
+    cfg = _read_job_cfg("job.scrape_weekly")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.scrape_weekly")
+    try:
+        summary = await _scrape_with_mode("weekly", cfg.get("exchanges") or [])
+        _finish_run(rid, started, "ok", summary=summary)
+    except Exception as exc:
+        log.exception("scrape_weekly_failed", error=str(exc))
         _finish_run(rid, started, "failed", error=str(exc))
 
 
@@ -411,7 +427,8 @@ async def run_alerts_evaluate():
 
 
 JOB_HANDLERS = {
-    "job.scrape_news": run_scrape_news,
+    "job.scrape_daily": run_scrape_daily,
+    "job.scrape_weekly": run_scrape_weekly,
     "job.score_recompute": run_score_recompute,
     "job.account_stats_snapshot": run_account_stats_snapshot,
     "job.broker_quote_refresh": run_broker_quote_refresh,

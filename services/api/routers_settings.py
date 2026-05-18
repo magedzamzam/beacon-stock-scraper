@@ -39,12 +39,19 @@ _RECOMMENDER_URL = os.environ.get("RECOMMENDER_URL", "http://recommender:8002")
 # Each entry describes a scheduled job to the UI. cron field validation is
 # light: we let APScheduler reject malformed crons at apply-time.
 KNOWN_JOBS: dict[str, dict[str, Any]] = {
-    "job.scrape_news": {
-        "label": "Daily news scrape",
-        "purpose": "Pulls news headlines for each stock. Financial / "
-                   "fundamental data comes from bulk CSV imports — not scraped.",
+    "job.scrape_daily": {
+        "label": "Daily scrape (overview)",
+        "purpose": "Light: overview page only — price, change, news, today's "
+                   "OHLC row, refreshed quote cache. Throttled across the day.",
         "supports_exchanges": True,
         "default_cron": "0 16 * * *",
+    },
+    "job.scrape_weekly": {
+        "label": "Weekly scrape (financials)",
+        "purpose": "Heavy: financials, balance sheet, cashflow, ratios, "
+                   "forecast, ratings, statistics. Runs once a week.",
+        "supports_exchanges": True,
+        "default_cron": "0 3 * * 0",
     },
     "job.score_recompute": {
         "label": "Recompute composite scores",
@@ -188,11 +195,19 @@ async def run_job(
     summary = None
     error = None
     try:
-        if key == "job.scrape_news":
+        if key == "job.scrape_daily":
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
                     f"{_SCRAPER_URL}/scrape/all",
                     json={"mode": "daily", "exchanges": exchanges or None},
+                )
+                r.raise_for_status()
+                summary = r.json()
+        elif key == "job.scrape_weekly":
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{_SCRAPER_URL}/scrape/all",
+                    json={"mode": "weekly", "exchanges": exchanges or None},
                 )
                 r.raise_for_status()
                 summary = r.json()

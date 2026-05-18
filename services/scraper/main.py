@@ -1,14 +1,16 @@
-"""Scraper microservice — exposes a small HTTP API.
+"""Scraper microservice HTTP API.
 
 Endpoints:
     GET  /healthz
-    POST /scrape/all                  -> kicks off a scrape (background task)
-                                         body: {"mode": "daily"|"full",
-                                                "exchanges": ["adx",...]}
-    POST /scrape/{exchange}/{ticker}  -> on-demand re-scrape one stock
+    POST /scrape/all                      kick off a batch scrape
+                                          body: {"mode": "daily"|"weekly",
+                                                 "exchanges": ["adx",...]}
+    POST /scrape/{exchange}/{ticker}      re-scrape one stock on demand
+                                          query: ?mode=daily|weekly (default daily)
 
-The scheduler now calls /scrape/all with different mode + exchange filters
-for the daily-quotes job vs. the monthly-fundamentals job.
+The scheduler calls /scrape/all with mode='daily' on the daily tick and
+mode='weekly' on the weekly tick. 'full' is also accepted as a synonym for
+'weekly' for backward-compat with the old API.
 """
 from __future__ import annotations
 
@@ -21,12 +23,14 @@ from shared.logging_setup import configure_logging
 from .pipeline import scrape_all_active, scrape_by_ticker
 
 log = configure_logging("scraper-api")
-app = FastAPI(title="Beacon Scraper", version="1.0.0")
+app = FastAPI(title="Beacon Scraper", version="2.0.0")
+
+_VALID_MODES = {"daily", "weekly", "full"}
 
 
 class ScrapeAllRequest(BaseModel):
-    mode: str = "full"                          # "daily" or "full"
-    exchanges: Optional[list[str]] = None       # None/[] means all
+    mode: str = "daily"
+    exchanges: Optional[list[str]] = None
 
 
 @app.get("/healthz")
@@ -35,26 +39,22 @@ def healthz():
 
 
 @app.post("/scrape/all")
-async def scrape_all(background: BackgroundTasks, req: Optional[ScrapeAllRequest] = None):
-    """Kick off a scrape in the background and return immediately.
-
-    Without a body: full scrape, all exchanges (legacy behaviour).
-    With a body: caller picks mode + exchange filter.
-    """
+async def scrape_all(background: BackgroundTasks,
+                     req: Optional[ScrapeAllRequest] = None):
+    """Kick off a scrape in the background and return immediately."""
     if req is None:
         req = ScrapeAllRequest()
-    if req.mode not in ("daily", "full"):
-        raise HTTPException(400, "mode must be 'daily' or 'full'")
+    if req.mode not in _VALID_MODES:
+        raise HTTPException(400, f"mode must be one of {_VALID_MODES}")
     background.add_task(scrape_all_active, mode=req.mode, exchanges=req.exchanges)
     return {
         "queued": True, "mode": req.mode,
         "exchanges": req.exchanges or "all",
-        "message": f"{req.mode.capitalize()} scrape started in background.",
     }
 
 
 @app.post("/scrape/{exchange}/{ticker}")
-async def scrape_single(exchange: str, ticker: str):
-    if exchange.lower() not in {"adx", "dfm", "egx", "nasdaq", "nyse"}:
-        raise HTTPException(400, "exchange must be one of: adx, dfm, egx, nasdaq, nyse")
-    return await scrape_by_ticker(exchange, ticker)
+async def scrape_single(exchange: str, ticker: str, mode: str = "daily"):
+    if mode not in _VALID_MODES:
+        raise HTTPException(400, f"mode must be one of {_VALID_MODES}")
+    return await scrape_by_ticker(exchange, ticker, mode=mode)
