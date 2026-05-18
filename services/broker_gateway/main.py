@@ -430,7 +430,7 @@ class BatchQuoteRequest(BaseModel):
     # whatever set of mappings they have; if a broker is connected but has
     # zero tradeable instruments yet, we'd rather return an empty batch than
     # 422 and break the loop. max_length still bounds the per-call cost.
-    symbols: list[str] = Field(default_factory=list, max_length=500)
+    symbols: list[str] = Field(default_factory=list, max_length=1500)
 
 
 @app.post("/brokers/{broker_id}/quotes/batch")
