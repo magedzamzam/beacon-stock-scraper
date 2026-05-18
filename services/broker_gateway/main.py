@@ -442,6 +442,7 @@ async def get_quotes_batch(broker_id: int, body: BatchQuoteRequest):
     error and moves on. Auth failure mid-batch invalidates the cache and the
     rest of the batch retries through a fresh session.
     """
+    log.info(f"Batch quote request for broker={broker_id}, symbols_count={len(body.symbols)}, first_5={body.symbols[:5]}")
     if not body.symbols:
         return {
             "broker_id": broker_id,
