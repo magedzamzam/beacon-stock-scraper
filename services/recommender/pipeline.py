@@ -123,18 +123,6 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
         .limit(1)
     ).scalar_one_or_none()
 
-    # --- Derived: revenue growth YoY ---
-    rev_growth = None
-    if fin:
-        rev_growth = _f(fin[0].revenue_growth_yoy)
-        if rev_growth is None and len(fin) >= 2:
-            rev_growth = _safe_div(
-                float(fin[0].revenue) - float(fin[1].revenue),
-                float(fin[1].revenue)
-            )
-            if rev_growth is not None:
-                rev_growth *= 100
-
     # --- Derived: net margin ---
     net_margin = None
     if fin and fin[0].revenue and fin[0].net_income:
@@ -165,7 +153,7 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
 
     return StockMetrics(
         sector=sector,
-        revenue_growth_pct=rev_growth,
+        revenue_growth_pct=_f(fin[0].revenue_growth_yoy if fin else None),
         net_margin_pct=net_margin,
         roe_pct=_f(ratios.roe if ratios else None),
         eps_growth_pct=_f(fin[0].eps_growth_yoy if fin else None),
