@@ -168,7 +168,7 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
         revenue_growth_pct=rev_growth,
         net_margin_pct=net_margin,
         roe_pct=_f(ratios.roe if ratios else None),
-        eps_growth_pct=_f(ratios.eps_growth_yoy if ratios else None),
+        eps_growth_pct=_f(fin[0].eps_growth_yoy if fin else None),
         gross_margin_pct=gross_margin,
         revenue_growth_3y_cagr=rev_cagr_3y,
         pe_ratio=_f(ratios.pe_ratio if ratios else None),
