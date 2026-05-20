@@ -14,7 +14,7 @@ import {
 // per request, so we fetch up to 100 once and paginate client-side — keeps
 // the home page snappy and avoids round-tripping on every page change.
 const EARNINGS_FETCH_CAP = 100;
-const EARNINGS_PAGE_SIZE = 10;
+const EARNINGS_PAGE_SIZE = 7;
 
 export default function DashboardPage() {
   const { data: topBuy } = useSWR("dashboard:top-buy", () =>
