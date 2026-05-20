@@ -50,6 +50,7 @@ def _row_to_summary(r) -> StockSummary:
         composite_score=_f(r.composite_score),
         verdict=r.verdict, last_updated=r.last_updated,
         next_earnings_date=getattr(r, "next_earnings_date", None),
+        earnings_time=getattr(r, "earnings_time", None),
     )
 
 
