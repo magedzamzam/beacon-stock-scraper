@@ -470,6 +470,7 @@ class StockFinRatios(Base):
     current_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     debt_to_equity: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     fcf_yield: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    z_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(9, 3))
     snapshot_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     snapshot_market_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

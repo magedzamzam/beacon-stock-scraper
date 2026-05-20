@@ -1,4 +1,4 @@
-"""Scoring engine — v2.0 (Sector-Aware, Enhanced Risk, New Indicators).
+"""Scoring engine — v2.0 (Sector-Aware, Enhanced Risk, Schema-Validated).
 
 Philosophy
 ----------
@@ -16,8 +16,8 @@ Sub-scores
   technical_score   : RSI sweet-spot, price vs SMA50/SMA200, 52w position
   analyst_score     : consensus rating + upside vs target price
   quality_score     : balance-sheet strength (debt/equity, current ratio, FCF)
-  risk_score        : penalty (high beta, drawdown, low free-float, cash position,
-                     earnings volatility, concentration risk)
+  risk_score        : penalty (high beta, drawdown, cash position, Altman Z,
+                     earnings volatility proxy, insider ownership)
 
 Composite = sum(weight_i * sub_score_i) - weight_risk * (risk - 30)
 
@@ -132,17 +132,16 @@ class StockMetrics:
     net_margin_pct: Optional[float] = None
     roe_pct: Optional[float] = None
     eps_growth_pct: Optional[float] = None
-    gross_margin_pct: Optional[float] = None          # NEW v2.0
-    revenue_growth_3y_cagr: Optional[float] = None     # NEW v2.0
-    earnings_volatility: Optional[float] = None        # NEW v2.0 (std dev YoY EPS)
+    gross_margin_pct: Optional[float] = None          # v2.0
+    revenue_growth_3y_cagr: Optional[float] = None     # v2.0
 
     # valuation
     pe_ratio: Optional[float] = None
     pb_ratio: Optional[float] = None
     ev_ebitda: Optional[float] = None
-    ps_ratio: Optional[float] = None                   # NEW v2.0 — stock_fin_ratios.ps_ratio
-    ev_sales: Optional[float] = None                   # NEW v2.0 — stock_fin_ratios.ev_sales
-    peg_ratio: Optional[float] = None                  # NEW v2.0 — stock_fin_ratios.peg_ratio
+    ps_ratio: Optional[float] = None                   # v2.0
+    ev_sales: Optional[float] = None                   # v2.0
+    peg_ratio: Optional[float] = None                  # v2.0
     dividend_yield_pct: Optional[float] = None
 
     # momentum
@@ -168,16 +167,15 @@ class StockMetrics:
     debt_to_equity: Optional[float] = None
     current_ratio: Optional[float] = None
     fcf_yield: Optional[float] = None
-    roic_pct: Optional[float] = None                   # NEW v2.0
-    cfo_to_net_income: Optional[float] = None          # NEW v2.0
-    interest_coverage: Optional[float] = None          # NEW v2.0
+    roic_pct: Optional[float] = None                   # v2.0
+    cfo_to_net_income: Optional[float] = None          # v2.0
 
     # risk
     beta: Optional[float] = None
-    free_float_pct: Optional[float] = None
+    free_float_pct: Optional[float] = None             # may be None if not in schema
     cash_per_share: Optional[float] = None
-    altman_z_score: Optional[float] = None             # NEW v2.0
-    insider_ownership_pct: Optional[float] = None      # NEW v2.0
+    z_score: Optional[float] = None                    # v2.0 — schema column is z_score
+    shares_insiders_pct: Optional[float] = None        # v2.0 — from fin_statement
 
 
 @dataclass
@@ -193,8 +191,8 @@ class ScoreResult:
     verdict:     str = "WATCH"
     pros: list[str] = field(default_factory=list)
     cons: list[str] = field(default_factory=list)
-    data_completeness_pct: float = 0.0                 # NEW v2.0
-    confidence: str = "MEDIUM"                         # NEW v2.0
+    data_completeness_pct: float = 0.0                 # v2.0
+    confidence: str = "MEDIUM"                         # v2.0
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +281,7 @@ def score_fundamental(m: StockMetrics, pros: list[str], cons: list[str]) -> floa
         s = 50 + min(50, m.eps_growth_pct * 1.2)
         parts.append(clamp(s))
 
-    # NEW v2.0 — Gross margin (moat proxy)
+    # v2.0 — Gross margin (moat proxy)
     if m.gross_margin_pct is not None:
         if m.gross_margin_pct > 50:
             s = 95.0
@@ -297,7 +295,7 @@ def score_fundamental(m: StockMetrics, pros: list[str], cons: list[str]) -> floa
             cons.append(f"Thin gross margin ({m.gross_margin_pct:.1f}%)")
         parts.append(s)
 
-    # NEW v2.0 — 3Y revenue CAGR (sustainability)
+    # v2.0 — 3Y revenue CAGR (sustainability)
     if m.revenue_growth_3y_cagr is not None:
         s = 50 + min(50, m.revenue_growth_3y_cagr * 1.5)
         parts.append(clamp(s))
@@ -305,14 +303,6 @@ def score_fundamental(m: StockMetrics, pros: list[str], cons: list[str]) -> floa
             pros.append(f"Consistent 3Y revenue CAGR ({m.revenue_growth_3y_cagr:.1f}%)")
         elif m.revenue_growth_3y_cagr < 0:
             cons.append(f"Revenue shrinking over 3Y ({m.revenue_growth_3y_cagr:.1f}%)")
-
-    # NEW v2.0 — Earnings volatility (penalty for erratic earnings)
-    if m.earnings_volatility is not None:
-        # Lower volatility = higher score.  0% vol = 100, 50% vol = 20
-        s = clamp(100 - m.earnings_volatility * 1.6)
-        parts.append(s)
-        if m.earnings_volatility > 40:
-            cons.append(f"High earnings volatility ({m.earnings_volatility:.1f}%)")
 
     return sum(parts) / len(parts) if parts else 50.0
 
@@ -344,9 +334,8 @@ def score_valuation(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         s = 100 - clamp((m.ev_ebitda - 6) * 4)
         parts.append(clamp(s))
 
-    # NEW v2.0 — P/S (critical for unprofitable growth stocks)
+    # v2.0 — P/S (critical for unprofitable growth stocks)
     if m.ps_ratio is not None and m.ps_ratio > 0:
-        # P/S < 2 = great, 2-5 = fair, 5-10 = pricey, >10 = expensive
         if m.ps_ratio < 2:
             s = 90.0
             pros.append(f"Low P/S ({m.ps_ratio:.1f})")
@@ -359,7 +348,7 @@ def score_valuation(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
             cons.append(f"High P/S ({m.ps_ratio:.1f})")
         parts.append(clamp(s))
 
-    # NEW v2.0 — EV/Sales
+    # v2.0 — EV/Sales
     if m.ev_sales is not None and m.ev_sales > 0:
         if m.ev_sales < 2:
             s = 90.0
@@ -371,9 +360,8 @@ def score_valuation(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
             s = 25.0 - min(15.0, (m.ev_sales - 10) / 10 * 15.0)
         parts.append(clamp(s))
 
-    # NEW v2.0 — PEG Ratio
+    # v2.0 — PEG Ratio
     if m.peg_ratio is not None and m.peg_ratio > 0:
-        # PEG < 1 = undervalued growth, 1-2 = fair, >2 = overvalued
         if m.peg_ratio < 0.8:
             s = 95.0
             pros.append(f"Attractive PEG ({m.peg_ratio:.2f})")
@@ -392,7 +380,7 @@ def score_valuation(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         parts.append(s)
         if m.dividend_yield_pct >= 5:
             pros.append(f"Attractive dividend yield ({m.dividend_yield_pct:.2f}%)")
-        # NEW v2.0 — flag unsustainably high yields (>12% often = dividend trap)
+        # v2.0 — flag unsustainably high yields (>12% often = dividend trap)
         if m.dividend_yield_pct > 12:
             cons.append(f"Very high yield ({m.dividend_yield_pct:.2f}%) — possible dividend trap")
 
@@ -528,7 +516,7 @@ def score_quality(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
             cons.append("Negative Free Cash Flow — burning capital")
         parts.append(s)
 
-    # NEW v2.0 — ROIC (better than ROE, not gamed by leverage)
+    # v2.0 — ROIC (better than ROE, not gamed by leverage)
     if m.roic_pct is not None:
         if m.roic_pct > 15:
             s = 95.0
@@ -544,7 +532,7 @@ def score_quality(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
             cons.append(f"Negative ROIC ({m.roic_pct:.1f}%) — destroying value")
         parts.append(s)
 
-    # NEW v2.0 — CFO / Net Income (earnings quality)
+    # v2.0 — CFO / Net Income (earnings quality)
     if m.cfo_to_net_income is not None:
         if m.cfo_to_net_income >= 1.0:
             s = 90.0
@@ -559,44 +547,18 @@ def score_quality(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
             cons.append("Earnings not backed by cash — accrual risk")
         parts.append(s)
 
-    # NEW v2.0 — Interest Coverage
-    if m.interest_coverage is not None:
-        if m.interest_coverage > 10:
-            s = 95.0
-            pros.append(f"Strong interest coverage ({m.interest_coverage:.1f}x)")
-        elif m.interest_coverage > 5:
-            s = 80.0
-        elif m.interest_coverage > 2:
-            s = 55.0
-        elif m.interest_coverage > 1:
-            s = 25.0
-            cons.append(f"Tight interest coverage ({m.interest_coverage:.1f}x)")
-        else:
-            s = 5.0
-            cons.append(f"Cannot cover interest ({m.interest_coverage:.1f}x) — distress")
-        parts.append(s)
-
     return sum(parts) / len(parts) if parts else 50.0
 
 
 # ---------------------------------------------------------------------------
 # 1.2  New Risk Score — Convex Penalty, Multi-Dimensional
 # ---------------------------------------------------------------------------
-# Old risk: linear subtraction with (risk - 30) baseline.
-# New risk: each component scored 0..100, then combined with convex weighting
-# so that multiple risk factors compound non-linearly.
-#
 # Components:
 #   A. Market risk      — beta, drawdown
-#   B. Liquidity risk   — free float
-#   C. Solvency risk    — cash position, Altman Z, interest coverage
-#   D. Volatility risk  — earnings volatility, 52w range
-#   E. Governance risk  — low insider ownership
-#
-# Final risk = weighted average of components, then passed through a convex
-# transform:  risk_final = 30 + (risk_raw - 30) * convex_factor
-# where convex_factor = 1.0 + 0.5 * max(0, (risk_raw - 50) / 50)
-# This means: moderate risk gets mild penalty, high risk gets SEVERE penalty.
+#   B. Liquidity risk   — free float (if available)
+#   C. Solvency risk    — cash position, Altman Z
+#   D. Volatility risk  — 52w range
+#   E. Governance risk  — insider ownership
 # ---------------------------------------------------------------------------
 
 def score_risk(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
@@ -632,7 +594,7 @@ def score_risk(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         components.append(sum(market_risk_parts) / len(market_risk_parts))
         weights.append(0.25)
 
-    # ---- B. Liquidity Risk (free float) ----
+    # ---- B. Liquidity Risk (free float — if available) ----
     if m.free_float_pct is not None:
         if m.free_float_pct < 10:
             s = 85
@@ -647,7 +609,7 @@ def score_risk(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
         components.append(s)
         weights.append(0.15)
 
-    # ---- C. Solvency Risk (cash position + Altman Z + interest coverage) ----
+    # ---- C. Solvency Risk (cash position + Altman Z) ----
     solvency_parts: list[float] = []
 
     if m.cash_per_share is not None and m.last_close:
@@ -668,56 +630,44 @@ def score_risk(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
             pros.append(f"Net cash positive ({m.cash_per_share:.2f}/share)")
         solvency_parts.append(s)
 
-    # NEW v2.0 — Altman Z-Score
-    if m.altman_z_score is not None:
-        if m.altman_z_score > 2.99:
+    # Altman Z-Score — schema column is z_score
+    if m.z_score is not None:
+        if m.z_score > 2.99:
             s = 10.0  # safe
-        elif m.altman_z_score > 1.81:
+        elif m.z_score > 1.81:
             s = 50.0  # grey zone
         else:
             s = 90.0  # distress zone
-            cons.append(f"Altman Z-Score distress ({m.altman_z_score:.2f})")
+            cons.append(f"Altman Z-Score distress ({m.z_score:.2f})")
         solvency_parts.append(s)
-
-    # Interest coverage already in quality, but double-count here with lower weight
-    # if it's very bad (< 1.5x)
-    if m.interest_coverage is not None and m.interest_coverage < 1.5:
-        solvency_parts.append(80.0)
-        cons.append(f"Interest coverage critical ({m.interest_coverage:.1f}x)")
 
     if solvency_parts:
         components.append(sum(solvency_parts) / len(solvency_parts))
         weights.append(0.30)
 
-    # ---- D. Volatility Risk (earnings volatility + 52w range) ----
-    vol_parts: list[float] = []
-    if m.earnings_volatility is not None and m.earnings_volatility > 30:
-        vol_parts.append(min(100.0, 50 + m.earnings_volatility))
-
+    # ---- D. Volatility Risk (52w range) ----
     if m.week_52_high and m.week_52_low and m.week_52_high > m.week_52_low:
         yr_range = (m.week_52_high - m.week_52_low) / m.week_52_low * 100
         if yr_range > 80:
-            vol_parts.append(70.0)
+            vol_s = 70.0
         elif yr_range > 50:
-            vol_parts.append(45.0)
+            vol_s = 45.0
         else:
-            vol_parts.append(20.0)
-
-    if vol_parts:
-        components.append(sum(vol_parts) / len(vol_parts))
+            vol_s = 20.0
+        components.append(vol_s)
         weights.append(0.15)
 
     # ---- E. Governance Risk (insider ownership) ----
-    if m.insider_ownership_pct is not None:
+    if m.shares_insiders_pct is not None:
         # Low insider ownership = misaligned incentives
-        if m.insider_ownership_pct < 5:
+        if m.shares_insiders_pct < 5:
             s = 60.0
-            cons.append(f"Low insider ownership ({m.insider_ownership_pct:.1f}%)")
-        elif m.insider_ownership_pct < 15:
+            cons.append(f"Low insider ownership ({m.shares_insiders_pct:.1f}%)")
+        elif m.shares_insiders_pct < 15:
             s = 35.0
         else:
             s = 10.0
-            pros.append(f"Strong insider ownership ({m.insider_ownership_pct:.1f}%)")
+            pros.append(f"Strong insider ownership ({m.shares_insiders_pct:.1f}%)")
         components.append(s)
         weights.append(0.15)
 
@@ -743,12 +693,12 @@ def score_risk(m: StockMetrics, pros: list[str], cons: list[str]) -> float:
 def _compute_completeness(m: StockMetrics) -> tuple[float, str]:
     """Return (completeness_pct, confidence_label).
 
-    Counts how many of the ~30 key metrics are non-None.
+    Counts how many of the key metrics are non-None.
     """
     key_fields = [
         m.sector,
         m.revenue_growth_pct, m.net_margin_pct, m.roe_pct, m.eps_growth_pct,
-        m.gross_margin_pct, m.revenue_growth_3y_cagr, m.earnings_volatility,
+        m.gross_margin_pct, m.revenue_growth_3y_cagr,
         m.pe_ratio, m.pb_ratio, m.ev_ebitda, m.ps_ratio, m.ev_sales,
         m.peg_ratio, m.dividend_yield_pct,
         m.return_1m, m.return_3m, m.return_6m, m.return_1y,
@@ -756,9 +706,9 @@ def _compute_completeness(m: StockMetrics) -> tuple[float, str]:
         m.week_52_high, m.week_52_low,
         m.analyst_rating, m.analyst_count, m.analyst_upside_pct,
         m.debt_to_equity, m.current_ratio, m.fcf_yield,
-        m.roic_pct, m.cfo_to_net_income, m.interest_coverage,
+        m.roic_pct, m.cfo_to_net_income,
         m.beta, m.free_float_pct, m.cash_per_share,
-        m.altman_z_score, m.insider_ownership_pct,
+        m.z_score, m.shares_insiders_pct,
     ]
     present = sum(1 for f in key_fields if f is not None)
     total = len(key_fields)
@@ -835,7 +785,7 @@ class PositionContext:
     avg_entry_price: float
     current_price: float
     stock_score: ScoreResult
-    holding_days: Optional[int] = None  # NEW v2.0
+    holding_days: Optional[int] = None  # v2.0
 
 
 def recommend_position(ctx: PositionContext) -> dict:
