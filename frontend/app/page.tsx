@@ -4,13 +4,25 @@ import useSWR from "swr";
 import { api } from "@/lib/api";
 import { fmtNumber, fmtPercent, fmtPrice, changeColor } from "@/lib/utils";
 import VerdictBadge from "@/components/VerdictBadge";
-import { TrendingUp, BarChart3, Sparkles } from "lucide-react";
+import { TrendingUp, BarChart3, Sparkles, CalendarClock } from "lucide-react";
 
 export default function DashboardPage() {
   const { data: topBuy } = useSWR("dashboard:top-buy", () =>
     api.screener({ verdict: "BUY", sort_by: "composite_score", sort_dir: "desc", limit: 8 }));
   const { data: topWatch } = useSWR("dashboard:top-watch", () =>
     api.screener({ verdict: "WATCH", sort_by: "composite_score", sort_dir: "desc", limit: 5 }));
+  // "Reporting today" — both filters set to 0 means "next_earnings_date BETWEEN
+  // today AND today" OR "last_earnings_date BETWEEN today AND today". So we
+  // catch both pre-announcement (still to report) and post-announcement
+  // (already reported earlier today) cases without changing the backend.
+  const { data: earningsToday } = useSWR("dashboard:earnings-today", () =>
+    api.screener({
+      earnings_within_days_future: 0,
+      earnings_within_days_past: 0,
+      sort_by: "composite_score",
+      sort_dir: "desc",
+      limit: 12,
+    }));
   const { data: marketAdx } = useSWR("dashboard:adx", () =>
     api.screener({ exchange: "adx", sort_by: "market_cap", sort_dir: "desc", limit: 5 }));
   const { data: marketDfm } = useSWR("dashboard:dfm", () =>
@@ -61,6 +73,62 @@ export default function DashboardPage() {
           {topBuy && topBuy.items.length === 0 && (
             <div className="col-span-full text-sm text-ink-muted card p-4">
               No BUY signals yet — run the daily pipeline from the Admin panel.
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* Reporting today — only renders the section header + grid when the
+          API has loaded. The grid stays empty (with a fallback row) on a
+          quiet day so the section doesn't disappear mid-render. */}
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold flex items-center gap-2">
+            <CalendarClock className="size-4 text-brand" /> Reporting today
+            {earningsToday && earningsToday.items.length > 0 && (
+              <span className="text-[11px] text-ink-muted font-normal">
+                · {earningsToday.items.length} {earningsToday.items.length === 1 ? "stock" : "stocks"}
+              </span>
+            )}
+          </h2>
+          <Link
+            href="/screener?earnings_within_days_future=0&earnings_within_days_past=0"
+            className="text-xs text-brand hover:underline"
+          >
+            View all →
+          </Link>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          {(earningsToday?.items ?? []).map((s) => (
+            <Link key={s.id} href={`/stock/${s.exchange_code}/${s.ticker}`}
+                  className="card p-4 hover:border-border-strong transition-colors">
+              <div className="flex items-start justify-between">
+                <div>
+                  <div className="text-xs text-ink-dim uppercase">{s.exchange_code}</div>
+                  <div className="font-semibold">{s.ticker}</div>
+                </div>
+                <VerdictBadge verdict={s.verdict} size="xs" />
+              </div>
+              <div className="text-xs text-ink-muted truncate mt-1">{s.company_name}</div>
+              <div className="mt-3 flex items-end justify-between">
+                <div>
+                  <div className="text-lg font-semibold">{fmtPrice(s.last_close, s.currency)}</div>
+                  <div className={`text-xs ${changeColor(s.last_change_pct)}`}>
+                    {fmtPercent(s.last_change_pct)}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[10px] text-ink-dim uppercase">Score</div>
+                  <div className="font-mono text-sm font-semibold">
+                    {fmtNumber(s.composite_score, { digits: 0 })}
+                  </div>
+                </div>
+              </div>
+            </Link>
+          ))}
+          {earningsToday && earningsToday.items.length === 0 && (
+            <div className="col-span-full text-sm text-ink-muted card p-4">
+              No companies reporting earnings today.
             </div>
           )}
         </div>
