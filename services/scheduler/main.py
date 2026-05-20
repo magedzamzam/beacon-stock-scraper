@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -338,11 +338,15 @@ async def run_broker_quote_refresh():
                         v = p.get(k)
                         return Decimal(str(v)) if v is not None else None
 
+                    now = datetime.utcnow()
+                    today = date.today()
+                    last_price = _dec("last_price")
+
                     cq_values = {
                         "stock_id": stock_id, "broker_id": broker_id,
                         "broker_symbol": symbol,
                         "bid": _dec("bid"), "offer": _dec("offer"),
-                        "last_price": _dec("last_price"),
+                        "last_price": last_price,
                         "open_price": _dec("open_price"),
                         "high_price": _dec("high_price"),
                         "low_price": _dec("low_price"),
@@ -352,10 +356,11 @@ async def run_broker_quote_refresh():
                         "volume": _dec("volume"),
                         "currency": payload.get("currency"),
                         "market_status": payload.get("market_status"),
-                        "fetched_at": datetime.utcnow(),
+                        "fetched_at": now,
                     }
                     try:
                         with SessionLocal() as s:
+                            # 1) Per-broker live snapshot.
                             cq_stmt = pg_insert(StockCurQuote).values(**cq_values).on_conflict_do_update(
                                 index_elements=["stock_id", "broker_id"],
                                 set_={k: v for k, v in cq_values.items()
@@ -363,20 +368,62 @@ async def run_broker_quote_refresh():
                             )
                             s.execute(cq_stmt)
 
-                            # Refresh canonical stock_quotes (preserve score/verdict)
-                            last_price = cq_values["last_price"]
+                            # Skip the rest without a price — change calcs
+                            # need last_price, and an empty history row is
+                            # worse than no history row.
                             if last_price is not None:
-                                hist = s.execute(
+                                # 2) prev_close BEFORE writing today's history
+                                # row, otherwise the lookup would find today
+                                # and prev_close would equal current price.
+                                prev_close_row = s.execute(
                                     select(StockHistoryQuote.close_price)
                                     .where(StockHistoryQuote.stock_id == stock_id,
-                                           StockHistoryQuote.close_price.is_not(None))
-                                    .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
-                                ).all()
-                                prev_close = hist[1].close_price if len(hist) >= 2 else None
+                                           StockHistoryQuote.close_price.is_not(None),
+                                           StockHistoryQuote.trading_date < today)
+                                    .order_by(StockHistoryQuote.trading_date.desc())
+                                    .limit(1)
+                                ).first()
+                                prev_close = (prev_close_row.close_price
+                                              if prev_close_row else None)
+
                                 ch_abs = ch_pct = None
                                 if prev_close is not None and prev_close != 0:
                                     ch_abs = last_price - prev_close
                                     ch_pct = (ch_abs / prev_close) * 100
+
+                                # 3) stock_history_quote — today's OHLC row.
+                                # Without this, the 6-month chart freezes for
+                                # broker-mapped stocks since the scrape pipeline
+                                # skips them on purpose. UNIQUE(stock_id,
+                                # trading_date) means same-day refreshes UPSERT.
+                                open_p = cq_values["open_price"] or last_price
+                                high_p = cq_values["high_price"] or last_price
+                                low_p = cq_values["low_price"] or last_price
+                                hist_values = {
+                                    "stock_id": stock_id,
+                                    "trading_date": today,
+                                    "open_price": open_p,
+                                    "high_price": high_p,
+                                    "low_price": low_p,
+                                    "close_price": last_price,
+                                    "volume": cq_values["volume"],
+                                    "change_pct": ch_pct,
+                                    "source": "broker",
+                                    "scraped_at": now,
+                                }
+                                # Strip None from the SET clause so a missing
+                                # field doesn't blow away a previously-good
+                                # value from earlier in the day.
+                                hist_stmt = pg_insert(StockHistoryQuote).values(**hist_values).on_conflict_do_update(
+                                    index_elements=["stock_id", "trading_date"],
+                                    set_={k: v for k, v in hist_values.items()
+                                          if k not in ("stock_id", "trading_date")
+                                          and v is not None},
+                                )
+                                s.execute(hist_stmt)
+
+                                # 4) Canonical stock_quotes — refresh price
+                                # block only; preserve composite_score/verdict.
                                 sq_record = {
                                     "stock_id": stock_id,
                                     "current_price": last_price,
@@ -384,8 +431,8 @@ async def run_broker_quote_refresh():
                                     "change_abs": ch_abs,
                                     "change_pct": ch_pct,
                                     "price_source": "broker",
-                                    "price_fetched_at": cq_values["fetched_at"],
-                                    "last_updated": datetime.utcnow(),
+                                    "price_fetched_at": now,
+                                    "last_updated": now,
                                 }
                                 sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
                                     index_elements=["stock_id"],
