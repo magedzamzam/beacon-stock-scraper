@@ -49,6 +49,7 @@ def _row_to_summary(r) -> StockSummary:
         rsi_14=_f(getattr(r, "rsi_14", None)),
         composite_score=_f(r.composite_score),
         verdict=r.verdict, last_updated=r.last_updated,
+        next_earnings_date=getattr(r, "next_earnings_date", None),
     )
 
 
@@ -64,6 +65,8 @@ _SUMMARY_COLS = (
     StockQuote.dividend_yield_pct, StockQuote.rsi_14,
     StockQuote.composite_score, StockQuote.verdict,
     StockQuote.last_updated,
+    StockEarningsCalendar.next_earnings_date,
+    StockEarningsCalendar.earnings_time,
 )
 
 
