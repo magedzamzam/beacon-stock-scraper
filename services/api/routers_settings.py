@@ -39,19 +39,50 @@ _RECOMMENDER_URL = os.environ.get("RECOMMENDER_URL", "http://recommender:8002")
 # Each entry describes a scheduled job to the UI. cron field validation is
 # light: we let APScheduler reject malformed crons at apply-time.
 KNOWN_JOBS: dict[str, dict[str, Any]] = {
-    "job.scrape_daily": {
-        "label": "Daily scrape (overview)",
-        "purpose": "Light: overview page only — price, change, news, today's "
-                   "OHLC row, refreshed quote cache. Throttled across the day.",
+    "job.scrape_news": {
+        "label": "Scrape · News",
+        "purpose": "Pulls news headlines for each stock from the configured "
+                   "news provider. UPSERTs on (stock_id, headline) — same "
+                   "headline never duplicates.",
         "supports_exchanges": True,
-        "default_cron": "0 16 * * *",
+        "default_cron": "0 */6 * * *",
     },
-    "job.scrape_weekly": {
-        "label": "Weekly scrape (financials)",
-        "purpose": "Heavy: financials, balance sheet, cashflow, ratios, "
-                   "forecast, ratings, statistics. Runs once a week.",
+    "job.scrape_current_quote": {
+        "label": "Scrape · Current quote (unmapped stocks)",
+        "purpose": "Refreshes stock_quotes + today's stock_history_quote row "
+                   "for stocks WITHOUT a broker mapping. Mapped stocks get "
+                   "their prices from job.broker_quote_refresh.",
+        "supports_exchanges": True,
+        "default_cron": "30 * * * *",
+    },
+    "job.scrape_financials": {
+        "label": "Scrape · Financials",
+        "purpose": "Income statement, balance sheet, cash flow. "
+                   "→ stock_fin_statement + stock_fin_cashflow. "
+                   "UPSERTs on (stock_id, period_end, period_type, is_estimate).",
         "supports_exchanges": True,
         "default_cron": "0 3 * * 0",
+    },
+    "job.scrape_technicals": {
+        "label": "Scrape · Technicals",
+        "purpose": "RSI, SMA, 52-week range, beta, returns, dividend metrics. "
+                   "→ stock_mkt_technicals + stock_mkt_dividends.",
+        "supports_exchanges": True,
+        "default_cron": "15 3 * * 0",
+    },
+    "job.scrape_ratios": {
+        "label": "Scrape · Ratios",
+        "purpose": "P/E, P/B, EV/EBITDA, ROE/ROA/ROIC, debt/equity, current ratio. "
+                   "→ stock_fin_ratios.",
+        "supports_exchanges": True,
+        "default_cron": "30 3 * * 0",
+    },
+    "job.scrape_forecast": {
+        "label": "Scrape · Forecast & Analyst Ratings",
+        "purpose": "Analyst consensus + earnings forecast estimates. "
+                   "→ stock_analyst_consensus + stock_earnings_calendar (est_*).",
+        "supports_exchanges": True,
+        "default_cron": "0 5 * * 0",
     },
     "job.score_recompute": {
         "label": "Recompute composite scores",
@@ -195,19 +226,15 @@ async def run_job(
     summary = None
     error = None
     try:
-        if key == "job.scrape_daily":
+        # Generic dispatch for scrape topics — all 6 keys map to the same
+        # scraper endpoint pattern (/scrape/<topic>), so one branch covers
+        # them all. New topics added to KNOWN_JOBS work here automatically.
+        if key.startswith("job.scrape_"):
+            topic = key.removeprefix("job.scrape_")
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
-                    f"{_SCRAPER_URL}/scrape/all",
-                    json={"mode": "daily", "exchanges": exchanges or None},
-                )
-                r.raise_for_status()
-                summary = r.json()
-        elif key == "job.scrape_weekly":
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    f"{_SCRAPER_URL}/scrape/all",
-                    json={"mode": "weekly", "exchanges": exchanges or None},
+                    f"{_SCRAPER_URL}/scrape/{topic}",
+                    json={"exchanges": exchanges or None},
                 )
                 r.raise_for_status()
                 summary = r.json()

@@ -10,7 +10,7 @@ The hourly periodic refresh lives in the scheduler.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -121,7 +121,22 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
     """Hit the gateway, persist the result, return the saved row as dict.
 
     Returns None on broker failures so the caller can decide what to do.
+    
+        Writes to THREE tables in order:
+        1. stock_cur_quote      — per-broker live quote (one row per
+                                  stock×broker pair, full bid/offer/OHLC).
+        2. stock_history_quote  — today's OHLC row (one row per
+                                  stock×trading_date). Without this, the
+                                  6-month chart freezes for broker-mapped
+                                  stocks since the scrape pipeline skips
+                                  them on purpose.
+        3. stock_quotes         — canonical "now" cache (one row per stock).
+
+    We compute prev_close BEFORE writing today's history row, otherwise the
+    history UPSERT would shift the "second-most-recent close" lookup to
+    today + today and prev_close would equal current price.
     """
+    
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(f"{_GATEWAY_URL}/brokers/{broker_id}/quote/{broker_symbol}")
@@ -134,6 +149,10 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
     def _dec(k):
         v = payload.get(k)
         return Decimal(str(v)) if v is not None else None
+        
+    now = datetime.utcnow()
+    today = date.today()
+    last_price = _dec("last_price")
 
     # Write live quote into stock_cur_quote.
     # The broker's reported change_abs/change_pct often disagree with
@@ -142,14 +161,14 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
     cur_quote_values = {
         "stock_id": stock_id, "broker_id": broker_id, "broker_symbol": broker_symbol,
         "bid": _dec("bid"), "offer": _dec("offer"),
-        "last_price": _dec("last_price"),
+        "last_price": last_price,
         "open_price": _dec("open_price"), "high_price": _dec("high_price"),
         "low_price": _dec("low_price"), "close_price": _dec("close_price"),
         "broker_change_abs": _dec("change_abs"),
         "broker_change_pct": _dec("change_pct"),
         "volume": _dec("volume"), "currency": payload.get("currency"),
         "market_status": payload.get("market_status"),
-        "fetched_at": datetime.utcnow(),
+        "fetched_at": now,
     }
     cq_stmt = pg_insert(StockCurQuote).values(**cur_quote_values).on_conflict_do_update(
         index_elements=["stock_id", "broker_id"],
@@ -158,37 +177,85 @@ async def _refresh_one(db: Session, stock_id: int, broker_id: int, broker_symbol
     )
     db.execute(cq_stmt)
 
-    # Refresh canonical stock_quotes row with broker price.
-    # We update only the price block; preserve composite_score/verdict.
-    last_price = cur_quote_values["last_price"]
-    if last_price is not None:
-        # prev_close from history (second-most-recent close)
-        hist = db.execute(
-            select(StockHistoryQuote.close_price)
-            .where(StockHistoryQuote.stock_id == stock_id,
-                   StockHistoryQuote.close_price.is_not(None))
-            .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
-        ).all()
-        prev_close = hist[1].close_price if len(hist) >= 2 else None
-        change_abs = change_pct = None
-        if prev_close is not None and prev_close != 0:
-            change_abs = last_price - prev_close
-            change_pct = (change_abs / prev_close) * 100
-        sq_record = {
-            "stock_id": stock_id,
-            "current_price": last_price,
-            "prev_close": prev_close,
-            "change_abs": change_abs,
-            "change_pct": change_pct,
-            "price_source": "broker",
-            "price_fetched_at": cur_quote_values["fetched_at"],
-            "last_updated": datetime.utcnow(),
-        }
-        sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
-            index_elements=["stock_id"],
-            set_={k: v for k, v in sq_record.items() if k != "stock_id"},
-        )
-        db.execute(sq_stmt)
+    # Nothing else to do without a price. Commit the cur_quote upsert so the
+    # bid/offer/etc are still persisted, and bail out — change calcs depend
+    # on last_price being non-null.
+    if last_price is None:
+        db.commit()
+        return payload
+
+    # ---------------------------------------------------------------
+    # 2) prev_close lookup — BEFORE writing today's history row so we don't
+    #    pollute the result. We want the most-recent close on a DIFFERENT
+    #    trading day from today.
+    # ---------------------------------------------------------------
+    prev_close_row = db.execute(
+        select(StockHistoryQuote.close_price)
+        .where(StockHistoryQuote.stock_id == stock_id,
+               StockHistoryQuote.close_price.is_not(None),
+               StockHistoryQuote.trading_date < today)
+        .order_by(StockHistoryQuote.trading_date.desc())
+        .limit(1)
+    ).first()
+    prev_close = prev_close_row.close_price if prev_close_row else None
+
+    change_abs = change_pct = None
+    if prev_close is not None and prev_close != 0:
+        change_abs = last_price - prev_close
+        change_pct = (change_abs / prev_close) * 100
+
+    # ---------------------------------------------------------------
+    # 3) stock_history_quote — today's OHLC row (UNIQUE on stock_id,
+    #    trading_date so re-running during the day updates in place).
+    # ---------------------------------------------------------------
+    # OHLC comes from the broker if reported, otherwise we fall back to
+    # last_price for all four. The change_pct uses our prev-close-based
+    # calc, not the broker's (consistent with stock_quotes).
+    open_price = _dec("open_price") or last_price
+    high_price = _dec("high_price") or last_price
+    low_price = _dec("low_price") or last_price
+    # close_price is intentionally last_price (intraday: rolling close;
+    # post-close: the real close once the broker reports it).
+    hist_values = {
+        "stock_id": stock_id,
+        "trading_date": today,
+        "open_price": open_price,
+        "high_price": high_price,
+        "low_price": low_price,
+        "close_price": last_price,
+        "volume": _dec("volume"),
+        "change_pct": change_pct,
+        "source": "broker",
+        "scraped_at": now,
+    }
+    # Strip None values from the SET clause so a missing field doesn't blow
+    # away a previously-good value from earlier in the day.
+    hist_stmt = pg_insert(StockHistoryQuote).values(**hist_values).on_conflict_do_update(
+        index_elements=["stock_id", "trading_date"],
+        set_={k: v for k, v in hist_values.items()
+              if k not in ("stock_id", "trading_date") and v is not None},
+    )
+    db.execute(hist_stmt)
+
+    # ---------------------------------------------------------------
+    # 4) stock_quotes — canonical "now" row. Refresh price block only;
+    #    composite_score / verdict / pe_ratio etc are owned by other writers.
+    # ---------------------------------------------------------------
+    sq_record = {
+        "stock_id": stock_id,
+        "current_price": last_price,
+        "prev_close": prev_close,
+        "change_abs": change_abs,
+        "change_pct": change_pct,
+        "price_source": "broker",
+        "price_fetched_at": now,
+        "last_updated": now,
+    }
+    sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
+        index_elements=["stock_id"],
+        set_={k: v for k, v in sq_record.items() if k != "stock_id"},
+    )
+    db.execute(sq_stmt)
 
     db.commit()
     return payload

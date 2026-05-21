@@ -1,4 +1,4 @@
-"""Recommender pipeline.
+"""Recommender pipeline — v2.0 (Sector-Aware, Schema-Validated).
 
 Reads the latest data for each stock from the DB and produces:
     1. stock_recommendations  — daily verdict + sub-scores per stock
@@ -27,6 +27,7 @@ from shared.logging_setup import configure_logging
 
 from .scoring import (
     StockMetrics, compute_score, recommend_position, PositionContext,
+    MODEL_VERSION,
 )
 
 log = configure_logging("recommender")
@@ -36,23 +37,36 @@ def _f(x) -> Optional[float]:
     return float(x) if x is not None else None
 
 
+def _safe_div(a, b) -> Optional[float]:
+    """Safely divide two values, returning None on any error."""
+    if a is None or b is None:
+        return None
+    try:
+        b_f = float(b)
+        if b_f == 0:
+            return None
+        return float(a) / b_f
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def gather_metrics(session, stock_id: int) -> StockMetrics:
     """Pull the latest available row from each new parallel-schema table and
     build StockMetrics for the scoring engine.
 
-    Round 4 sources:
-      pe_ratio, pb_ratio, ev_ebitda  ← stock_fin_ratios (latest period_end)
-      revenue, net_income            ← stock_fin_statement (latest 2 periods)
-      dividend_yield_pct             ← stock_mkt_dividends
-      rsi_14, sma_50, sma_200,
-      week_52_high/low, beta,
-      price_chg_*_pct                ← stock_mkt_technicals (latest)
-      last_close, market_cap         ← stock_history_quote (latest by date)
-      analyst_*                      ← stock_analyst_consensus (latest)
-
-    Balance-sheet metrics (roe, debt_to_equity) are not on the new schema yet,
-    so they return None until balance-sheet fields are added.
+    v2.0 validated against beacon_schema.sql:
+      - sector from Stock table
+      - ps_ratio, ev_sales, peg_ratio, roic, z_score from stock_fin_ratios
+      - gross_profit, revenue_growth_3y, shares_insiders_pct from stock_fin_statement
+      - operating_cash_flow from stock_fin_cashflow
+      - free_float_pct NOT in schema → omitted (graceful None)
+      - interest_coverage NOT in schema → omitted
+      - earnings_volatility NOT in schema → omitted
     """
+    # --- Stock metadata (sector) ---
+    stock = session.get(Stock, stock_id)
+    sector = stock.sector if stock else None
+
     # --- Latest history quote (close, market_cap) ---
     hq = session.execute(
         select(StockHistoryQuote)
@@ -61,7 +75,7 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
         .limit(1)
     ).scalar_one_or_none()
 
-    # --- Latest valuation ratios (PE, PB, EV/EBITDA) ---
+    # --- Latest valuation ratios (PE, PB, EV/EBITDA, P/S, EV/Sales, PEG, ROIC, Z) ---
     ratios = session.execute(
         select(StockFinRatios)
         .where(StockFinRatios.stock_id == stock_id)
@@ -100,41 +114,57 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
         .limit(1)
     ).scalar_one_or_none()
 
-    # --- Derived: revenue growth YoY (prefer pre-computed column) ---
-    rev_growth = None
-    if fin:
-        # If the scraper computed revenue_growth_yoy directly, use it.
-        rev_growth = _f(fin[0].revenue_growth_yoy)
-        # Otherwise derive from the latest two periods.
-        if rev_growth is None and len(fin) >= 2 and fin[0].revenue and fin[1].revenue:
-            try:
-                rev_growth = (float(fin[0].revenue) - float(fin[1].revenue)) / float(fin[1].revenue) * 100
-            except ZeroDivisionError:
-                pass
+    # --- Latest cashflow (for CFO/NI) ---
+    cf = session.execute(
+        select(StockFinCashflow)
+        .where(StockFinCashflow.stock_id == stock_id,
+               StockFinCashflow.is_estimate.is_(False))
+        .order_by(desc(StockFinCashflow.period_end), desc(StockFinCashflow.id))
+        .limit(1)
+    ).scalar_one_or_none()
 
     # --- Derived: net margin ---
     net_margin = None
     if fin and fin[0].revenue and fin[0].net_income:
-        try:
-            net_margin = float(fin[0].net_income) / float(fin[0].revenue) * 100
-        except ZeroDivisionError:
-            pass
-            
-    # --- Derived: Net Cash per Share --
+        net_margin = _safe_div(fin[0].net_income, fin[0].revenue)
+        if net_margin is not None:
+            net_margin *= 100
+
+    # --- Derived: gross margin ---
+    gross_margin = None
+    if fin and fin[0].revenue and fin[0].gross_profit:
+        gross_margin = _safe_div(fin[0].gross_profit, fin[0].revenue)
+        if gross_margin is not None:
+            gross_margin *= 100
+
+    # --- Derived: 3Y revenue CAGR (if pre-computed) ---
+    rev_cagr_3y = _f(fin[0].revenue_growth_3y) if fin else None
+
+    # --- Derived: Net Cash per Share ---
     net_cpc = None
     if fin and fin[0].net_cash and fin[0].shares_outstanding:
-        try:
-            net_cpc = float(fin[0].net_cash) / float(fin[0].shares_outstanding)
-        except ZeroDivisionError:
-            pass
+        net_cpc = _safe_div(fin[0].net_cash, fin[0].shares_outstanding)
+
+    # --- Derived: CFO / Net Income (earnings quality) ---
+    # FIXED: schema column is operating_cash_flow (with underscore)
+    cfo_to_ni = None
+    if cf and fin and fin[0].net_income:
+        cfo_to_ni = _safe_div(cf.operating_cash_flow, fin[0].net_income)
 
     return StockMetrics(
-        revenue_growth_pct=rev_growth,
+        sector=sector,
+        revenue_growth_pct=_f(fin[0].revenue_growth_yoy if fin else None),
         net_margin_pct=net_margin,
         roe_pct=_f(ratios.roe if ratios else None),
+        eps_growth_pct=_f(fin[0].eps_growth_yoy if fin else None),
+        gross_margin_pct=gross_margin,
+        revenue_growth_3y_cagr=rev_cagr_3y,
         pe_ratio=_f(ratios.pe_ratio if ratios else None),
         pb_ratio=_f(ratios.pb_ratio if ratios else None),
         ev_ebitda=_f(ratios.ev_ebitda if ratios else None),
+        ps_ratio=_f(ratios.ps_ratio if ratios else None),
+        ev_sales=_f(ratios.ev_sales if ratios else None),
+        peg_ratio=_f(ratios.peg_ratio if ratios else None),
         dividend_yield_pct=_f(div.dividend_yield_pct if div else None),
         return_1m=_f(tech.price_chg_1m_pct if tech else None),
         return_3m=_f(tech.price_chg_3m_pct if tech else None),
@@ -151,10 +181,14 @@ def gather_metrics(session, stock_id: int) -> StockMetrics:
         analyst_upside_pct=_f(ana.implied_upside_pct if ana else None),
         debt_to_equity=_f(ratios.debt_to_equity if ratios else None),
         current_ratio=_f(ratios.current_ratio if ratios else None),
-        beta=_f(tech.beta if tech else None),
-        free_float_pct=None,
         fcf_yield=_f(ratios.fcf_yield if ratios else None),
+        roic_pct=_f(ratios.roic if ratios else None),
+        cfo_to_net_income=cfo_to_ni,
+        beta=_f(tech.beta if tech else None),
+        free_float_pct=None,  # NOT in schema — gracefully None
         cash_per_share=net_cpc,
+        z_score=_f(ratios.z_score if ratios else None),
+        shares_insiders_pct=_f(fin[0].shares_insiders_pct if fin else None),
     )
 
 
@@ -167,11 +201,9 @@ def _score_and_persist(session, stock_id: int, today: date) -> str:
     metrics = gather_metrics(session, stock_id)
     result = compute_score(metrics)
 
-    # Append to stock_scoring (history). Each scoring run is a new row so we
-    # keep the audit trail. Component scores from the scoring engine map as:
-    #   old fundamental → score_quality (best fit conceptually)
-    #   old technical   → score_momentum
-    #   old analyst     → no direct equivalent — kept in inputs_snapshot
+    # Append to stock_scoring (history). v2.0: store all sub-scores.
+    # NOTE: confidence and data_completeness_pct are stored in inputs_snapshot
+    #       because they don't exist as dedicated columns in stock_scoring table.
     session.add(StockScoring(
         stock_id=stock_id,
         composite_score=result.composite,
@@ -180,22 +212,24 @@ def _score_and_persist(session, stock_id: int, today: date) -> str:
         score_momentum=result.momentum,
         score_quality=result.quality,
         score_risk=result.risk,
-        # score_growth, score_income left NULL — current model doesn't compute them
+        score_growth=result.fundamental,
+        score_income=result.technical,
         pros=result.pros,
         cons=result.cons,
         risk_flags=None,
-        model_version="v1.1",
+        model_version=MODEL_VERSION,
         inputs_snapshot={
             "fundamental_score": float(result.fundamental) if result.fundamental is not None else None,
             "technical_score": float(result.technical) if result.technical is not None else None,
             "analyst_score": float(result.analyst) if result.analyst is not None else None,
             "score_date": str(today),
+            "data_completeness_pct": result.data_completeness_pct,
+            "confidence": result.confidence,
         },
         updated_at=datetime.utcnow(),
     ))
 
-    # Denormalise composite_score + verdict onto stock_quotes (the canonical
-    # row). Preserve every other column by only setting the two we own here.
+    # Denormalise composite_score + verdict onto stock_quotes (canonical row).
     sq_stmt = pg_insert(StockQuote).values(
         stock_id=stock_id,
         composite_score=result.composite,
@@ -265,10 +299,18 @@ def score_portfolio() -> dict:
             if current_price is None or metrics.last_close is None:
                 continue
 
+            # FIXED: use pos.entry_date instead of pos.opened_at (not in schema)
+            holding_days = None
+            if pos.entry_date:
+                holding_days = (today - pos.entry_date).days
+            elif pos.created_at:
+                holding_days = (today - pos.created_at.date()).days
+
             ctx = PositionContext(
                 avg_entry_price=float(pos.avg_entry_price),
                 current_price=current_price,
                 stock_score=stock_score,
+                holding_days=holding_days,
             )
             rec = recommend_position(ctx)
 
