@@ -762,7 +762,11 @@ class AlertEvent(Base):
 # Trading Bot — Milestone 1 (migration 015)
 # =============================================================================
 class TgChannel(Base):
-    """Telegram channel the listener subscribes to."""
+    """Telegram channel the listener subscribes to. Includes per-channel
+    strategy parameters used at execute-time (Milestone 3): order_position_type,
+    tp_strategy, is_tradeable, is_trusted, image_url. Ported from the original
+    bot's strategy_config.json.
+    """
     __tablename__ = "tg_channels"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
@@ -772,6 +776,14 @@ class TgChannel(Base):
     parser_key: Mapped[str] = mapped_column(String(32), nullable=False, default="gold_xau")
     notes: Mapped[Optional[str]] = mapped_column(Text)
     last_message_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Strategy params (migration 016). Defaults give "trade as MARKET, full
+    # size at tp1, tradeable, trusted" so existing channels keep current
+    # behaviour without admin re-edits.
+    order_position_type: Mapped[str] = mapped_column(String(16), nullable=False, default="MARKET")
+    tp_strategy: Mapped[str] = mapped_column(String(120), nullable=False, default="tp1")
+    is_tradeable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_trusted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    image_url: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

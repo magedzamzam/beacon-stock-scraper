@@ -274,10 +274,100 @@ async def amain():
 
     # Background channel reloader runs alongside the listener.
     reload_task = asyncio.create_task(_reload_loop(client, state))
+
+    # Resolver HTTP server runs in the same event loop so it shares the
+    # authenticated Telethon client. Lives on port 8005 inside the cluster;
+    # external traffic never reaches it.
+    resolver_task = asyncio.create_task(_run_resolver_server(client))
+
     try:
         await client.run_until_disconnected()
     finally:
         reload_task.cancel()
+        resolver_task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Resolver HTTP server — called by the API container when an admin wants
+# to look up a channel by @username or numeric id without leaving the UI.
+# ---------------------------------------------------------------------------
+async def _run_resolver_server(client: "TelegramClient"):
+    """Boot a FastAPI app on :8005 that proxies channel-lookup requests
+    to the already-authenticated Telethon client.
+
+    Kept inside the listener service because Telethon sessions can't be
+    shared across processes — only the listener has a live client object.
+    """
+    from fastapi import FastAPI, HTTPException
+    import uvicorn
+
+    app = FastAPI(title="Beacon Telegram Resolver", version="1.0.0")
+
+    @app.get("/healthz")
+    def _healthz():
+        return {"ok": True}
+
+    @app.get("/resolve")
+    async def _resolve(query: str):
+        """Resolve a Telegram entity by @username or numeric id.
+
+        Returns the canonical id + title so the admin UI can pre-fill the
+        Add Channel form. Errors return HTTP 4xx with a human-readable
+        message — never leak Telethon exception types to the user.
+        """
+        q = (query or "").strip()
+        if not q:
+            raise HTTPException(400, "query is required")
+
+        # Allow callers to pass numeric ids directly. Telegram channel ids
+        # are negative ints starting with -100... — we tolerate both forms.
+        target: object = q
+        try:
+            target = int(q)
+        except ValueError:
+            # Strip a leading @ if the user typed it.
+            target = q.lstrip("@") if q.startswith("@") else q
+
+        try:
+            entity = await client.get_entity(target)
+        except ValueError as exc:
+            # "No user has 'foo' as username" etc. — pure not-found.
+            raise HTTPException(404, f"Not found: {exc}") from None
+        except Exception as exc:
+            log.exception("resolver_lookup_failed")
+            raise HTTPException(500, f"Lookup failed: {type(exc).__name__}: {exc}")
+
+        # Channels/megagroups have a `megagroup` or `broadcast` attribute;
+        # users have `first_name`. We return whatever is meaningful.
+        title = (
+            getattr(entity, "title", None)
+            or " ".join(filter(None, [
+                getattr(entity, "first_name", None),
+                getattr(entity, "last_name", None),
+            ]))
+            or str(target)
+        )
+        # Telethon entity.id is the raw id; channels need the -100 prefix
+        # to be unique across the API. Use Telethon's helper.
+        from telethon.utils import get_peer_id
+        canonical_id = get_peer_id(entity)
+        return {
+            "channel_id": canonical_id,
+            "title": title.strip(),
+            "username": getattr(entity, "username", None),
+            "kind": entity.__class__.__name__,   # 'Channel' | 'User' | 'Chat'
+        }
+
+    config = uvicorn.Config(
+        app, host="0.0.0.0", port=8005,
+        log_level=os.environ.get("LOG_LEVEL", "info").lower(),
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    try:
+        await server.serve()
+    except asyncio.CancelledError:
+        await server.shutdown()
 
 
 def main():

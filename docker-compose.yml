@@ -28,6 +28,7 @@ services:
       BROKER_GATEWAY_URL: http://broker_gateway:8004
       BROKER_SECRET_KEY: ${BROKER_SECRET_KEY}
       BROKER_POSITION_TTL_S: "60"
+      TELEGRAM_RESOLVER_URL: http://telegram_listener:8005
     networks: [beacon-net]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]

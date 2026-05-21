@@ -458,6 +458,8 @@ export const api = {
     }),
   deleteTgChannel: (id: number) =>
     request<{ deleted: number }>(`/trading-bot/channels/${id}`, { method: "DELETE" }),
+  resolveTgChannel: (query: string) =>
+    request<TgResolveResult>(`/trading-bot/resolve?query=${encodeURIComponent(query)}`),
 
   // ===== Brokers / accounts =====
   listBrokers: () =>
@@ -1027,13 +1029,30 @@ export interface TgChannelInput {
   parser_key?: string;
   is_enabled?: boolean;
   notes?: string | null;
+  // Strategy params (Milestone 2)
+  order_position_type?: "MARKET" | "LIMIT" | "STOP";
+  tp_strategy?: string;
+  is_tradeable?: boolean;
+  is_trusted?: boolean;
+  image_url?: string | null;
 }
 
 export interface TgChannelRow extends TgChannelInput {
   id: number;
   is_enabled: boolean;
   parser_key: string;
+  order_position_type: "MARKET" | "LIMIT" | "STOP";
+  tp_strategy: string;
+  is_tradeable: boolean;
+  is_trusted: boolean;
   last_message_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface TgResolveResult {
+  channel_id: number;
+  title: string;
+  username: string | null;
+  kind: string;
 }

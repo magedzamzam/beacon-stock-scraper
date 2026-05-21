@@ -113,6 +113,9 @@ def list_raw_messages(
 # ---------------------------------------------------------------------------
 # Channels (admin CRUD)
 # ---------------------------------------------------------------------------
+_VALID_ORDER_TYPES = ("MARKET", "LIMIT", "STOP")
+
+
 class ChannelIn(BaseModel):
     channel_id: int = Field(..., description="Telegram channel id, e.g. -1001234567890")
     channel_title: str = Field(..., min_length=1, max_length=160)
@@ -120,6 +123,12 @@ class ChannelIn(BaseModel):
     parser_key: str = Field("gold_xau", max_length=32)
     is_enabled: bool = True
     notes: Optional[str] = None
+    # Strategy params (Milestone 2)
+    order_position_type: str = Field("MARKET", max_length=16)
+    tp_strategy: str = Field("tp1", max_length=120)
+    is_tradeable: bool = True
+    is_trusted: bool = True
+    image_url: Optional[str] = None
 
 
 class ChannelUpdate(BaseModel):
@@ -128,6 +137,11 @@ class ChannelUpdate(BaseModel):
     parser_key: Optional[str] = Field(None, max_length=32)
     is_enabled: Optional[bool] = None
     notes: Optional[str] = None
+    order_position_type: Optional[str] = Field(None, max_length=16)
+    tp_strategy: Optional[str] = Field(None, max_length=120)
+    is_tradeable: Optional[bool] = None
+    is_trusted: Optional[bool] = None
+    image_url: Optional[str] = None
 
 
 def _channel_out(c: TgChannel) -> dict[str, Any]:
@@ -139,10 +153,27 @@ def _channel_out(c: TgChannel) -> dict[str, Any]:
         "parser_key": c.parser_key,
         "is_enabled": c.is_enabled,
         "notes": c.notes,
+        "order_position_type": c.order_position_type,
+        "tp_strategy": c.tp_strategy,
+        "is_tradeable": c.is_tradeable,
+        "is_trusted": c.is_trusted,
+        "image_url": c.image_url,
         "last_message_at": c.last_message_at,
         "created_at": c.created_at,
         "updated_at": c.updated_at,
     }
+
+
+def _validate_strategy_fields(order_position_type: Optional[str]) -> None:
+    """Raise HTTPException(400) on bad enum-like inputs.
+
+    Centralised so create + update paths give identical error messages.
+    """
+    if order_position_type is not None and order_position_type not in _VALID_ORDER_TYPES:
+        raise HTTPException(
+            400,
+            f"order_position_type must be one of {_VALID_ORDER_TYPES}",
+        )
 
 
 @trading_bot_router.get("/channels")
@@ -162,6 +193,7 @@ def create_channel(
     _: User = Depends(_require_admin),
     db: Session = Depends(get_db),
 ):
+    _validate_strategy_fields(req.order_position_type)
     existing = db.execute(
         select(TgChannel).where(TgChannel.channel_id == req.channel_id)
     ).scalar_one_or_none()
@@ -184,6 +216,7 @@ def update_channel(
     _: User = Depends(_require_admin),
     db: Session = Depends(get_db),
 ):
+    _validate_strategy_fields(req.order_position_type)
     c = db.get(TgChannel, channel_pk)
     if c is None:
         raise HTTPException(404, "Channel not found")
@@ -207,3 +240,42 @@ def delete_channel(
     db.delete(c)
     db.commit()
     return {"deleted": channel_pk}
+
+
+# ---------------------------------------------------------------------------
+# Channel resolver — asks the listener container to look up a channel by
+# @username or numeric id using the authenticated Telethon session. Lets
+# admins paste either form into the Add Channel form and get the canonical
+# numeric id + title back without leaving the UI.
+# ---------------------------------------------------------------------------
+@trading_bot_router.get("/resolve")
+async def resolve_channel(
+    query: str,
+    _: User = Depends(_require_admin),
+):
+    """Proxy to telegram_listener:8005/resolve."""
+    import os
+    import httpx
+
+    base = os.environ.get("TELEGRAM_RESOLVER_URL", "http://telegram_listener:8005")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{base}/resolve", params={"query": query})
+    except httpx.RequestError as exc:
+        # Listener service down / unreachable — give the admin a specific
+        # actionable error, not a generic 500.
+        raise HTTPException(
+            503,
+            f"Telegram listener is unreachable ({type(exc).__name__}). "
+            f"Is the telegram_listener service running and configured?",
+        )
+
+    if r.status_code >= 400:
+        # Pass the listener's error through verbatim so HTTP 404 stays 404.
+        try:
+            detail = r.json().get("detail") or r.text
+        except Exception:
+            detail = r.text
+        raise HTTPException(r.status_code, detail or "Resolve failed")
+
+    return r.json()
