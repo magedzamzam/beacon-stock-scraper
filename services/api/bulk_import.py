@@ -275,7 +275,6 @@ def _upsert_fin_ratios(db: Session, stock_id: int, row: dict[str, Any]) -> None:
         "current_ratio":    parse_number(_G(row, "Current Ratio")),
         "debt_to_equity":   parse_number(_G(row, "Debt / Equity")),
         "fcf_yield": parse_number(_G(row, "FCF Yield")),
-        "z_score": parse_number(_G(row, "Z-Score")),
     }
     if not any(v is not None for v in payload.values() if not isinstance(v, datetime)):
         return

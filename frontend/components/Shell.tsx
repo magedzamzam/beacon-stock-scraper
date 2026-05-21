@@ -3,17 +3,20 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import {
-  LayoutDashboard, Search, Briefcase, Star, Shield, LogOut, LogIn, User as UserIcon, Activity, Settings,
+  LayoutDashboard, Search, Briefcase, Star, Shield, LogOut, User as UserIcon, Bot,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-store";
 import { cn } from "@/lib/utils";
 
+// Mobile bottom-nav has room for 5 icons. We keep this at 5 by replacing
+// Profile (now reachable via the user pill at the bottom of the sidebar /
+// the top-bar avatar on mobile) with Trading Bot.
 const NAV = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/screener", label: "Screener", icon: Search },
   { href: "/portfolio", label: "Portfolio", icon: Briefcase },
   { href: "/watchlists", label: "Watchlists", icon: Star },
-  { href: "/profile", label: "Profile", icon: Settings },
+  { href: "/trading-bot", label: "Trading Bot", icon: Bot },
 ];
 
 export default function Shell({ children }: { children: React.ReactNode }) {
@@ -73,14 +76,18 @@ export default function Shell({ children }: { children: React.ReactNode }) {
           )}
         </nav>
         <div className="p-3 border-t border-border">
+          {/* Click the user pill to open Profile / settings. Previously
+              Profile was its own sidebar entry; replaced by Trading Bot. */}
           <div className="flex items-center gap-2 px-2 py-2 text-sm">
-            <div className="size-8 rounded-full bg-bg-elevated flex items-center justify-center">
+            <Link href="/profile"
+                  className="size-8 rounded-full bg-bg-elevated flex items-center justify-center hover:bg-bg-subtle"
+                  title="Profile / settings">
               <UserIcon className="size-4 text-ink-muted" />
-            </div>
-            <div className="flex-1 min-w-0">
+            </Link>
+            <Link href="/profile" className="flex-1 min-w-0 hover:text-ink">
               <div className="truncate text-ink">{user.display_name || user.email.split("@")[0]}</div>
               <div className="truncate text-xs text-ink-dim">{user.email}</div>
-            </div>
+            </Link>
             <button onClick={logout} title="Logout" className="text-ink-muted hover:text-ink p-1.5">
               <LogOut className="size-4" />
             </button>
@@ -94,7 +101,10 @@ export default function Shell({ children }: { children: React.ReactNode }) {
           <img src="/icon-192.png" alt="Beacon" className="size-7 rounded-md" />
           <span className="font-semibold">Beacon</span>
         </Link>
-        <button onClick={logout} className="text-ink-muted"><LogOut className="size-5" /></button>
+        <div className="flex items-center gap-3">
+          <Link href="/profile" className="text-ink-muted"><UserIcon className="size-5" /></Link>
+          <button onClick={logout} className="text-ink-muted"><LogOut className="size-5" /></button>
+        </div>
       </div>
 
       {/* Mobile bottom nav */}

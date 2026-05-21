@@ -7,12 +7,8 @@ replace_existing=True. Admin UI edits propagate without restart.
 Each scheduled run writes a row to job_runs so the admin can audit it.
 
 Job kinds today:
-    job.scrape_news              -> POST /scrape/news        on scraper
-    job.scrape_current_quote     -> POST /scrape/current_quote on scraper
-    job.scrape_financials        -> POST /scrape/financials  on scraper
-    job.scrape_technicals        -> POST /scrape/technicals  on scraper
-    job.scrape_ratios            -> POST /scrape/ratios      on scraper
-    job.scrape_forecast          -> POST /scrape/forecast    on scraper
+    job.scrape_daily             -> POST /scrape/all on scraper (mode=daily)
+    job.scrape_weekly            -> POST /scrape/all on scraper (mode=weekly)
     job.score_recompute          -> POST /score/all/sync             on recommender
                                     + POST /score/portfolio/sync
     job.account_stats_snapshot   -> in-process (snapshot_all_accounts)
@@ -23,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -49,18 +45,12 @@ BROKER_GATEWAY_URL = os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway
 # Default crons mirror routers_settings.KNOWN_JOBS so a fresh DB without
 # seeded settings still gets reasonable behaviour.
 DEFAULT_JOBS = {
-    # Scraping topics — granular schedules per topic.
-    "job.scrape_news":            "0 */6 * * *",    # every 6h
-    "job.scrape_current_quote":   "30 * * * *",     # every hour at :30 (unmapped stocks only)
-    "job.scrape_financials":      "0 3 * * 0",      # Sunday 03:00
-    "job.scrape_technicals":      "15 3 * * 0",     # Sunday 03:15
-    "job.scrape_ratios":          "30 3 * * 0",     # Sunday 03:30
-    "job.scrape_forecast":        "0 5 * * 0",      # Sunday 05:00
-    # Non-scraping jobs (unchanged)
-    "job.score_recompute":        "30 16 * * *",
+    "job.scrape_daily":         "0 16 * * *",       # daily: overview page only
+    "job.scrape_weekly":        "0 3 * * 0",        # Sundays 03:00: deep scrape
+    "job.score_recompute":     "30 16 * * *",
     "job.account_stats_snapshot": "15 */6 * * *",
-    "job.broker_quote_refresh":   "5 * * * *",
-    "job.alerts_evaluate":        "* * * * *",
+    "job.broker_quote_refresh": "5 * * * *",
+    "job.alerts_evaluate":     "* * * * *",
 }
 
 
@@ -96,47 +86,44 @@ def _finish_run(run_id: int, started: datetime, status: str,
 # --------------------------------------------------------------------------
 # Job implementations
 # --------------------------------------------------------------------------
-async def _scrape_topic(topic: str, exchanges: list[str]):
-    """POST to the scraper's per-topic endpoint."""
-    payload = {"exchanges": exchanges or None}
+async def _scrape_with_mode(mode: str, exchanges: list[str]):
+    payload = {"mode": mode, "exchanges": exchanges or None}
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{SCRAPER_URL}/scrape/{topic}", json=payload)
+        r = await client.post(f"{SCRAPER_URL}/scrape/all", json=payload)
         r.raise_for_status()
         return r.json()
 
 
-def _make_scrape_topic_runner(topic: str):
-    """Build a coroutine that runs one topic against its app_settings cfg.
-
-    Returns an async function so we can register it in JOB_HANDLERS by key.
-    Each generated runner has its own job key, its own audit row, its own
-    exchange filter — failures in one don't poison another.
+async def run_scrape_daily():
+    """Daily-tier scrape: overview page only (price, change, news, today's
+    history row, refreshed quote cache).
     """
-    job_key = f"job.scrape_{topic}"
-
-    async def runner():
-        cfg = _read_job_cfg(job_key)
-        if not cfg.get("enabled", True):
-            return
-        rid, started = _start_run(job_key)
-        try:
-            summary = await _scrape_topic(topic, cfg.get("exchanges") or [])
-            _finish_run(rid, started, "ok", summary=summary)
-        except Exception as exc:
-            log.exception("scrape_topic_failed", topic=topic, error=str(exc))
-            _finish_run(rid, started, "failed", error=str(exc))
-
-    runner.__name__ = f"run_scrape_{topic}"
-    return runner
+    cfg = _read_job_cfg("job.scrape_daily")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.scrape_daily")
+    try:
+        summary = await _scrape_with_mode("daily", cfg.get("exchanges") or [])
+        _finish_run(rid, started, "ok", summary=summary)
+    except Exception as exc:
+        log.exception("scrape_daily_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
 
 
-# Generate one runner per topic. Order matches DEFAULT_JOBS for readability.
-run_scrape_news           = _make_scrape_topic_runner("news")
-run_scrape_current_quote  = _make_scrape_topic_runner("current_quote")
-run_scrape_financials     = _make_scrape_topic_runner("financials")
-run_scrape_technicals     = _make_scrape_topic_runner("technicals")
-run_scrape_ratios         = _make_scrape_topic_runner("ratios")
-run_scrape_forecast       = _make_scrape_topic_runner("forecast")
+async def run_scrape_weekly():
+    """Weekly-tier scrape: all slow-changing pages (financials, ratios,
+    statistics, forecast, ratings). Heavy — runs once per week.
+    """
+    cfg = _read_job_cfg("job.scrape_weekly")
+    if not cfg.get("enabled", True):
+        return
+    rid, started = _start_run("job.scrape_weekly")
+    try:
+        summary = await _scrape_with_mode("weekly", cfg.get("exchanges") or [])
+        _finish_run(rid, started, "ok", summary=summary)
+    except Exception as exc:
+        log.exception("scrape_weekly_failed", error=str(exc))
+        _finish_run(rid, started, "failed", error=str(exc))
 
 
 async def run_score_recompute():
@@ -338,15 +325,11 @@ async def run_broker_quote_refresh():
                         v = p.get(k)
                         return Decimal(str(v)) if v is not None else None
 
-                    now = datetime.utcnow()
-                    today = date.today()
-                    last_price = _dec("last_price")
-
                     cq_values = {
                         "stock_id": stock_id, "broker_id": broker_id,
                         "broker_symbol": symbol,
                         "bid": _dec("bid"), "offer": _dec("offer"),
-                        "last_price": last_price,
+                        "last_price": _dec("last_price"),
                         "open_price": _dec("open_price"),
                         "high_price": _dec("high_price"),
                         "low_price": _dec("low_price"),
@@ -356,11 +339,10 @@ async def run_broker_quote_refresh():
                         "volume": _dec("volume"),
                         "currency": payload.get("currency"),
                         "market_status": payload.get("market_status"),
-                        "fetched_at": now,
+                        "fetched_at": datetime.utcnow(),
                     }
                     try:
                         with SessionLocal() as s:
-                            # 1) Per-broker live snapshot.
                             cq_stmt = pg_insert(StockCurQuote).values(**cq_values).on_conflict_do_update(
                                 index_elements=["stock_id", "broker_id"],
                                 set_={k: v for k, v in cq_values.items()
@@ -368,62 +350,20 @@ async def run_broker_quote_refresh():
                             )
                             s.execute(cq_stmt)
 
-                            # Skip the rest without a price — change calcs
-                            # need last_price, and an empty history row is
-                            # worse than no history row.
+                            # Refresh canonical stock_quotes (preserve score/verdict)
+                            last_price = cq_values["last_price"]
                             if last_price is not None:
-                                # 2) prev_close BEFORE writing today's history
-                                # row, otherwise the lookup would find today
-                                # and prev_close would equal current price.
-                                prev_close_row = s.execute(
+                                hist = s.execute(
                                     select(StockHistoryQuote.close_price)
                                     .where(StockHistoryQuote.stock_id == stock_id,
-                                           StockHistoryQuote.close_price.is_not(None),
-                                           StockHistoryQuote.trading_date < today)
-                                    .order_by(StockHistoryQuote.trading_date.desc())
-                                    .limit(1)
-                                ).first()
-                                prev_close = (prev_close_row.close_price
-                                              if prev_close_row else None)
-
+                                           StockHistoryQuote.close_price.is_not(None))
+                                    .order_by(StockHistoryQuote.trading_date.desc()).limit(2)
+                                ).all()
+                                prev_close = hist[1].close_price if len(hist) >= 2 else None
                                 ch_abs = ch_pct = None
                                 if prev_close is not None and prev_close != 0:
                                     ch_abs = last_price - prev_close
                                     ch_pct = (ch_abs / prev_close) * 100
-
-                                # 3) stock_history_quote — today's OHLC row.
-                                # Without this, the 6-month chart freezes for
-                                # broker-mapped stocks since the scrape pipeline
-                                # skips them on purpose. UNIQUE(stock_id,
-                                # trading_date) means same-day refreshes UPSERT.
-                                open_p = cq_values["open_price"] or last_price
-                                high_p = cq_values["high_price"] or last_price
-                                low_p = cq_values["low_price"] or last_price
-                                hist_values = {
-                                    "stock_id": stock_id,
-                                    "trading_date": today,
-                                    "open_price": open_p,
-                                    "high_price": high_p,
-                                    "low_price": low_p,
-                                    "close_price": last_price,
-                                    "volume": cq_values["volume"],
-                                    "change_pct": ch_pct,
-                                    "source": "broker",
-                                    "scraped_at": now,
-                                }
-                                # Strip None from the SET clause so a missing
-                                # field doesn't blow away a previously-good
-                                # value from earlier in the day.
-                                hist_stmt = pg_insert(StockHistoryQuote).values(**hist_values).on_conflict_do_update(
-                                    index_elements=["stock_id", "trading_date"],
-                                    set_={k: v for k, v in hist_values.items()
-                                          if k not in ("stock_id", "trading_date")
-                                          and v is not None},
-                                )
-                                s.execute(hist_stmt)
-
-                                # 4) Canonical stock_quotes — refresh price
-                                # block only; preserve composite_score/verdict.
                                 sq_record = {
                                     "stock_id": stock_id,
                                     "current_price": last_price,
@@ -431,8 +371,8 @@ async def run_broker_quote_refresh():
                                     "change_abs": ch_abs,
                                     "change_pct": ch_pct,
                                     "price_source": "broker",
-                                    "price_fetched_at": now,
-                                    "last_updated": now,
+                                    "price_fetched_at": cq_values["fetched_at"],
+                                    "last_updated": datetime.utcnow(),
                                 }
                                 sq_stmt = pg_insert(StockQuote).values(**sq_record).on_conflict_do_update(
                                     index_elements=["stock_id"],
@@ -487,16 +427,12 @@ async def run_alerts_evaluate():
 
 
 JOB_HANDLERS = {
-    "job.scrape_news":            run_scrape_news,
-    "job.scrape_current_quote":   run_scrape_current_quote,
-    "job.scrape_financials":      run_scrape_financials,
-    "job.scrape_technicals":      run_scrape_technicals,
-    "job.scrape_ratios":          run_scrape_ratios,
-    "job.scrape_forecast":        run_scrape_forecast,
-    "job.score_recompute":        run_score_recompute,
+    "job.scrape_daily": run_scrape_daily,
+    "job.scrape_weekly": run_scrape_weekly,
+    "job.score_recompute": run_score_recompute,
     "job.account_stats_snapshot": run_account_stats_snapshot,
-    "job.broker_quote_refresh":   run_broker_quote_refresh,
-    "job.alerts_evaluate":        run_alerts_evaluate,
+    "job.broker_quote_refresh": run_broker_quote_refresh,
+    "job.alerts_evaluate": run_alerts_evaluate,
 }
 
 

@@ -1,18 +1,16 @@
 """Scraper microservice HTTP API.
 
-One endpoint per topic — called by the scheduler on cron, or by an admin
-manually. Background-task pattern so the caller doesn't block on the
-batch run.
-
 Endpoints:
     GET  /healthz
-    POST /scrape/news        body: {"exchanges": ["adx",...]}  (optional)
-    POST /scrape/current_quote
-    POST /scrape/financials
-    POST /scrape/technicals
-    POST /scrape/ratios
-    POST /scrape/forecast
-    POST /scrape/one/{topic}/{exchange}/{ticker}    on-demand single stock
+    POST /scrape/all                      kick off a batch scrape
+                                          body: {"mode": "daily"|"weekly",
+                                                 "exchanges": ["adx",...]}
+    POST /scrape/{exchange}/{ticker}      re-scrape one stock on demand
+                                          query: ?mode=daily|weekly (default daily)
+
+The scheduler calls /scrape/all with mode='daily' on the daily tick and
+mode='weekly' on the weekly tick. 'full' is also accepted as a synonym for
+'weekly' for backward-compat with the old API.
 """
 from __future__ import annotations
 
@@ -22,52 +20,41 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from shared.logging_setup import configure_logging
-from .pipelines import (
-    run_current_quote, run_financials, run_forecast, run_news,
-    run_one_topic, run_ratios, run_technicals,
-)
+from .pipeline import scrape_all_active, scrape_by_ticker
 
 log = configure_logging("scraper-api")
-app = FastAPI(title="Beacon Scraper", version="3.0.0")
+app = FastAPI(title="Beacon Scraper", version="2.0.0")
+
+_VALID_MODES = {"daily", "weekly", "full"}
 
 
-class ScrapeRequest(BaseModel):
+class ScrapeAllRequest(BaseModel):
+    mode: str = "daily"
     exchanges: Optional[list[str]] = None
-
-
-# Topic → batch entry point
-_TOPICS = {
-    "news":          run_news,
-    "current_quote": run_current_quote,
-    "financials":    run_financials,
-    "technicals":    run_technicals,
-    "ratios":        run_ratios,
-    "forecast":      run_forecast,
-}
 
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "topics": list(_TOPICS.keys())}
+    return {"ok": True}
 
 
-@app.post("/scrape/{topic}")
-async def scrape_topic(topic: str, background: BackgroundTasks,
-                       req: Optional[ScrapeRequest] = None):
-    """Kick off a batch scrape for one topic in the background."""
-    if topic not in _TOPICS:
-        raise HTTPException(404, f"unknown topic '{topic}'. "
-                                  f"Valid: {list(_TOPICS)}")
-    fn = _TOPICS[topic]
-    exchanges = req.exchanges if req else None
-    background.add_task(fn, exchanges=exchanges)
-    return {"queued": True, "topic": topic, "exchanges": exchanges or "all"}
+@app.post("/scrape/all")
+async def scrape_all(background: BackgroundTasks,
+                     req: Optional[ScrapeAllRequest] = None):
+    """Kick off a scrape in the background and return immediately."""
+    if req is None:
+        req = ScrapeAllRequest()
+    if req.mode not in _VALID_MODES:
+        raise HTTPException(400, f"mode must be one of {_VALID_MODES}")
+    background.add_task(scrape_all_active, mode=req.mode, exchanges=req.exchanges)
+    return {
+        "queued": True, "mode": req.mode,
+        "exchanges": req.exchanges or "all",
+    }
 
 
-@app.post("/scrape/one/{topic}/{exchange}/{ticker}")
-async def scrape_one(topic: str, exchange: str, ticker: str):
-    """Synchronous single-stock scrape. Useful for manual debugging."""
-    if topic not in _TOPICS:
-        raise HTTPException(404, f"unknown topic '{topic}'. "
-                                  f"Valid: {list(_TOPICS)}")
-    return await run_one_topic(topic, exchange, ticker)
+@app.post("/scrape/{exchange}/{ticker}")
+async def scrape_single(exchange: str, ticker: str, mode: str = "daily"):
+    if mode not in _VALID_MODES:
+        raise HTTPException(400, f"mode must be one of {_VALID_MODES}")
+    return await scrape_by_ticker(exchange, ticker, mode=mode)

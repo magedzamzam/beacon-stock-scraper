@@ -470,7 +470,6 @@ class StockFinRatios(Base):
     current_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     debt_to_equity: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     fcf_yield: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
-    z_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(9, 3))
     snapshot_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     snapshot_market_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -756,6 +755,61 @@ class AlertEvent(Base):
     body: Mapped[Optional[str]] = mapped_column(Text)
     delivery: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+
+# =============================================================================
+# Trading Bot — Milestone 1 (migration 015)
+# =============================================================================
+class TgChannel(Base):
+    """Telegram channel the listener subscribes to."""
+    __tablename__ = "tg_channels"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    channel_username: Mapped[Optional[str]] = mapped_column(String(80))
+    channel_title: Mapped[str] = mapped_column(String(160), nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    parser_key: Mapped[str] = mapped_column(String(32), nullable=False, default="gold_xau")
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    last_message_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TgRawMessage(Base):
+    """Raw message captured by the listener. Queue for the parser worker."""
+    __tablename__ = "tg_raw_messages"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    channel_title: Mapped[Optional[str]] = mapped_column(String(160))
+    tg_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sender_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    message_text: Mapped[Optional[str]] = mapped_column(Text)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    parse_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    parse_error: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class TgSignal(Base):
+    """Parsed signal — one row per successful parse."""
+    __tablename__ = "tg_signals"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("tg_raw_messages.id", ondelete="CASCADE"), nullable=False,
+    )
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    channel_title: Mapped[Optional[str]] = mapped_column(String(160))
+    signal_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)
+    entry_from: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    entry_to: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    sl: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    tps: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    parser_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="NEW")
+    raw_text: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 # ---------- Engine factory ----------

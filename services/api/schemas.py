@@ -109,8 +109,6 @@ class StockSummary(BaseModel):
     composite_score: Optional[float] = None
     verdict: Optional[str] = None
     last_updated: Optional[datetime] = None
-    next_earnings_date: Optional[date] = None
-    earnings_time: Optional[str] = None
 
 
 class StockDetail(StockSummary):

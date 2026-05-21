@@ -114,6 +114,19 @@ services:
         condition: service_healthy
     networks: [beacon-net]
 
+  telegram_listener:
+    build:
+      context: .
+      dockerfile: services/telegram_listener/Dockerfile
+    image: beacon-telegram-listener:latest
+    restart: unless-stopped
+    # Telegram API uses non-standard ports; keep the dns override consistent
+    # with other services that hit external networks.
+    dns: [1.1.1.1, 8.8.8.8]
+    environment:
+      <<: *python-env
+    networks: [beacon-net]
+
   sentiment:
     build:
       context: .

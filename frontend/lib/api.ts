@@ -439,6 +439,26 @@ export const api = {
     return request<AlertEventRow[]>(`/admin/alerts/events?${qs.toString()}`);
   },
 
+  // ===== Trading Bot =====
+  tgSignals: (limit = 50) =>
+    request<TgSignalRow[]>(`/trading-bot/signals?limit=${limit}`),
+  tgRawMessages: (limit = 50, parseStatus?: string) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (parseStatus) qs.set("parse_status", parseStatus);
+    return request<TgRawMessageRow[]>(`/trading-bot/raw?${qs.toString()}`);
+  },
+  tgChannels: () => request<TgChannelRow[]>("/trading-bot/channels"),
+  createTgChannel: (body: TgChannelInput) =>
+    request<TgChannelRow>("/trading-bot/channels", {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  updateTgChannel: (id: number, body: Partial<TgChannelInput>) =>
+    request<TgChannelRow>(`/trading-bot/channels/${id}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  deleteTgChannel: (id: number) =>
+    request<{ deleted: number }>(`/trading-bot/channels/${id}`, { method: "DELETE" }),
+
   // ===== Brokers / accounts =====
   listBrokers: () =>
     request<BrokerInfo[]>("/accounts/brokers"),
@@ -969,4 +989,51 @@ export interface AlertsEvaluateSummary {
   rules_errored: number;
   alerts_fired: number;
   alerts_skipped_cooldown: number;
+}
+
+// ===== Trading Bot =====
+export interface TgSignalRow {
+  id: number;
+  signal_time: string;
+  symbol: string;
+  direction: "BUY" | "SELL";
+  entry_from: number;
+  entry_to: number;
+  sl: number;
+  tps: number[];
+  parser_key: string;
+  status: string;
+  channel_id: number;
+  channel_title: string | null;
+  raw_text: string | null;
+}
+
+export interface TgRawMessageRow {
+  id: number;
+  channel_id: number;
+  channel_title: string | null;
+  tg_message_id: number;
+  received_at: string;
+  processed_at: string | null;
+  parse_status: "pending" | "signal" | "noise" | "failed";
+  parse_error: string | null;
+  message_text: string | null;
+}
+
+export interface TgChannelInput {
+  channel_id: number;
+  channel_title: string;
+  channel_username?: string | null;
+  parser_key?: string;
+  is_enabled?: boolean;
+  notes?: string | null;
+}
+
+export interface TgChannelRow extends TgChannelInput {
+  id: number;
+  is_enabled: boolean;
+  parser_key: string;
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
