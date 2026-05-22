@@ -1116,18 +1116,22 @@ export interface TgTradeOptions {
   channel_strategy: TgChannelStrategy | null;
 }
 
-export interface TgTradeRequest {
-  account_id: number;
+export interface TgTradeOrderLeg {
   broker_symbol: string;
   side: "BUY" | "SELL";
   order_type: "MARKET" | "LIMIT" | "STOP";
   quantity: number;
-  limit_price?: number | null;
-  stop_loss?: number | null;
-  take_profit?: number | null;
-  tp_level?: string | null;
-  risk_pct?: number | null;
+  limit_price: number | null;
+  stop_loss: number;
+  take_profit: number;
+  tp_level: string;          // "TP1" | "TP2" | …
+}
+
+export interface TgTradeRequest {
+  account_id: number;
+  total_risk_pct: number;
   notes?: string | null;
+  legs: TgTradeOrderLeg[];
 }
 
 export interface TgTradeResult {
