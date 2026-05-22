@@ -1,28 +1,28 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import useSWR from "swr";
 import {
   Bot, Plus, Pencil, Trash2, RefreshCw, AlertCircle, Search,
-  CheckCircle2, ToggleLeft, ToggleRight, Loader2,
+  CheckCircle2, ToggleLeft, ToggleRight, Loader2, Sliders, Save,
 } from "lucide-react";
 import {
   api,
   type TgChannelInput, type TgChannelRow, type TgResolveResult,
+  type TgBotSettings,
 } from "@/lib/api";
 
 /**
- * Admin → Bot config (Milestone 2).
+ * Admin → Bot config (Milestone 2 + 3).
  *
- * Per-channel CRUD with strategy parameters:
- *   - Identity:       channel_id, title, username, image_url
- *   - Parsing:        parser_key, notes
- *   - Strategy:       order_position_type, tp_strategy
- *   - Flags:          is_enabled, is_tradeable, is_trusted
+ * Two sections:
+ *   1. Global settings — risk %, lot rules, default TP level. Drives the
+ *      trade form's pre-fill behaviour for everyone.
+ *   2. Channels — per-channel CRUD with strategy parameters.
  *
- * The "Resolve" button pre-fills the form by asking the listener service
- * to look up @username or numeric id and return the canonical title +
- * numeric id. Admin never has to know Telegram's -100... prefix manually.
+ * The Resolve button under "Add channel" pre-fills by asking the listener
+ * to look up @username or numeric id. Admin never types the -100... prefix
+ * manually.
  */
 export default function AdminBotPage() {
   const { data: channels, mutate, isLoading } = useSWR(
@@ -33,6 +33,7 @@ export default function AdminBotPage() {
 
   return (
     <div className="space-y-5">
+      <BotGlobalSettings />
       <header className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold flex items-center gap-2">
@@ -441,6 +442,149 @@ function CheckboxField({ label, value, help, onChange }: {
         <div className="text-ink">{label}</div>
         {help && <div className="text-[11px] text-ink-dim mt-0.5">{help}</div>}
       </div>
+    </label>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Global bot settings — risk %, lot rules, default TP level.
+// ---------------------------------------------------------------------------
+function BotGlobalSettings() {
+  const { data, mutate } = useSWR("admin:bot:settings", api.tgBotSettings);
+
+  // Working copy so the user can tweak without committing until "Save".
+  const [draft, setDraft] = useState<Partial<TgBotSettings> | null>(null);
+  useEffect(() => { setDraft(data ? { ...data } : null); }, [data]);
+
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  async function save() {
+    if (!draft) return;
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      // Translate `tgbot.risk_pct_per_trade` keys to bare names the API expects.
+      const body = {
+        risk_pct_per_trade:     draft["tgbot.risk_pct_per_trade"],
+        max_risk_pct_per_trade: draft["tgbot.max_risk_pct_per_trade"],
+        min_lot_size:           draft["tgbot.min_lot_size"],
+        lot_step:               draft["tgbot.lot_step"],
+        default_tp_level:       draft["tgbot.default_tp_level"],
+      };
+      await api.updateTgBotSettings(body);
+      await mutate();
+      setSaved(true);
+      // Self-clear the "Saved" indicator after a moment so the UI doesn't
+      // claim a stale success state.
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e: any) {
+      setError(e.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!draft) {
+    return (
+      <section className="card p-4">
+        <Loader2 className="size-4 inline-block animate-spin" /> Loading bot settings…
+      </section>
+    );
+  }
+
+  function set<K extends keyof TgBotSettings>(k: K, v: TgBotSettings[K]) {
+    setDraft(prev => ({ ...(prev || {}), [k]: v }));
+  }
+
+  return (
+    <section className="card p-4 space-y-4">
+      <header className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <Sliders className="size-4" /> Bot global settings
+        </h3>
+        <button onClick={save} disabled={saving} className="btn-primary text-xs">
+          {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+          Save
+        </button>
+      </header>
+      <p className="text-ink-muted text-xs">
+        Defaults applied to the trade form. Per-trade values are still editable.
+      </p>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        <NumField
+          label="Default risk per trade (%)"
+          help="Pre-filled into the trade form. User can override per trade."
+          value={draft["tgbot.risk_pct_per_trade"]}
+          step={0.1} min={0.01} max={100}
+          onChange={v => set("tgbot.risk_pct_per_trade", v)}
+        />
+        <NumField
+          label="Max risk per trade (%)"
+          help="Hard cap. The trade form refuses higher values."
+          value={draft["tgbot.max_risk_pct_per_trade"]}
+          step={0.1} min={0.01} max={100}
+          onChange={v => set("tgbot.max_risk_pct_per_trade", v)}
+        />
+        <NumField
+          label="Minimum lot size"
+          help="Smallest order size the form allows. Broker minimum is usually 0.01."
+          value={draft["tgbot.min_lot_size"]}
+          step={0.01} min={0.0001} max={1000}
+          onChange={v => set("tgbot.min_lot_size", v)}
+        />
+        <NumField
+          label="Lot step"
+          help="Lot increment. Computed lot rounds down to this step."
+          value={draft["tgbot.lot_step"]}
+          step={0.01} min={0.0001} max={100}
+          onChange={v => set("tgbot.lot_step", v)}
+        />
+        <label className="block text-xs">
+          <span className="text-ink-muted">Default TP level</span>
+          <select className="input mt-1 w-full"
+                  value={draft["tgbot.default_tp_level"] ?? "TP1"}
+                  onChange={e => set("tgbot.default_tp_level", e.target.value)}>
+            {["TP1", "TP2", "TP3", "TP4", "TP5", "TP6", "TP7", "TP8"].map(t =>
+              <option key={t} value={t}>{t}</option>
+            )}
+          </select>
+          <span className="text-[11px] text-ink-dim block mt-0.5">
+            Trade form picks this TP from the signal by default.
+          </span>
+        </label>
+      </div>
+
+      {error && (
+        <div className="text-xs text-rose-500 flex items-center gap-1">
+          <AlertCircle className="size-3.5" /> {error}
+        </div>
+      )}
+      {saved && (
+        <div className="text-xs text-emerald-500 flex items-center gap-1">
+          <CheckCircle2 className="size-3.5" /> Saved.
+        </div>
+      )}
+    </section>
+  );
+}
+
+
+function NumField({ label, value, help, onChange, step, min, max }: {
+  label: string; value: number | undefined; help?: string;
+  onChange: (v: number) => void;
+  step?: number; min?: number; max?: number;
+}) {
+  return (
+    <label className="block text-xs">
+      <span className="text-ink-muted">{label}</span>
+      <input type="number" step={step} min={min} max={max}
+             className="input mt-1 w-full font-mono"
+             value={value ?? ""}
+             onChange={e => onChange(Number(e.target.value))} />
+      {help && <span className="text-[11px] text-ink-dim block mt-0.5">{help}</span>}
     </label>
   );
 }

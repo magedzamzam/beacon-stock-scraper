@@ -4,9 +4,10 @@ import { useState } from "react";
 import useSWR from "swr";
 import {
   Bot, ChevronRight, ArrowUp, ArrowDown, AlertCircle,
-  RefreshCw, MessageSquare, RadioTower,
+  RefreshCw, MessageSquare, RadioTower, Zap, History,
 } from "lucide-react";
-import { api, type TgSignalRow } from "@/lib/api";
+import { api, type TgSignalRow, type TgTradeRow } from "@/lib/api";
+import TradeSignalModal from "@/components/TradeSignalModal";
 
 /**
  * Trading Bot — Milestone 1.
@@ -30,6 +31,9 @@ export default function TradingBotPage() {
   // Selected signal id for the detail pane. Null = nothing selected.
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const selected = signals?.find(s => s.id === selectedId) ?? signals?.[0] ?? null;
+
+  // Trade modal — open with a signal id, null when closed.
+  const [tradingSignalId, setTradingSignalId] = useState<number | null>(null);
 
   return (
     <div className="space-y-4">
@@ -85,7 +89,8 @@ export default function TradingBotPage() {
         {/* Detail pane */}
         <section className="card p-4 min-h-[400px]">
           {selected ? (
-            <SignalDetail signal={selected} />
+            <SignalDetail signal={selected}
+                          onTrade={() => setTradingSignalId(selected.id)} />
           ) : (
             <div className="text-sm text-ink-muted flex items-center gap-2">
               <AlertCircle className="size-4" />
@@ -94,6 +99,16 @@ export default function TradingBotPage() {
           )}
         </section>
       </div>
+
+      {tradingSignalId !== null && (
+        <TradeSignalModal
+          signalId={tradingSignalId}
+          onClose={() => setTradingSignalId(null)}
+          // After a successful trade we re-fetch the signal list so the
+          // "Traded" badge appears immediately.
+          onPlaced={() => { mutate(); }}
+        />
+      )}
     </div>
   );
 }
@@ -136,10 +151,21 @@ function SignalRow({
 }
 
 
-function SignalDetail({ signal: s }: { signal: TgSignalRow }) {
+function SignalDetail({ signal: s, onTrade }: {
+  signal: TgSignalRow;
+  onTrade: () => void;
+}) {
   const dirCls = s.direction === "BUY"
     ? "bg-emerald-500/15 text-emerald-400"
     : "bg-rose-500/15 text-rose-400";
+
+  // Past trades placed against this signal. Refreshes whenever the signal
+  // changes so switching between signals doesn't show stale rows.
+  const { data: trades, mutate: refetchTrades } = useSWR(
+    ["trades-for-signal", s.id],
+    () => api.tgTradesForSignal(s.id),
+  );
+
   return (
     <div className="space-y-4">
       <div className="flex items-start justify-between gap-4">
@@ -158,17 +184,36 @@ function SignalDetail({ signal: s }: { signal: TgSignalRow }) {
             {new Date(s.signal_time).toLocaleString()}
           </div>
         </div>
-        <span className="text-[11px] px-2 py-0.5 rounded bg-bg-subtle text-ink-muted">
-          {s.status}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] px-2 py-0.5 rounded bg-bg-subtle text-ink-muted">
+            {s.status}
+          </span>
+          <button onClick={() => { onTrade(); refetchTrades(); }}
+                  className="btn-primary text-xs">
+            <Zap className="size-3.5" /> Trade
+          </button>
+        </div>
       </div>
 
       <dl className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-        <Field label="Entry from" value={fmt(s.entry_from)} mono />
-        <Field label="Entry to"   value={fmt(s.entry_to)} mono />
-        <Field label="Stop loss"  value={fmt(s.sl)} mono valueCls="text-rose-400" />
-        <Field label="TPs"        value={(s.tps || []).map(fmt).join(" · ") || "—"} mono />
+        <DetailField label="Entry from" value={fmt(s.entry_from)} mono />
+        <DetailField label="Entry to"   value={fmt(s.entry_to)} mono />
+        <DetailField label="Stop loss"  value={fmt(s.sl)} mono valueCls="text-rose-400" />
+        <DetailField label="TPs"        value={(s.tps || []).map(fmt).join(" · ") || "—"} mono />
       </dl>
+
+      {trades && trades.length > 0 && (
+        <div>
+          <div className="text-xs text-ink-muted mb-1 flex items-center gap-1">
+            <History className="size-3.5" /> Trades placed ({trades.length})
+          </div>
+          <div className="border border-border rounded divide-y divide-border text-xs">
+            {trades.map(t => (
+              <TradeRow key={t.id} trade={t} />
+            ))}
+          </div>
+        </div>
+      )}
 
       {s.raw_text && (
         <div>
@@ -185,7 +230,37 @@ function SignalDetail({ signal: s }: { signal: TgSignalRow }) {
 }
 
 
-function Field({ label, value, mono, valueCls }: {
+function TradeRow({ trade: t }: { trade: TgTradeRow }) {
+  const o = t.order;
+  const statusCls =
+    o?.status === "FILLED"   ? "text-emerald-400" :
+    o?.status === "PENDING"  ? "text-amber-400" :
+    o?.status === "REJECTED" ? "text-rose-400" :
+    "text-ink-muted";
+  return (
+    <div className="p-2 flex items-center justify-between gap-2">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="font-mono text-ink">
+          {o?.side} {o?.quantity?.toFixed?.(2)}
+        </span>
+        {t.tp_level && (
+          <span className="text-[10px] uppercase text-ink-dim">
+            target {t.tp_level}
+          </span>
+        )}
+        <span className={`text-[10px] uppercase tracking-wide ${statusCls}`}>
+          {o?.status ?? "unknown"}
+        </span>
+      </div>
+      <div className="text-[11px] text-ink-muted whitespace-nowrap">
+        {new Date(t.created_at).toLocaleString()}
+      </div>
+    </div>
+  );
+}
+
+
+function DetailField({ label, value, mono, valueCls }: {
   label: string; value: string; mono?: boolean; valueCls?: string;
 }) {
   return (

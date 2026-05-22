@@ -1,29 +1,43 @@
 """Trading Bot — read endpoints for the /trading-bot page + admin CRUD for
-channels.
+channels + manual trade execution from signals.
 
-Milestone 1 endpoints (no trade execution yet):
-    GET    /trading-bot/signals?limit=50      recent parsed signals (latest first)
-    GET    /trading-bot/raw?limit=50          recent raw messages (audit / debug)
-    GET    /trading-bot/channels              list channels
-    POST   /trading-bot/channels              admin: add channel
-    PATCH  /trading-bot/channels/{id}         admin: enable / rename / change parser
-    DELETE /trading-bot/channels/{id}         admin: remove channel
+Milestone 1 endpoints:
+    GET    /trading-bot/signals?limit=50              recent parsed signals
+    GET    /trading-bot/raw?limit=50                  recent raw messages
+Milestone 2 endpoints:
+    GET    /trading-bot/channels                      list channels
+    POST   /trading-bot/channels                      admin: add channel
+    PATCH  /trading-bot/channels/{id}                 admin: edit channel
+    DELETE /trading-bot/channels/{id}                 admin: remove channel
+    GET    /trading-bot/resolve?query=...             admin: resolve @username/id
+Milestone 3 endpoints (manual trading):
+    GET    /trading-bot/settings                      bot globals (risk %, lot rules)
+    PATCH  /trading-bot/settings                      admin: update bot globals
+    GET    /trading-bot/signals/{id}/trade-options    pre-fill data for trade form
+    POST   /trading-bot/signals/{id}/trade            place a trade from a signal
+    GET    /trading-bot/signals/{id}/trades           trades placed against this signal
+    GET    /trading-bot/trades                        user's recent trade history
 
-The listener service polls tg_channels every 60s, so changes take effect
+The listener service polls tg_channels every 60s, so admin changes propagate
 without a service restart.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from shared.db import TgChannel, TgRawMessage, TgSignal, User
+from shared.db import (
+    AppSetting, BotTrade, Broker, BrokerInstrument, BrokerOrder,
+    TgChannel, TgRawMessage, TgSignal, TradingAccount, User,
+)
 
 from .auth import get_current_user, get_db
 
@@ -279,3 +293,361 @@ async def resolve_channel(
         raise HTTPException(r.status_code, detail or "Resolve failed")
 
     return r.json()
+
+
+# =============================================================================
+# Milestone 3: Bot settings + manual trade execution
+# =============================================================================
+# Bot-global settings live in app_settings under keys 'tgbot.*'. Values are
+# stored as JSONB so numbers stay numbers and strings stay strings.
+_BOT_SETTING_KEYS = (
+    "tgbot.risk_pct_per_trade",
+    "tgbot.max_risk_pct_per_trade",
+    "tgbot.min_lot_size",
+    "tgbot.lot_step",
+    "tgbot.default_tp_level",
+)
+
+
+def _read_bot_settings(db: Session) -> dict[str, Any]:
+    """Return all 'tgbot.*' settings as a flat dict with safe fallbacks.
+
+    Defaults match migration 017's seed values so the form works even on
+    an environment where the migration hasn't fully applied.
+    """
+    defaults = {
+        "tgbot.risk_pct_per_trade":     1.0,
+        "tgbot.max_risk_pct_per_trade": 5.0,
+        "tgbot.min_lot_size":           0.01,
+        "tgbot.lot_step":               0.01,
+        "tgbot.default_tp_level":       "TP1",
+    }
+    rows = db.execute(
+        select(AppSetting).where(AppSetting.key.in_(_BOT_SETTING_KEYS))
+    ).scalars().all()
+    out = dict(defaults)
+    for r in rows:
+        out[r.key] = r.value
+    return out
+
+
+@trading_bot_router.get("/settings")
+def get_bot_settings(
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Bot globals (lot sizing / risk caps). Anyone authenticated can read —
+    the trade form needs these to compute lot sizes for non-admin users too.
+    """
+    return _read_bot_settings(db)
+
+
+class BotSettingsUpdate(BaseModel):
+    """Partial update. Each field maps to one app_settings row.
+
+    Constraints — defensive only; the frontend should enforce these too.
+    """
+    risk_pct_per_trade:     Optional[float] = Field(None, ge=0.01, le=100)
+    max_risk_pct_per_trade: Optional[float] = Field(None, ge=0.01, le=100)
+    min_lot_size:           Optional[float] = Field(None, gt=0)
+    lot_step:               Optional[float] = Field(None, gt=0)
+    default_tp_level:       Optional[str]   = Field(None, max_length=8)
+
+
+@trading_bot_router.patch("/settings")
+def update_bot_settings(
+    body: BotSettingsUpdate,
+    user: User = Depends(_require_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin-only. Each provided field UPSERTs one app_settings row."""
+    updates = body.model_dump(exclude_unset=True)
+    if not updates:
+        return _read_bot_settings(db)
+
+    for field, value in updates.items():
+        key = f"tgbot.{field}"
+        existing = db.execute(
+            select(AppSetting).where(AppSetting.key == key)
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(AppSetting(
+                key=key, value=value,
+                description=f"Bot setting: {field}",
+                updated_by=user.id, updated_at=datetime.utcnow(),
+            ))
+        else:
+            existing.value = value
+            existing.updated_by = user.id
+            existing.updated_at = datetime.utcnow()
+    db.commit()
+    return _read_bot_settings(db)
+
+
+# ---------------------------------------------------------------------------
+# Trade-options endpoint — gives the frontend everything it needs to render
+# the "Trade signal" modal in one round trip:
+#   - the signal itself
+#   - bot settings (default risk %, max risk %, lot rules)
+#   - eligible trading accounts (active + Capital.com for now)
+#   - resolved broker_symbol per account (so we know if the symbol is mapped)
+# ---------------------------------------------------------------------------
+@trading_bot_router.get("/signals/{signal_id}/trade-options")
+def get_trade_options(
+    signal_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    sig = db.get(TgSignal, signal_id)
+    if sig is None:
+        raise HTTPException(404, "Signal not found")
+
+    settings = _read_bot_settings(db)
+
+    # Active trading accounts owned by this user — keyed by broker for the
+    # frontend to group them under broker headings.
+    accounts = db.execute(
+        select(TradingAccount, Broker)
+        .join(Broker, TradingAccount.broker_id == Broker.id)
+        .where(TradingAccount.user_id == user.id,
+               TradingAccount.is_active.is_(True))
+        .order_by(Broker.name, TradingAccount.description)
+    ).all()
+
+    # Build the (account → resolved broker_symbol) map. The signal's symbol
+    # is something like 'XAUUSD' — each broker may use a different symbol
+    # (XAUUSD vs GOLD vs XAU/USD). We look it up via broker_instruments
+    # using a stock_id that matches by ticker if one exists; otherwise we
+    # pass the signal symbol through unchanged and let the broker reject it
+    # (the trade form lets the user override).
+    account_options = []
+    for acct, broker in accounts:
+        # Best-effort symbol resolution. Currently the bot only handles XAU,
+        # which isn't in the stocks table. For now we just echo the signal's
+        # symbol. Future: instrument lookup by ticker/broker.
+        account_options.append({
+            "account_id": acct.id,
+            "broker_id": broker.id,
+            "broker_code": broker.code,
+            "broker_name": broker.name,
+            "account_label": acct.description or f"Account {acct.id}",
+            "account_type": getattr(acct, "account_type", None),
+            "currency": getattr(acct, "currency", None),
+            "is_active": acct.is_active,
+            "resolved_symbol": sig.symbol,  # placeholder mapping
+        })
+
+    return {
+        "signal": {
+            "id": sig.id,
+            "symbol": sig.symbol,
+            "direction": sig.direction,
+            "entry_from": float(sig.entry_from),
+            "entry_to": float(sig.entry_to),
+            "sl": float(sig.sl),
+            "tps": [float(x) for x in (sig.tps or [])],
+            "channel_id": sig.channel_id,
+            "channel_title": sig.channel_title,
+            "signal_time": sig.signal_time,
+            "raw_text": sig.raw_text,
+        },
+        "settings": settings,
+        "accounts": account_options,
+        # Also include the channel's strategy params — the frontend uses
+        # `order_position_type` to pre-fill the order type radio.
+        "channel_strategy": _channel_strategy_for(db, sig.channel_id),
+    }
+
+
+def _channel_strategy_for(db: Session, channel_id: int) -> Optional[dict[str, Any]]:
+    """Returns the strategy block from tg_channels for a given Telegram
+    channel_id, or None if the channel was somehow removed since the signal
+    was logged."""
+    c = db.execute(
+        select(TgChannel).where(TgChannel.channel_id == channel_id)
+    ).scalar_one_or_none()
+    if c is None:
+        return None
+    return {
+        "order_position_type": c.order_position_type,
+        "tp_strategy": c.tp_strategy,
+        "is_tradeable": c.is_tradeable,
+        "is_trusted": c.is_trusted,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trade endpoint — places ONE order against ONE account for ONE TP level.
+# Calls the existing /orders endpoint internally (broker_gateway routing
+# stays unchanged). Wraps the created BrokerOrder row in a BotTrade link.
+# ---------------------------------------------------------------------------
+class TradeSignalRequest(BaseModel):
+    account_id: int
+    broker_symbol: str = Field(..., min_length=1, max_length=64)
+    side: str = Field(..., pattern="^(BUY|SELL)$")
+    order_type: str = Field(..., pattern="^(MARKET|LIMIT|STOP)$")
+    quantity: Decimal = Field(..., gt=0)
+    limit_price: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    tp_level: Optional[str] = Field(None, max_length=8)
+    risk_pct: Optional[Decimal] = Field(None, ge=0, le=100)
+    notes: Optional[str] = None
+
+
+@trading_bot_router.post("/signals/{signal_id}/trade")
+async def trade_signal(
+    signal_id: int,
+    body: TradeSignalRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Place a manual trade against a Telegram signal.
+
+    We deliberately POST to the existing /orders endpoint instead of
+    duplicating its broker_gateway logic. That keeps a single code path
+    for "order goes from Beacon to broker" — bug fixes there flow to bot
+    trades for free.
+    """
+    sig = db.get(TgSignal, signal_id)
+    if sig is None:
+        raise HTTPException(404, "Signal not found")
+
+    acct = db.get(TradingAccount, body.account_id)
+    if acct is None or acct.user_id != user.id or not acct.is_active:
+        raise HTTPException(404, "Trading account not found / not yours / inactive")
+
+    # 1. Place the order via existing /orders handler.
+    # We avoid re-implementing the place_order logic by importing the function
+    # and calling it directly. This shares its DB session, auth context, and
+    # broker_gateway dispatch — bug fixes there propagate automatically.
+    from .routers_orders import place_order, PlaceOrderIn
+
+    order_in = PlaceOrderIn(
+        account_id=body.account_id,
+        stock_id=None,                 # bot signals aren't tied to stocks
+        broker_symbol=body.broker_symbol,
+        side=body.side,
+        order_type=body.order_type,
+        quantity=body.quantity,
+        limit_price=body.limit_price,
+        stop_loss=body.stop_loss,
+        take_profit=body.take_profit,
+        notes=body.notes or f"Bot signal #{signal_id} ({sig.channel_title})",
+    )
+    order_response = await place_order(order_in, user=user, db=db)
+
+    # 2. The /orders response is a dict; pull the order id we just created.
+    # Be defensive about the response shape — different paths (manual vs
+    # automated account) may use different keys.
+    order_id = (
+        order_response.get("id")
+        or order_response.get("order_id")
+        or order_response.get("order", {}).get("id")
+    )
+    if not order_id:
+        raise HTTPException(
+            500,
+            f"Order placed but no id returned — response: {order_response}",
+        )
+
+    # 3. Link the order to the signal via bot_trades.
+    bt = BotTrade(
+        signal_id=signal_id,
+        order_id=order_id,
+        user_id=user.id,
+        account_id=body.account_id,
+        tp_level=body.tp_level,
+        risk_pct=body.risk_pct,
+        trade_mode="manual",
+        notes=body.notes,
+    )
+    db.add(bt)
+    db.commit()
+    db.refresh(bt)
+
+    return {
+        "bot_trade_id": bt.id,
+        "order_id": order_id,
+        "signal_id": signal_id,
+        "order": order_response,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trade history endpoints
+# ---------------------------------------------------------------------------
+def _bot_trade_out(bt: BotTrade, order: Optional[BrokerOrder],
+                   sig: Optional[TgSignal]) -> dict[str, Any]:
+    """Build the trade-row payload the UI table renders.
+
+    Includes the underlying order's status so the user can see fills /
+    rejections / pending state without an extra fetch.
+    """
+    return {
+        "id": bt.id,
+        "signal_id": bt.signal_id,
+        "order_id": bt.order_id,
+        "account_id": bt.account_id,
+        "tp_level": bt.tp_level,
+        "risk_pct": float(bt.risk_pct) if bt.risk_pct is not None else None,
+        "trade_mode": bt.trade_mode,
+        "notes": bt.notes,
+        "created_at": bt.created_at,
+        "signal": {
+            "symbol": sig.symbol, "direction": sig.direction,
+            "channel_title": sig.channel_title,
+            "signal_time": sig.signal_time,
+        } if sig else None,
+        "order": {
+            "side": order.side, "order_type": order.order_type,
+            "quantity": float(order.quantity),
+            "limit_price": float(order.limit_price) if order.limit_price is not None else None,
+            "stop_loss":   float(order.stop_loss)   if order.stop_loss   is not None else None,
+            "take_profit": float(order.take_profit) if order.take_profit is not None else None,
+            "status": order.status,
+            "fill_price": float(order.fill_price) if order.fill_price is not None else None,
+            "broker_order_ref": order.broker_order_ref,
+            "rejection_reason": order.rejection_reason,
+            "placed_at": order.placed_at,
+            "filled_at": order.filled_at,
+        } if order else None,
+    }
+
+
+@trading_bot_router.get("/signals/{signal_id}/trades")
+def list_trades_for_signal(
+    signal_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Trades placed against a specific signal — used by the UI to show
+    a "✓ Traded N times" badge and a quick list.
+    """
+    rows = db.execute(
+        select(BotTrade, BrokerOrder, TgSignal)
+        .outerjoin(BrokerOrder, BrokerOrder.id == BotTrade.order_id)
+        .outerjoin(TgSignal,    TgSignal.id == BotTrade.signal_id)
+        .where(BotTrade.signal_id == signal_id, BotTrade.user_id == user.id)
+        .order_by(desc(BotTrade.created_at))
+    ).all()
+    return [_bot_trade_out(bt, order, sig) for (bt, order, sig) in rows]
+
+
+@trading_bot_router.get("/trades")
+def list_my_trades(
+    limit: int = 50,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """All of the current user's bot-trades, newest first."""
+    limit = max(1, min(limit, 200))
+    rows = db.execute(
+        select(BotTrade, BrokerOrder, TgSignal)
+        .outerjoin(BrokerOrder, BrokerOrder.id == BotTrade.order_id)
+        .outerjoin(TgSignal,    TgSignal.id == BotTrade.signal_id)
+        .where(BotTrade.user_id == user.id)
+        .order_by(desc(BotTrade.created_at))
+        .limit(limit)
+    ).all()
+    return [_bot_trade_out(bt, order, sig) for (bt, order, sig) in rows]

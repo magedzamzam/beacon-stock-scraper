@@ -825,6 +825,34 @@ class TgSignal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class BotTrade(Base):
+    """Trade placed from a signal — links tg_signals → broker_orders.
+
+    One signal can have many trades (different accounts, different TPs,
+    user repeating the same trade by mistake). Lookup by signal_id is
+    indexed so the UI can show "✓ Traded" badges efficiently.
+    """
+    __tablename__ = "bot_trades"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    signal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("tg_signals.id", ondelete="CASCADE"), nullable=False,
+    )
+    order_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("broker_orders.id", ondelete="CASCADE"), nullable=False,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+    account_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("trading_accounts.id", ondelete="CASCADE"), nullable=False,
+    )
+    tp_level: Mapped[Optional[str]] = mapped_column(String(8))
+    risk_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 3))
+    trade_mode: Mapped[str] = mapped_column(String(16), default="manual")
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # ---------- Engine factory ----------
 _settings = get_settings()
 _engine = create_engine(_settings.database_url_sync, pool_pre_ping=True, pool_size=10)

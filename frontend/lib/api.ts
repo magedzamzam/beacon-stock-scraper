@@ -460,6 +460,22 @@ export const api = {
     request<{ deleted: number }>(`/trading-bot/channels/${id}`, { method: "DELETE" }),
   resolveTgChannel: (query: string) =>
     request<TgResolveResult>(`/trading-bot/resolve?query=${encodeURIComponent(query)}`),
+  // ===== Trading Bot · Milestone 3 (manual execution) =====
+  tgBotSettings: () => request<TgBotSettings>("/trading-bot/settings"),
+  updateTgBotSettings: (body: Partial<TgBotSettingsInput>) =>
+    request<TgBotSettings>("/trading-bot/settings", {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  tgTradeOptions: (signalId: number) =>
+    request<TgTradeOptions>(`/trading-bot/signals/${signalId}/trade-options`),
+  tgTradeSignal: (signalId: number, body: TgTradeRequest) =>
+    request<TgTradeResult>(`/trading-bot/signals/${signalId}/trade`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  tgTradesForSignal: (signalId: number) =>
+    request<TgTradeRow[]>(`/trading-bot/signals/${signalId}/trades`),
+  tgMyTrades: (limit = 50) =>
+    request<TgTradeRow[]>(`/trading-bot/trades?limit=${limit}`),
 
   // ===== Brokers / accounts =====
   listBrokers: () =>
@@ -1055,4 +1071,98 @@ export interface TgResolveResult {
   title: string;
   username: string | null;
   kind: string;
+}
+
+// ===== Trading Bot · Milestone 3 =====
+export interface TgBotSettings {
+  "tgbot.risk_pct_per_trade": number;
+  "tgbot.max_risk_pct_per_trade": number;
+  "tgbot.min_lot_size": number;
+  "tgbot.lot_step": number;
+  "tgbot.default_tp_level": string;
+}
+
+export interface TgBotSettingsInput {
+  risk_pct_per_trade?: number;
+  max_risk_pct_per_trade?: number;
+  min_lot_size?: number;
+  lot_step?: number;
+  default_tp_level?: string;
+}
+
+export interface TgTradeAccountOption {
+  account_id: number;
+  broker_id: number;
+  broker_code: string;
+  broker_name: string;
+  account_label: string;
+  account_type: string | null;
+  currency: string | null;
+  is_active: boolean;
+  resolved_symbol: string;
+}
+
+export interface TgChannelStrategy {
+  order_position_type: "MARKET" | "LIMIT" | "STOP";
+  tp_strategy: string;
+  is_tradeable: boolean;
+  is_trusted: boolean;
+}
+
+export interface TgTradeOptions {
+  signal: TgSignalRow;
+  settings: TgBotSettings;
+  accounts: TgTradeAccountOption[];
+  channel_strategy: TgChannelStrategy | null;
+}
+
+export interface TgTradeRequest {
+  account_id: number;
+  broker_symbol: string;
+  side: "BUY" | "SELL";
+  order_type: "MARKET" | "LIMIT" | "STOP";
+  quantity: number;
+  limit_price?: number | null;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  tp_level?: string | null;
+  risk_pct?: number | null;
+  notes?: string | null;
+}
+
+export interface TgTradeResult {
+  bot_trade_id: number;
+  order_id: number;
+  signal_id: number;
+  order: any;
+}
+
+export interface TgTradeRow {
+  id: number;
+  signal_id: number;
+  order_id: number;
+  account_id: number;
+  tp_level: string | null;
+  risk_pct: number | null;
+  trade_mode: string;
+  notes: string | null;
+  created_at: string;
+  signal: {
+    symbol: string; direction: "BUY" | "SELL";
+    channel_title: string | null;
+    signal_time: string;
+  } | null;
+  order: {
+    side: string; order_type: string;
+    quantity: number;
+    limit_price: number | null;
+    stop_loss: number | null;
+    take_profit: number | null;
+    status: string;
+    fill_price: number | null;
+    broker_order_ref: string | null;
+    rejection_reason: string | null;
+    placed_at: string;
+    filled_at: string | null;
+  } | null;
 }
