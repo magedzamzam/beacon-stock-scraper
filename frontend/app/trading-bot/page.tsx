@@ -9,6 +9,20 @@ import {
 import { api, type TgSignalRow, type TgTradeRow } from "@/lib/api";
 import TradeSignalModal from "@/components/TradeSignalModal";
 
+// ─── Timezone configuration ─────────────────────────────────────────
+// Set your timezone here. Examples: "America/New_York", "Europe/London",
+// "Asia/Tokyo", "Australia/Sydney". Uses system default if null.
+const DISPLAY_TIMEZONE: string | undefined = undefined; // e.g. "America/New_York"
+
+// Helper: convert UTC ISO string to locale string in target timezone
+function toLocalTime(iso: string, opts?: Intl.DateTimeFormatOptions): string {
+  const d = new Date(iso);
+  return d.toLocaleString(undefined, {
+    timeZone: DISPLAY_TIMEZONE,
+    ...opts,
+  });
+}
+
 /**
  * Trading Bot — Milestone 1.
  *
@@ -21,6 +35,7 @@ import TradeSignalModal from "@/components/TradeSignalModal";
  * Refreshes every 10s via SWR — short enough that new signals appear
  * promptly, long enough not to hammer the API.
  */
+
 export default function TradingBotPage() {
   const { data: signals, mutate, isLoading } = useSWR(
     "trading-bot:signals",
@@ -28,11 +43,8 @@ export default function TradingBotPage() {
     { refreshInterval: 10_000 },
   );
 
-  // Selected signal id for the detail pane. Null = nothing selected.
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const selected = signals?.find(s => s.id === selectedId) ?? signals?.[0] ?? null;
-
-  // Trade modal — open with a signal id, null when closed.
   const [tradingSignalId, setTradingSignalId] = useState<number | null>(null);
 
   return (
@@ -104,8 +116,6 @@ export default function TradingBotPage() {
         <TradeSignalModal
           signalId={tradingSignalId}
           onClose={() => setTradingSignalId(null)}
-          // After a successful trade we re-fetch the signal list so the
-          // "Traded" badge appears immediately.
           onPlaced={() => { mutate(); }}
         />
       )}
@@ -159,8 +169,6 @@ function SignalDetail({ signal: s, onTrade }: {
     ? "bg-emerald-500/15 text-emerald-400"
     : "bg-rose-500/15 text-rose-400";
 
-  // Past trades placed against this signal. Refreshes whenever the signal
-  // changes so switching between signals doesn't show stale rows.
   const { data: trades, mutate: refetchTrades } = useSWR(
     ["trades-for-signal", s.id],
     () => api.tgTradesForSignal(s.id),
@@ -181,7 +189,7 @@ function SignalDetail({ signal: s, onTrade }: {
           </div>
           <div className="text-xs text-ink-muted mt-1">
             From {s.channel_title || `channel ${s.channel_id}`} ·{" "}
-            {new Date(s.signal_time).toLocaleString()}
+            {toLocalTime(s.signal_time)}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -253,7 +261,7 @@ function TradeRow({ trade: t }: { trade: TgTradeRow }) {
         </span>
       </div>
       <div className="text-[11px] text-ink-muted whitespace-nowrap">
-        {new Date(t.created_at).toLocaleString()}
+        {toLocalTime(t.created_at)}
       </div>
     </div>
   );
@@ -275,20 +283,17 @@ function DetailField({ label, value, mono, valueCls }: {
 
 
 function fmt(n: number) {
-  // XAU prices have up to two decimals; forex pairs have up to five. We
-  // pick a sensible default — show up to 6 significant digits without
-  // trailing zeros.
   return Number(n).toLocaleString(undefined, {
     maximumFractionDigits: 6, minimumFractionDigits: 0,
   });
 }
 
 function relTime(iso: string) {
-  // Lightweight "5m ago" formatter — avoids pulling date-fns just for this.
+  // Uses local system time for relative diff (usually what users expect)
   const d = new Date(iso);
   const diff = (Date.now() - d.getTime()) / 1000;
   if (diff < 60) return "just now";
   if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
-  return d.toLocaleDateString();
+  return toLocalTime(iso, { month: "short", day: "numeric" });
 }
