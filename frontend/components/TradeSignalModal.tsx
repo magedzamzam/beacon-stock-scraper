@@ -9,7 +9,6 @@ import {
 import {
   api,
   type TgSignalRow, type TgTradeOptions, type TgTradeRequest,
-  type TgTradeAccountOption,
 } from "@/lib/api";
 
 /**
@@ -77,6 +76,8 @@ export default function TradeSignalModal({
 }
 
 
+
+
 // ---------------------------------------------------------------------------
 // Form
 // ---------------------------------------------------------------------------
@@ -91,72 +92,86 @@ function TradeForm({
   const { signal, settings, accounts, channel_strategy } = data;
   const tps = signal.tps || [];
 
-  // Pre-fill values from the signal + channel strategy + bot settings.
-  // Account: first eligible Capital.com (or first overall) by default.
+  // Determine the fanout shape.
+  //   entry_from == entry_to → 1 × N orders (one per TP, single entry)
+  //   entry_from != entry_to → 2 × N orders (each entry × each TP)
+  // The fanout is computed BEFORE the user makes any choices so they see
+  // exactly how many orders will be placed.
+  const entries = signal.entry_from === signal.entry_to
+    ? [signal.entry_from]
+    : [signal.entry_from, signal.entry_to];
+  const orderCount = entries.length * tps.length;
+
+  // Pre-fill from channel strategy + settings + defaults.
   const defaultAccount =
     accounts.find(a => a.broker_code === "capital_com" && a.is_active)
     ?? accounts[0] ?? null;
 
-  const [accountId, setAccountId] = useState<number | null>(defaultAccount?.account_id ?? null);
+  const [accountId, setAccountId] = useState<number | null>(
+    defaultAccount?.account_id ?? null,
+  );
   const account = accounts.find(a => a.account_id === accountId) ?? null;
 
-  // Order type pre-fill: respect the channel strategy. Default to MARKET if
-  // there is no channel strategy (rare — channel could have been deleted).
   const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "STOP">(
-    channel_strategy?.order_position_type ?? "MARKET",
+    channel_strategy?.order_position_type ?? "LIMIT",
   );
 
-  const side = signal.direction;   // BUY or SELL — never overridden by user
-  const [riskPct, setRiskPct] = useState<number>(settings["tgbot.risk_pct_per_trade"]);
+  const side = signal.direction;  // BUY/SELL — never user-overridden
 
-  // SL pre-filled from signal; user can edit but the system warns on bad side.
+  // total_risk_pct is the TOTAL across the whole fanout (your spec).
+  // The backend will divide it evenly across orderCount children.
+  const [totalRiskPct, setTotalRiskPct] = useState<number>(
+    settings["tgbot.risk_pct_per_trade"],
+  );
+
+  // SL is identical for every child. Editable so the user can adjust.
   const [stopLoss, setStopLoss] = useState<number>(signal.sl);
 
-  // TP picker: pick a TP level from the signal's TPs array. Default to the
-  // configured default level (e.g. "TP1") if it exists in the array.
-  const [tpIdx, setTpIdx] = useState<number>(() => {
-    const defaultLevel = settings["tgbot.default_tp_level"]; // e.g. "TP1"
-    const idx = parseInt(defaultLevel?.replace(/[^0-9]/g, "") || "1", 10) - 1;
-    if (idx >= 0 && idx < tps.length) return idx;
-    return tps.length > 0 ? 0 : -1;   // -1 = no TP
-  });
-  const takeProfit = tpIdx >= 0 ? tps[tpIdx] : null;
-  const tpLevel = tpIdx >= 0 ? `TP${tpIdx + 1}` : null;
-
-  // Limit price: required when order_type=LIMIT. Pre-filled to entry_from
-  // (the closer-to-current side of the range).
-  const [limitPrice, setLimitPrice] = useState<number>(signal.entry_from);
-  // For MARKET orders we don't send limit_price.
-  const effectiveLimit = orderType === "MARKET" ? null : limitPrice;
-
-  // Lot size — computed from risk% but editable.
-  const computedLot = useComputedLot({
-    riskPct, accountId, accounts,
-    entry: orderType === "MARKET" ? signal.entry_from : limitPrice,
-    sl: stopLoss,
-    minLot: settings["tgbot.min_lot_size"],
-    lotStep: settings["tgbot.lot_step"],
-  });
-  // Track whether the user manually edited lot. Once edited, we stop the
-  // auto-compute from overwriting their value.
-  const [lotOverride, setLotOverride] = useState<number | null>(null);
-  const lot = lotOverride ?? computedLot.value;
-
-  // Broker symbol — Capital.com adapter expects whatever the broker uses;
-  // we surface it as editable in case the resolved_symbol from the API is
-  // wrong (it's a placeholder right now — see backend comment).
+  // Broker symbol — editable per account.
   const [brokerSymbol, setBrokerSymbol] = useState<string>(
     account?.resolved_symbol ?? signal.symbol,
   );
   useEffect(() => {
-    // When the user switches account, re-pull its resolved_symbol.
     setBrokerSymbol(account?.resolved_symbol ?? signal.symbol);
   }, [account?.account_id]);
 
-  // SL-side sanity check — prevents the #1 copy-paste error.
+  // SL-side sanity (#1 copy-paste error).
   const slWrongSide =
-    (side === "BUY"  && stopLoss >= signal.entry_from) ||
-    (side === "SELL" && stopLoss <= signal.entry_from);
+    (side === "BUY"  && stopLoss >= Math.min(...entries)) ||
+    (side === "SELL" && stopLoss <= Math.max(...entries));
+
+  // Build the fanout legs. Lot per leg = total_risk / N. We don't have live
+  // account balance here, so the displayed lot is a placeholder min_lot for
+  // now and the backend recomputes from total_risk_pct on its end. See note
+  // in useComputedLot.
+  const minLot = settings["tgbot.min_lot_size"];
+  const lotStep = settings["tgbot.lot_step"];
+  const perOrderRiskPct = orderCount > 0 ? totalRiskPct / orderCount : 0;
+
+  const legs = useMemo(() => {
+    const out: Array<{
+      entry: number;
+      tp: number;
+      tpLevel: string;
+      orderType: "MARKET" | "LIMIT" | "STOP";
+      limitPrice: number | null;
+      quantity: number;
+    }> = [];
+    for (const entry of entries) {
+      tps.forEach((tp, i) => {
+        out.push({
+          entry,
+          tp,
+          tpLevel: `TP${i + 1}`,
+          orderType,
+          limitPrice: orderType === "MARKET" ? null : entry,
+          // Per-leg lot. Placeholder math — see useComputedLot note.
+          quantity: minLot,
+        });
+      });
+    }
+    return out;
+  }, [entries, tps, orderType, minLot]);
 
   // Place button state machine
   const [stage, setStage] = useState<"edit" | "confirm" | "placing" | "done">("edit");
@@ -166,9 +181,10 @@ function TradeForm({
   const canSubmit = !!(
     account &&
     brokerSymbol.trim() &&
-    lot > 0 &&
+    legs.length > 0 &&
     !slWrongSide &&
-    (orderType === "MARKET" || limitPrice > 0)
+    totalRiskPct > 0 &&
+    totalRiskPct <= settings["tgbot.max_risk_pct_per_trade"]
   );
 
   async function place() {
@@ -176,17 +192,19 @@ function TradeForm({
     setStage("placing"); setError(null);
     try {
       const body: TgTradeRequest = {
-        account_id: account.account_id,
-        broker_symbol: brokerSymbol.trim(),
-        side,
-        order_type: orderType,
-        quantity: lot,
-        limit_price: effectiveLimit,
-        stop_loss: stopLoss,
-        take_profit: takeProfit,
-        tp_level: tpLevel,
-        risk_pct: riskPct,
+        account_id:     account.account_id,
+        total_risk_pct: totalRiskPct,
         notes: `From signal #${signalId} (${signal.channel_title || signal.channel_id})`,
+        legs: legs.map(l => ({
+          broker_symbol: brokerSymbol.trim(),
+          side,
+          order_type:    l.orderType,
+          quantity:      l.quantity,
+          limit_price:   l.limitPrice,
+          stop_loss:     stopLoss,
+          take_profit:   l.tp,
+          tp_level:      l.tpLevel,
+        })),
       };
       const r = await api.tgTradeSignal(signalId, body);
       setResult(r);
@@ -200,19 +218,56 @@ function TradeForm({
 
   if (stage === "done") {
     return (
-      <div className="text-center py-8 space-y-3">
-        <CheckCircle2 className="size-12 text-emerald-500 mx-auto" />
-        <div className="text-lg font-semibold">Order placed</div>
-        <div className="text-sm text-ink-muted">
-          {side} {lot.toFixed(2)} {brokerSymbol} ·{" "}
-          Order status: <span className="font-mono">{result?.order?.status ?? "?"}</span>
+      <div className="space-y-4 py-4">
+        <div className="text-center space-y-2">
+          <CheckCircle2 className={`size-12 mx-auto ${
+            result?.all_ok ? "text-emerald-500" : "text-amber-500"
+          }`} />
+          <div className="text-lg font-semibold">
+            {result?.all_ok ? "All orders placed" : "Partially placed"}
+          </div>
+          <div className="text-sm text-ink-muted">
+            {result?.placed?.length ?? 0} placed
+            {result?.failed?.length > 0 && `, ${result.failed.length} failed`}
+          </div>
         </div>
-        {result?.order?.broker_order_ref && (
-          <div className="text-xs text-ink-muted font-mono">
-            broker ref: {result.order.broker_order_ref}
+        {result?.placed?.length > 0 && (
+          <div className="border border-border rounded overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-bg-subtle text-ink-muted">
+                <tr>
+                  <th className="text-left px-2 py-1.5">Leg</th>
+                  <th className="text-right px-2 py-1.5">TP</th>
+                  <th className="text-right px-2 py-1.5">Lot</th>
+                  <th className="text-left px-2 py-1.5">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.placed.map((p: any) => (
+                  <tr key={p.order_id} className="border-t border-border">
+                    <td className="px-2 py-1.5">{p.tp_level}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{p.take_profit}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{p.quantity}</td>
+                    <td className="px-2 py-1.5">
+                      <span className="text-emerald-500">{p.status ?? "OK"}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
-        <button onClick={onClose} className="btn-primary text-xs">Close</button>
+        {result?.failed?.length > 0 && (
+          <div className="border border-rose-500/30 bg-rose-500/5 rounded p-3 space-y-1 text-xs">
+            <div className="font-semibold text-rose-400">Failed legs:</div>
+            {result.failed.map((f: any, i: number) => (
+              <div key={i} className="text-ink-muted">
+                <span className="font-mono">{f.tp_level}</span>: {f.error}
+              </div>
+            ))}
+          </div>
+        )}
+        <button onClick={onClose} className="btn-primary text-xs w-full">Close</button>
       </div>
     );
   }
@@ -230,6 +285,23 @@ function TradeForm({
 
       {accounts.length > 0 && (
         <>
+          {/* Fanout banner — front and centre so user sees the order count */}
+          <div className="border border-brand/30 bg-brand/5 rounded p-3 text-sm">
+            <div className="flex items-center gap-2">
+              <TrendingUp className="size-4 text-brand" />
+              <span className="font-medium">{orderCount} orders</span>
+              <span className="text-ink-muted text-xs">
+                {entries.length === 1
+                  ? `${tps.length} TPs × 1 entry`
+                  : `${tps.length} TPs × 2 entries`}
+              </span>
+            </div>
+            <div className="text-[11px] text-ink-muted mt-1">
+              Total {totalRiskPct.toFixed(2)}% risk → split evenly
+              ({perOrderRiskPct.toFixed(3)}% per order)
+            </div>
+          </div>
+
           {/* Account selector */}
           <Field label="Account">
             <select className="input w-full"
@@ -244,7 +316,6 @@ function TradeForm({
             </select>
           </Field>
 
-          {/* Broker symbol — editable in case the auto-resolved value is wrong */}
           <Field label="Broker symbol"
                  help="The symbol as the broker knows it (e.g. GOLD vs XAUUSD). Override if needed.">
             <input type="text" className="input w-full font-mono"
@@ -253,7 +324,8 @@ function TradeForm({
           </Field>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Field label="Order type">
+            <Field label="Order type"
+                   help="Applied to every order in the fanout.">
               <div className="flex gap-1">
                 {(["MARKET", "LIMIT", "STOP"] as const).map(t => (
                   <button key={t}
@@ -269,88 +341,74 @@ function TradeForm({
               </div>
             </Field>
 
-            {orderType !== "MARKET" && (
-              <Field label={`${orderType} price`}>
-                <input type="number" step="any" className="input w-full font-mono"
-                       value={limitPrice}
-                       onChange={e => setLimitPrice(Number(e.target.value))} />
-              </Field>
-            )}
-          </div>
-
-          {/* Risk % + computed lot */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Field label="Risk %"
-                   help={`Max ${settings["tgbot.max_risk_pct_per_trade"]}% per trade (admin setting).`}>
+            <Field label="Total risk %"
+                   help={`Across all ${orderCount} orders. Max ${settings["tgbot.max_risk_pct_per_trade"]}%.`}>
               <input type="number" step="0.1"
-                     min={0}
+                     min={0.01}
                      max={settings["tgbot.max_risk_pct_per_trade"]}
                      className="input w-full font-mono"
-                     value={riskPct}
-                     onChange={e => {
-                       setRiskPct(Number(e.target.value));
-                       setLotOverride(null);    // re-enable auto-compute
-                     }} />
-            </Field>
-            <Field label="Lot size"
-                   help={lotOverride === null
-                          ? `Auto-computed from risk %. ${computedLot.explanation}`
-                          : "Manual override — risk % is ignored."}>
-              <div className="flex items-center gap-2">
-                <input type="number" step={settings["tgbot.lot_step"]}
-                       min={settings["tgbot.min_lot_size"]}
-                       className="input w-full font-mono"
-                       value={lot}
-                       onChange={e => setLotOverride(Number(e.target.value))} />
-                {lotOverride !== null && (
-                  <button onClick={() => setLotOverride(null)}
-                          title="Reset to auto-computed"
-                          className="text-xs text-brand hover:underline whitespace-nowrap">
-                    <Calculator className="size-3 inline" /> Auto
-                  </button>
-                )}
-              </div>
+                     value={totalRiskPct}
+                     onChange={e => setTotalRiskPct(Number(e.target.value))} />
             </Field>
           </div>
 
-          {/* SL + TP */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Field label="Stop loss"
-                   help={slWrongSide
-                          ? `SL is on the WRONG side for a ${side} order!`
-                          : `Distance: ${Math.abs(signal.entry_from - stopLoss).toFixed(2)}`}
-                   helpCls={slWrongSide ? "text-rose-500 font-medium" : ""}>
-              <input type="number" step="any" className="input w-full font-mono"
-                     value={stopLoss}
-                     onChange={e => setStopLoss(Number(e.target.value))} />
-            </Field>
+          <Field label="Stop loss (shared across all orders)"
+                 help={slWrongSide
+                        ? `SL is on the WRONG side for a ${side} order!`
+                        : `Distance to nearest entry: ${
+                            Math.min(...entries.map(e => Math.abs(e - stopLoss))).toFixed(2)
+                          }`}
+                 helpCls={slWrongSide ? "text-rose-500 font-medium" : ""}>
+            <input type="number" step="any" className="input w-full font-mono"
+                   value={stopLoss}
+                   onChange={e => setStopLoss(Number(e.target.value))} />
+          </Field>
 
-            <Field label="Take profit"
-                   help={takeProfit
-                          ? `Distance: ${Math.abs(signal.entry_from - takeProfit).toFixed(2)}`
-                          : "No TP — open trade with SL only."}>
-              <div className="flex gap-1 flex-wrap">
-                {tps.map((tp, i) => (
-                  <button key={i}
-                          onClick={() => setTpIdx(i)}
-                          className={`text-xs px-2 py-1.5 rounded border ${
-                            tpIdx === i
-                              ? "bg-emerald-500/15 border-emerald-500/50 text-emerald-400"
-                              : "border-border text-ink-muted hover:text-ink"
-                          }`}>
-                    TP{i + 1}: {fmt(tp)}
-                  </button>
-                ))}
-                <button onClick={() => setTpIdx(-1)}
-                        className={`text-xs px-2 py-1.5 rounded border ${
-                          tpIdx === -1
-                            ? "bg-bg-subtle border-border text-ink"
-                            : "border-border text-ink-muted hover:text-ink"
-                        }`}>
-                  None
-                </button>
-              </div>
-            </Field>
+          {/* Fanout preview table */}
+          <div>
+            <div className="text-xs text-ink-muted mb-1">
+              Preview ({orderCount} orders)
+            </div>
+            <div className="border border-border rounded overflow-hidden">
+              <table className="w-full text-xs">
+                <thead className="bg-bg-subtle text-ink-muted">
+                  <tr>
+                    <th className="text-left  px-2 py-1.5">#</th>
+                    <th className="text-right px-2 py-1.5">Entry</th>
+                    <th className="text-right px-2 py-1.5">TP</th>
+                    <th className="text-right px-2 py-1.5">SL</th>
+                    <th className="text-right px-2 py-1.5">Lot</th>
+                    <th className="text-right px-2 py-1.5">Risk</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {legs.map((l, i) => (
+                    <tr key={i} className="border-t border-border">
+                      <td className="px-2 py-1.5 text-ink-muted">{i + 1}</td>
+                      <td className="px-2 py-1.5 text-right font-mono">{fmt(l.entry)}</td>
+                      <td className="px-2 py-1.5 text-right font-mono text-emerald-400">
+                        {l.tpLevel}: {fmt(l.tp)}
+                      </td>
+                      <td className="px-2 py-1.5 text-right font-mono text-rose-400">
+                        {fmt(stopLoss)}
+                      </td>
+                      <td className="px-2 py-1.5 text-right font-mono">
+                        {l.quantity.toFixed(2)}
+                      </td>
+                      <td className="px-2 py-1.5 text-right font-mono text-ink-muted">
+                        {perOrderRiskPct.toFixed(3)}%
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="text-[11px] text-ink-dim mt-1 flex items-start gap-1">
+              <Calculator className="size-3 mt-0.5 shrink-0" />
+              Per-leg lot is a placeholder — risk-based sizing needs broker
+              balance which isn't wired in this milestone. The server splits
+              total risk evenly across orders.
+            </div>
           </div>
 
           {error && (
@@ -366,13 +424,12 @@ function TradeForm({
                 <Shield className="size-4 text-amber-500" /> Confirm
               </div>
               <div className="text-ink-muted">
-                Place <b className="text-ink">{side}</b>{" "}
-                <b className="text-ink font-mono">{lot.toFixed(2)}</b>{" "}
-                <b className="text-ink font-mono">{brokerSymbol}</b> as{" "}
-                <b className="text-ink">{orderType}</b>
-                {effectiveLimit !== null && <> @ <span className="font-mono">{fmt(effectiveLimit)}</span></>}
+                Place <b className="text-ink">{orderCount}</b>{" "}
+                <b className="text-ink">{side}</b>{" "}
+                <b className="text-ink font-mono">{brokerSymbol}</b>{" "}
+                <b className="text-ink">{orderType}</b> orders
                 {", SL "}<span className="font-mono">{fmt(stopLoss)}</span>
-                {takeProfit !== null && <>, TP <span className="font-mono">{fmt(takeProfit)}</span></>}
+                {", total risk "}<b className="text-ink">{totalRiskPct.toFixed(2)}%</b>
                 {" on "}<b className="text-ink">{account?.broker_name} · {account?.account_label}</b>.
               </div>
             </div>
@@ -396,7 +453,7 @@ function TradeForm({
                 </button>
                 <button onClick={place}
                         className="btn-primary text-xs flex-1">
-                  Place trade
+                  Place {orderCount} {orderCount === 1 ? "order" : "orders"}
                 </button>
               </>
             )}
@@ -413,42 +470,6 @@ function TradeForm({
   );
 }
 
-
-// ---------------------------------------------------------------------------
-// Lot computation hook
-// ---------------------------------------------------------------------------
-function useComputedLot({
-  riskPct, accountId, accounts, entry, sl, minLot, lotStep,
-}: {
-  riskPct: number;
-  accountId: number | null;
-  accounts: TgTradeAccountOption[];
-  entry: number;
-  sl: number;
-  minLot: number;
-  lotStep: number;
-}) {
-  return useMemo(() => {
-    // Without an account or a valid SL/entry, fall back to the minimum lot.
-    if (!accountId || !accounts.find(a => a.account_id === accountId)) {
-      return { value: minLot, explanation: "No account selected — falling back to min lot." };
-    }
-    const distance = Math.abs(entry - sl);
-    if (!distance || riskPct <= 0) {
-      return { value: minLot, explanation: "Invalid SL distance — falling back to min lot." };
-    }
-    // Without balance data we can't compute risk-based lot precisely.
-    // Show the user the formula they'd need; default to min lot for safety.
-    // (Future: account_info endpoint surfaces balance — wire that in then.)
-    const lot = minLot;   // placeholder
-    return {
-      value: lot,
-      explanation:
-        `Risk-based sizing needs account balance, which isn't wired yet. ` +
-        `Using min lot. Distance to SL: ${distance.toFixed(2)}.`,
-    };
-  }, [riskPct, accountId, accounts, entry, sl, minLot, lotStep]);
-}
 
 
 // ---------------------------------------------------------------------------

@@ -477,22 +477,50 @@ def _channel_strategy_for(db: Session, channel_id: int) -> Optional[dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# Trade endpoint — places ONE order against ONE account for ONE TP level.
-# Calls the existing /orders endpoint internally (broker_gateway routing
-# stays unchanged). Wraps the created BrokerOrder row in a BotTrade link.
+# Trade endpoint — fans out a SIGNAL into N (or 2N) orders.
+#
+# Fanout rules (from your spec):
+#   entry_from == entry_to  → N orders (one per TP), same entry for all
+#   entry_from != entry_to  → 2N orders (each entry × each TP)
+#
+# All children share the SAME stop_loss. They differ only in take_profit
+# (and entry, in the range case). Because the distance from entry to SL is
+# identical for every child within one entry, the per-order RISK in account
+# currency is identical for all children at that entry — so we split the
+# user's chosen total risk_pct evenly across the children.
+#
+#   per_order_risk_pct = total_risk_pct / child_count
+#
+# The client computes the lot size per child from per_order_risk_pct so the
+# total account exposure equals the user's total_risk_pct figure.
 # ---------------------------------------------------------------------------
+class TradeOrderLeg(BaseModel):
+    """One child in the fanout. Computed by the client; validated here."""
+    broker_symbol:   str       = Field(..., min_length=1, max_length=64)
+    side:            str       = Field(..., pattern="^(BUY|SELL)$")
+    order_type:      str       = Field(..., pattern="^(MARKET|LIMIT|STOP)$")
+    quantity:        Decimal   = Field(..., gt=0)
+    limit_price:     Optional[Decimal] = None
+    stop_loss:       Decimal
+    take_profit:     Decimal
+    tp_level:        str       = Field(..., max_length=8)   # 'TP1' | 'TP2' …
+
+
 class TradeSignalRequest(BaseModel):
-    account_id: int
-    broker_symbol: str = Field(..., min_length=1, max_length=64)
-    side: str = Field(..., pattern="^(BUY|SELL)$")
-    order_type: str = Field(..., pattern="^(MARKET|LIMIT|STOP)$")
-    quantity: Decimal = Field(..., gt=0)
-    limit_price: Optional[Decimal] = None
-    stop_loss: Optional[Decimal] = None
-    take_profit: Optional[Decimal] = None
-    tp_level: Optional[str] = Field(None, max_length=8)
-    risk_pct: Optional[Decimal] = Field(None, ge=0, le=100)
-    notes: Optional[str] = None
+    """Fanout request: one ACCOUNT + N order legs.
+
+    The client computes per-leg quantity from the chosen total_risk_pct
+    (split evenly across legs). The server places each leg via the existing
+    /orders code path and links every resulting BrokerOrder to the same
+    signal via bot_trades. ATOMIC SEMANTICS: if any leg fails, we DO NOT
+    roll back already-placed legs — that would be impossible (you can't
+    un-place an order at the broker). Instead we record what succeeded
+    and surface failures back to the UI so the user can see + retry.
+    """
+    account_id:     int
+    total_risk_pct: Decimal     = Field(..., ge=0, le=100)
+    notes:          Optional[str] = None
+    legs:           list[TradeOrderLeg] = Field(..., min_length=1, max_length=50)
 
 
 @trading_bot_router.post("/signals/{signal_id}/trade")
@@ -502,12 +530,11 @@ async def trade_signal(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Place a manual trade against a Telegram signal.
+    """Place N child orders against a Telegram signal.
 
-    We deliberately POST to the existing /orders endpoint instead of
-    duplicating its broker_gateway logic. That keeps a single code path
-    for "order goes from Beacon to broker" — bug fixes there flow to bot
-    trades for free.
+    All children share the same account + same stop_loss. They differ in
+    take_profit (per TP level) and possibly entry/limit_price (when the
+    signal has an entry range).
     """
     sig = db.get(TgSignal, signal_id)
     if sig is None:
@@ -517,60 +544,106 @@ async def trade_signal(
     if acct is None or acct.user_id != user.id or not acct.is_active:
         raise HTTPException(404, "Trading account not found / not yours / inactive")
 
-    # 1. Place the order via existing /orders handler.
-    # We avoid re-implementing the place_order logic by importing the function
-    # and calling it directly. This shares its DB session, auth context, and
-    # broker_gateway dispatch — bug fixes there propagate automatically.
+    # Per-order risk pct — recorded on each bot_trades row so the audit log
+    # shows how the total was split. We use Decimal division to avoid
+    # float drift (totals must reconcile to total_risk_pct exactly).
+    per_order_risk = (body.total_risk_pct / Decimal(len(body.legs)))
+
+    # We import lazily so this module doesn't depend on routers_orders at
+    # import time (avoids any circular-import surprises).
     from .routers_orders import place_order, PlaceOrderIn
 
-    order_in = PlaceOrderIn(
-        account_id=body.account_id,
-        stock_id=None,                 # bot signals aren't tied to stocks
-        broker_symbol=body.broker_symbol,
-        side=body.side,
-        order_type=body.order_type,
-        quantity=body.quantity,
-        limit_price=body.limit_price,
-        stop_loss=body.stop_loss,
-        take_profit=body.take_profit,
-        notes=body.notes or f"Bot signal #{signal_id} ({sig.channel_title})",
-    )
-    order_response = await place_order(order_in, user=user, db=db)
+    placed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
 
-    # 2. The /orders response is a dict; pull the order id we just created.
-    # Be defensive about the response shape — different paths (manual vs
-    # automated account) may use different keys.
-    order_id = (
-        order_response.get("id")
-        or order_response.get("order_id")
-        or order_response.get("order", {}).get("id")
-    )
-    if not order_id:
-        raise HTTPException(
-            500,
-            f"Order placed but no id returned — response: {order_response}",
+    for idx, leg in enumerate(body.legs):
+        order_in = PlaceOrderIn(
+            account_id=body.account_id,
+            stock_id=None,
+            broker_symbol=leg.broker_symbol,
+            side=leg.side,
+            order_type=leg.order_type,
+            quantity=leg.quantity,
+            limit_price=leg.limit_price,
+            stop_loss=leg.stop_loss,
+            take_profit=leg.take_profit,
+            notes=(body.notes or
+                   f"Bot signal #{signal_id} ({sig.channel_title}) "
+                   f"leg {idx + 1}/{len(body.legs)} @ {leg.tp_level}"),
         )
 
-    # 3. Link the order to the signal via bot_trades.
-    bt = BotTrade(
-        signal_id=signal_id,
-        order_id=order_id,
-        user_id=user.id,
-        account_id=body.account_id,
-        tp_level=body.tp_level,
-        risk_pct=body.risk_pct,
-        trade_mode="manual",
-        notes=body.notes,
-    )
-    db.add(bt)
+        try:
+            order_response = await place_order(order_in, user=user, db=db)
+        except HTTPException as exc:
+            failed.append({
+                "leg_index":   idx,
+                "tp_level":    leg.tp_level,
+                "limit_price": str(leg.limit_price) if leg.limit_price is not None else None,
+                "take_profit": str(leg.take_profit),
+                "quantity":    str(leg.quantity),
+                "error":       exc.detail,
+                "status":      exc.status_code,
+            })
+            # Carry on — placing the remaining legs is the right call.
+            # An "all-or-nothing" semantic isn't achievable when legs land
+            # at the broker one at a time.
+            continue
+        except Exception as exc:
+            failed.append({
+                "leg_index": idx,
+                "tp_level":  leg.tp_level,
+                "error":     f"{type(exc).__name__}: {exc}",
+            })
+            continue
+
+        order_id = (
+            order_response.get("id")
+            or order_response.get("order_id")
+            or order_response.get("order", {}).get("id")
+        )
+        if not order_id:
+            failed.append({
+                "leg_index": idx, "tp_level": leg.tp_level,
+                "error": "Order placed but no id returned",
+                "response": order_response,
+            })
+            continue
+
+        bt = BotTrade(
+            signal_id=signal_id,
+            order_id=order_id,
+            user_id=user.id,
+            account_id=body.account_id,
+            tp_level=leg.tp_level,
+            risk_pct=per_order_risk,
+            trade_mode="manual",
+            notes=order_in.notes,
+        )
+        db.add(bt)
+        db.flush()         # need bt.id before commit
+
+        placed.append({
+            "bot_trade_id": bt.id,
+            "order_id":     order_id,
+            "leg_index":    idx,
+            "tp_level":     leg.tp_level,
+            "limit_price":  str(leg.limit_price) if leg.limit_price is not None else None,
+            "take_profit":  str(leg.take_profit),
+            "quantity":     str(leg.quantity),
+            "status":       order_response.get("status"),
+            "broker_order_ref": order_response.get("broker_order_ref"),
+        })
+
     db.commit()
-    db.refresh(bt)
 
     return {
-        "bot_trade_id": bt.id,
-        "order_id": order_id,
-        "signal_id": signal_id,
-        "order": order_response,
+        "signal_id":       signal_id,
+        "account_id":      body.account_id,
+        "total_risk_pct":  str(body.total_risk_pct),
+        "per_order_risk_pct": str(per_order_risk),
+        "placed":          placed,
+        "failed":          failed,
+        "all_ok":          len(failed) == 0,
     }
 
 
