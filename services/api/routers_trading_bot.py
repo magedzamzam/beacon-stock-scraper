@@ -411,7 +411,7 @@ def get_trade_options(
         .join(Broker, TradingAccount.broker_id == Broker.id)
         .where(TradingAccount.user_id == user.id,
                TradingAccount.is_active.is_(True))
-        .order_by(Broker.name, TradingAccount.description)
+        .order_by(Broker.name, TradingAccount.label)
     ).all()
 
     # Build the (account → resolved broker_symbol) map. The signal's symbol
@@ -430,7 +430,7 @@ def get_trade_options(
             "broker_id": broker.id,
             "broker_code": broker.code,
             "broker_name": broker.name,
-            "account_label": acct.description or f"Account {acct.id}",
+            "account_label": acct.label or f"Account {acct.id}",
             "account_type": getattr(acct, "account_type", None),
             "currency": getattr(acct, "currency", None),
             "is_active": acct.is_active,
