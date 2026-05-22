@@ -12,7 +12,7 @@ import TradeSignalModal from "@/components/TradeSignalModal";
 // ─── Timezone configuration ─────────────────────────────────────────
 // Set your timezone here. Examples: "America/New_York", "Europe/London",
 // "Asia/Tokyo", "Australia/Sydney". Uses system default if null.
-const DISPLAY_TIMEZONE: string | undefined = undefined; // e.g. "America/New_York"
+const DISPLAY_TIMEZONE: string | undefined = "Asia/Dubai"; // e.g. "America/New_York"
 
 // Helper: convert UTC ISO string to locale string in target timezone
 function toLocalTime(iso: string, opts?: Intl.DateTimeFormatOptions): string {
