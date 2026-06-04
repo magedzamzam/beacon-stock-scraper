@@ -82,7 +82,7 @@ export default function BotPositionsPage() {
   }, [positions]);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 -mx-4 md:-mx-6 px-4 md:px-6">
       <header className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
@@ -187,8 +187,8 @@ function SignalGroup({ group, onAction }: {
         </div>
       )}
 
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
+      <div className="overflow-x-auto overflow-y-visible">
+		<table className="w-full text-sm">
           <thead className="text-xs text-ink-muted bg-bg-subtle">
             <tr>
               <th className="text-left  px-3 py-2">Symbol</th>
@@ -293,7 +293,7 @@ function PositionRow({ p, onAction }: {
           Actions
         </button>
         {menuOpen && (
-          <div className="absolute right-3 top-9 z-20 bg-bg-card border border-border rounded shadow-lg text-xs min-w-[180px]">
+		  <div className="absolute right-3 bottom-9 z-30 bg-bg-card border border-border rounded shadow-lg text-xs min-w-[180px]">
             <button onClick={moveToEntry} disabled={busy}
                     className="w-full text-left px-3 py-2 hover:bg-bg-subtle flex items-center gap-2">
               <Target className="size-3.5" /> Move SL to entry
