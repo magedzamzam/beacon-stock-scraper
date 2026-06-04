@@ -97,7 +97,7 @@ export default function TradeSignalModal({
 // When balance_usd OR fx_rate is missing, we DISPLAY a warning and fall back
 // to min_lot. We do NOT silently default — that's how accounts get blown up.
 // ---------------------------------------------------------------------------
-#const CAPITAL_XAU_CONTRACT_OZ = 100;
+//const CAPITAL_XAU_CONTRACT_OZ = 100;
 const CAPITAL_XAU_CONTRACT_OZ = 1;
 
 function TradeForm({
