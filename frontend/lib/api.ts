@@ -1235,9 +1235,9 @@ export interface TgBotPositionRow {
     bot_trade_id: number;
     tp_level: string | null;
     risk_pct: number | null;
-  };
+  } | null;
   signal: {
-    id: number | null;
+    id: number;
     channel_title: string | null;
     direction: string | null;
     signal_time: string | null;

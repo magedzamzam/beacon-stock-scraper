@@ -59,15 +59,19 @@ export default function BotPositionsPage() {
     }>();
     for (const p of positions) {
       // One group per (signal_id, account_id) pair. The same signal can
-      // be traded on multiple accounts.
-      const key = `${p.signal?.id ?? "no-signal"}::${p.account.account_id}`;
+      // be traded on multiple accounts. Positions with no linked signal
+      // (manual opens) get grouped under a single "Manual positions"
+      // group per account.
+      const sigId = p.signal?.id ?? null;
+      const key = `${sigId ?? "manual"}::${p.account.account_id}`;
       if (!by.has(key)) {
         by.set(key, {
           label: p.signal
             ? `${p.signal.channel_title ?? "Signal"} · ${p.signal.direction}` +
               ` · ${new Date(p.signal.signal_time ?? "").toLocaleString()}`
-            : "Unlinked positions",
-		   signal_id: p.signal?.id ?? null,
+            : `Manual positions · ${p.account.broker_name}` +
+              (p.account.label ? ` · ${p.account.label}` : ""),
+          signal_id: sigId,
           account_id: p.account.account_id,
           rows: [],
         });
@@ -272,7 +276,7 @@ function PositionRow({ p, onAction }: {
         </div>
       </td>
       <td className="px-3 py-2 text-xs">
-        <span className="text-ink-muted">{p.bot_trade.tp_level ?? "—"}</span>
+        <span className="text-ink-muted">{p.bot_trade?.tp_level ?? "—"}</span>
       </td>
       <td className="px-3 py-2 text-right font-mono">{fmt(p.quantity, 2)}</td>
       <td className="px-3 py-2 text-right font-mono">{fmt(p.avg_open_price)}</td>

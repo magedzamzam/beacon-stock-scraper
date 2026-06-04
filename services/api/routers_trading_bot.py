@@ -825,7 +825,17 @@ async def list_bot_positions(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Positions originating from bot-placed orders, joined with their signal."""
+    """All positions on the user's broker accounts, with bot context where available.
+
+    Previously this was filtered to positions linked via BotTrade. We dropped
+    that filter so manually-opened positions are also actionable from this
+    screen — the abstraction layer doesn't care how a position originated,
+    and most users want one screen to manage everything.
+
+    Positions WITH a matching BotTrade get `signal` and `bot_trade` populated.
+    Positions WITHOUT one (manual opens) get them as null — the UI groups
+    those under "Manual positions".
+    """
 
     if refresh:
         # Trigger a fresh pull from each account the user has, then re-read.
@@ -854,41 +864,38 @@ async def list_bot_positions(
         if acct_ids:
             await asyncio.gather(*[_refresh_one(a) for a in acct_ids])
 
-    # Build the bot-only filter — only positions whose ref appears in a
-    # BrokerOrder linked from a BotTrade row owned by this user.
-    bot_refs_q = (
-        select(BrokerOrder.broker_order_ref)
-        .join(BotTrade, BotTrade.order_id == BrokerOrder.id)
-        .where(BotTrade.user_id == user.id,
-               BrokerOrder.broker_order_ref.is_not(None))
-    )
-    if signal_id is not None:
-        bot_refs_q = bot_refs_q.where(BotTrade.signal_id == signal_id)
-    bot_refs = [r for r in db.execute(bot_refs_q).scalars().all()]
-
-    if not bot_refs:
-        return []
-
-    # Join snapshot with the bot_trade context (signal info).
+    # Pull every snapshot row on the user's accounts. The bot context joins
+    # are LEFT OUTER — present for positions opened by signals, null for
+    # manual ones. The matching chain is:
+    #   snapshot.broker_position_ref == broker_order.broker_order_ref
+    #     (since MARKET orders fill into a position with the same dealId,
+    #      and place_order records that as broker_order_ref)
+    # When that doesn't match (manual position), the outer join yields null.
     q = (
-        select(BrokerPositionSnapshot, BotTrade, TgSignal, TradingAccount, Broker, BrokerOrder)
-        .join(BrokerOrder,
-              BrokerOrder.broker_order_ref == BrokerPositionSnapshot.broker_position_ref)
-        .join(BotTrade, BotTrade.order_id == BrokerOrder.id)
-        .outerjoin(TgSignal, TgSignal.id == BotTrade.signal_id)
+        select(BrokerPositionSnapshot, BotTrade, TgSignal, TradingAccount, Broker)
         .join(TradingAccount, TradingAccount.id == BrokerPositionSnapshot.account_id)
         .join(Broker, Broker.id == TradingAccount.broker_id)
-        .where(BotTrade.user_id == user.id,
-               BrokerPositionSnapshot.broker_position_ref.in_(bot_refs))
+        .outerjoin(BrokerOrder,
+                   BrokerOrder.broker_order_ref == BrokerPositionSnapshot.broker_position_ref)
+        # We outer-join BotTrade restricted to THIS user — otherwise another
+        # user's BotTrade linked to the same broker_order_ref (shouldn't
+        # happen but defensive) would leak through.
+        .outerjoin(BotTrade,
+                   (BotTrade.order_id == BrokerOrder.id) & (BotTrade.user_id == user.id))
+        .outerjoin(TgSignal, TgSignal.id == BotTrade.signal_id)
+        .where(TradingAccount.user_id == user.id)
         .order_by(desc(BrokerPositionSnapshot.fetched_at))
     )
     if account_id is not None:
         q = q.where(BrokerPositionSnapshot.account_id == account_id)
     if signal_id is not None:
+        # Caller wants ONLY positions for this signal — implies a BotTrade
+        # match. Switch the outer-join semantics by adding a where on
+        # signal_id that NULL won't satisfy.
         q = q.where(BotTrade.signal_id == signal_id)
 
     out = []
-    for snap, bt, sig, acct, broker, order in db.execute(q).all():
+    for snap, bt, sig, acct, broker in db.execute(q).all():
         out.append({
             "snapshot_id":         snap.id,
             "broker_position_ref": snap.broker_position_ref,
@@ -910,16 +917,18 @@ async def list_bot_positions(
                 "broker_name": broker.name,
                 "label":       acct.label,
             },
+            # bot_trade and signal are null for manual positions — that's
+            # the signal to the UI to file them under "Manual positions".
             "bot_trade": {
                 "bot_trade_id": bt.id,
                 "tp_level":     bt.tp_level,
                 "risk_pct":     _dec(bt.risk_pct),
-            },
+            } if bt else None,
             "signal": {
-                "id":             sig.id if sig else None,
-                "channel_title":  sig.channel_title if sig else None,
-                "direction":      sig.direction if sig else None,
-                "signal_time":    sig.signal_time if sig else None,
+                "id":             sig.id,
+                "channel_title":  sig.channel_title,
+                "direction":      sig.direction,
+                "signal_time":    sig.signal_time,
             } if sig else None,
         })
     return out
@@ -1051,23 +1060,22 @@ async def close_many_bot_positions(
 
 # Helpers shared by the routes above
 def _verify_position_ownership(db: Session, user: User, position_ref: str):
-    """Return (snapshot_row, broker) or raise 404. Verifies that the position
-    belongs to one of the user's bot trades — not just any position on the
-    account. Prevents a user from closing manual positions via the bot UI.
+    """Return (snapshot_row, broker) or raise 404.
+
+    Verifies the position belongs to an account the user owns. We deliberately
+    do NOT require a BotTrade link — manual positions are actionable from this
+    screen too. The account check is the security boundary.
     """
     row = db.execute(
         select(BrokerPositionSnapshot, Broker)
         .join(TradingAccount, TradingAccount.id == BrokerPositionSnapshot.account_id)
         .join(Broker, Broker.id == TradingAccount.broker_id)
-        .join(BrokerOrder,
-              BrokerOrder.broker_order_ref == BrokerPositionSnapshot.broker_position_ref)
-        .join(BotTrade, BotTrade.order_id == BrokerOrder.id)
-        .where(BotTrade.user_id == user.id,
+        .where(TradingAccount.user_id == user.id,
                BrokerPositionSnapshot.broker_position_ref == position_ref)
     ).first()
     if row is None:
         raise HTTPException(404,
-            f"Bot position '{position_ref}' not found / not yours")
+            f"Position '{position_ref}' not found / not on your account")
     return row
 
 
