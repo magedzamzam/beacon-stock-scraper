@@ -60,14 +60,14 @@ export default function BotPositionsPage() {
     for (const p of positions) {
       // One group per (signal_id, account_id) pair. The same signal can
       // be traded on multiple accounts.
-      const key = `${p.signal.id ?? "no-signal"}::${p.account.account_id}`;
+      const key = `${p.signal?.id ?? "no-signal"}::${p.account.account_id}`;
       if (!by.has(key)) {
         by.set(key, {
           label: p.signal
             ? `${p.signal.channel_title ?? "Signal"} · ${p.signal.direction}` +
               ` · ${new Date(p.signal.signal_time ?? "").toLocaleString()}`
             : "Unlinked positions",
-          signal_id: p.signal.id,
+		   signal_id: p.signal?.id ?? null,
           account_id: p.account.account_id,
           rows: [],
         });
