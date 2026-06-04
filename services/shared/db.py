@@ -265,17 +265,26 @@ class BrokerPositionSnapshot(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     account_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("trading_accounts.id", ondelete="CASCADE"))
     stock_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("stocks.id", ondelete="SET NULL"))
+    # Broker's deal id for this specific position. Capital.com's positions[].dealId.
+    # Required to target modify/close on a single position when multiple
+    # positions exist on the same symbol (which the fanout always produces).
+    broker_position_ref: Mapped[Optional[str]] = mapped_column(String(64))
     broker_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     quantity: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
     avg_open_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     current_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     unrealized_pl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     unrealized_pl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    # Live SL/TP as reported by the broker — drifts from the order-time values
+    # once we start moving SL manually. UI shows this so the user sees what's
+    # actually on the broker, not what we asked for at place time.
+    stop_loss: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    take_profit: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
     currency: Mapped[Optional[str]] = mapped_column(String(8))
     direction: Mapped[Optional[str]] = mapped_column(String(8))
+    opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     raw: Mapped[Optional[dict]] = mapped_column(JSONB)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    __table_args__ = (UniqueConstraint("account_id", "broker_symbol"),)
 
 
 class AccountBalanceSnapshot(Base):

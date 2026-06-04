@@ -14,9 +14,11 @@ import httpx
 from ..adapter_base import BrokerAdapter
 from ..types import (
     AccountInfo, AuthError, BrokerError, BrokerInstrument, BrokerOrder,
-    BrokerPosition, BrokerQuote, Direction, NetworkError, NotFoundError, OrderSide,
+    BrokerPosition, BrokerQuote, ClosePositionResult, Direction, ModifyOrderRequest,
+    ModifyPositionRequest, NetworkError, NotFoundError, OrderSide,
     OrderStatus, OrderType, PlaceOrderRequest, RateLimitError, to_dec,
 )
+from datetime import datetime
 
 
 _LIVE_HOST = "api-capital.backend-capital.com"
@@ -172,13 +174,34 @@ class CapitalComAdapter(BrokerAdapter):
             pos = p.get("position") or {}
             mkt = p.get("market") or {}
             direction = (pos.get("direction") or "BUY").upper()
+            # Parse createdDateUTC if present — Capital.com returns it in a
+            # few different fields across endpoints. Defensive: try several.
+            opened_raw = (
+                pos.get("createdDateUTC")
+                or pos.get("createdDate")
+                or pos.get("openDateTime")
+            )
+            opened_at = None
+            if opened_raw:
+                try:
+                    # Strip trailing Z then parse — accept both with and without.
+                    opened_at = datetime.fromisoformat(opened_raw.replace("Z", "+00:00"))
+                    # We store as naive UTC for consistency with the rest of the DB.
+                    if opened_at.tzinfo is not None:
+                        opened_at = opened_at.replace(tzinfo=None)
+                except (ValueError, AttributeError):
+                    opened_at = None
             out.append(BrokerPosition(
                 broker_symbol=str(mkt.get("epic") or pos.get("epic") or ""),
+                broker_position_ref=str(pos.get("dealId") or ""),
                 quantity=to_dec(pos.get("size")) or Decimal("0"),
                 avg_open_price=to_dec(pos.get("level")),
                 current_price=to_dec(mkt.get("bid") if direction == "BUY" else mkt.get("offer")),
                 unrealized_pl=to_dec(pos.get("upl") or pos.get("profit")),
                 unrealized_pl_pct=None,
+                stop_loss=to_dec(pos.get("stopLevel")),
+                take_profit=to_dec(pos.get("profitLevel")),
+                opened_at=opened_at,
                 currency=pos.get("currency") or mkt.get("currency"),
                 direction=Direction.LONG if direction == "BUY" else Direction.SHORT,
                 raw=p,
@@ -261,6 +284,161 @@ class CapitalComAdapter(BrokerAdapter):
             return _map_status(confirm.get("status")) == OrderStatus.CANCELLED
         except NotFoundError:
             return False
+
+    async def modify_position(self, req: ModifyPositionRequest) -> BrokerPosition:
+        """PUT /api/v1/positions/{dealId} — update SL/TP on an open position.
+
+        Capital.com semantics: the body MUST include the levels you want to
+        keep. Omitting stopLevel/profitLevel does NOT preserve them — it
+        clears them. So we fetch the current position first, then merge
+        in the requested changes. This mirrors what the legacy bot did
+        (capital_core.move_stop_loss_to_entry preserved profitLevel).
+        """
+        # 1) Fetch current state to preserve fields the caller left as None.
+        # Capital.com returns a single-position payload at /positions/{dealId}.
+        try:
+            current = await self._request("GET", f"/api/v1/positions/{req.broker_position_ref}")
+        except NotFoundError:
+            raise NotFoundError(f"Position {req.broker_position_ref} not found")
+        cur_pos = (current.get("position") or {})
+
+        body: Dict[str, float] = {}
+        # stopLevel: use new value if provided, else preserve existing.
+        new_sl = req.stop_loss if req.stop_loss is not None else to_dec(cur_pos.get("stopLevel"))
+        new_tp = req.take_profit if req.take_profit is not None else to_dec(cur_pos.get("profitLevel"))
+        if new_sl is not None:
+            body["stopLevel"] = float(new_sl)
+        if new_tp is not None:
+            body["profitLevel"] = float(new_tp)
+        if not body:
+            raise BrokerError("modify_position needs at least one of stop_loss / take_profit")
+
+        data = await self._request("PUT", f"/api/v1/positions/{req.broker_position_ref}", json=body)
+        deal_ref = data.get("dealReference")
+        if not deal_ref:
+            raise BrokerError(f"Capital.com modify_position missing dealReference: {data}")
+
+        # Confirm and return the post-modify state. /confirms doesn't always
+        # report SL/TP, so we re-read /positions/{ref} for the canonical view.
+        try:
+            await self._request("GET", f"/api/v1/confirms/{deal_ref}")
+        except NotFoundError:
+            # Capital.com occasionally serves the confirm 404 right after a
+            # successful modify; the position itself reflects the change.
+            pass
+        # Re-list to pick up the now-current SL/TP. Cheap; one round trip.
+        for p in await self.list_positions():
+            if p.broker_position_ref == req.broker_position_ref:
+                return p
+        # If the position disappeared between PUT and re-list it was probably
+        # closed; raise NotFound rather than returning a fabricated row.
+        raise NotFoundError(
+            f"Position {req.broker_position_ref} disappeared after modify"
+        )
+
+    async def close_position(
+        self, broker_position_ref: str, quantity: Optional[Decimal] = None,
+    ) -> ClosePositionResult:
+        """DELETE /api/v1/positions/{dealId} — close a position by ref.
+
+        Capital.com's DELETE always closes the FULL position. Partial close
+        requires opening an opposing position of the requested size (kludgy
+        but documented). For Milestone 4 we only support full close; partial
+        close needs more design (does the closed bit follow the original
+        position's SL/TP? does the remainder?).
+        """
+        if quantity is not None:
+            raise BrokerError(
+                "Partial close not yet implemented for Capital.com — "
+                "the broker requires opening an opposing position, which "
+                "introduces P&L attribution questions we haven't designed."
+            )
+        try:
+            data = await self._request("DELETE", f"/api/v1/positions/{broker_position_ref}")
+        except NotFoundError:
+            return ClosePositionResult(
+                broker_position_ref=broker_position_ref,
+                closed=False,
+                raw={"reason": "position not found"},
+            )
+
+        deal_ref = data.get("dealReference")
+        if not deal_ref:
+            return ClosePositionResult(
+                broker_position_ref=broker_position_ref,
+                closed=False,
+                raw=data,
+            )
+        try:
+            confirm = await self._request("GET", f"/api/v1/confirms/{deal_ref}")
+        except NotFoundError:
+            confirm = {}
+        ok = _map_status(confirm.get("status") or confirm.get("dealStatus")) in (
+            OrderStatus.FILLED, OrderStatus.CANCELLED,  # both mean "no longer open"
+        ) or confirm.get("dealStatus") == "ACCEPTED"
+        return ClosePositionResult(
+            broker_position_ref=broker_position_ref,
+            closed=ok,
+            closed_quantity=to_dec(confirm.get("size")),
+            close_price=to_dec(confirm.get("level")),
+            realized_pl=to_dec(confirm.get("profit")),
+            raw=confirm,
+        )
+
+    async def modify_order(self, req: ModifyOrderRequest) -> BrokerOrder:
+        """PUT /api/v1/workingorders/{dealId} — change levels on a working order.
+
+        Same preserve-then-merge pattern as modify_position: omitted fields
+        get cleared by the broker, so we read first.
+        """
+        # Working orders aren't fetched by id one-by-one — list and find.
+        try:
+            data = await self._request("GET", "/api/v1/workingorders")
+        except NotFoundError:
+            raise NotFoundError(f"Working order {req.broker_order_ref} not found")
+        target = None
+        for w in data.get("workingOrders", []):
+            wo = w.get("workingOrderData") or {}
+            if str(wo.get("dealId") or "") == req.broker_order_ref:
+                target = wo
+                break
+        if target is None:
+            raise NotFoundError(f"Working order {req.broker_order_ref} not found")
+
+        body: Dict[str, float] = {}
+        new_level = req.limit_price if req.limit_price is not None else to_dec(target.get("orderLevel"))
+        new_sl    = req.stop_loss   if req.stop_loss   is not None else to_dec(target.get("stopLevel"))
+        new_tp    = req.take_profit if req.take_profit is not None else to_dec(target.get("profitLevel"))
+        if new_level is not None: body["level"] = float(new_level)
+        if new_sl is not None:    body["stopLevel"] = float(new_sl)
+        if new_tp is not None:    body["profitLevel"] = float(new_tp)
+        if not body:
+            raise BrokerError("modify_order needs at least one of limit_price / stop_loss / take_profit")
+
+        result = await self._request("PUT", f"/api/v1/workingorders/{req.broker_order_ref}", json=body)
+        deal_ref = result.get("dealReference")
+        if not deal_ref:
+            raise BrokerError(f"Capital.com modify_order missing dealReference: {result}")
+        try:
+            confirm = await self._request("GET", f"/api/v1/confirms/{deal_ref}")
+        except NotFoundError:
+            confirm = {}
+        side_str = (target.get("direction") or "BUY").upper()
+        ot_raw = (target.get("orderType") or "LIMIT").upper()
+        ot = OrderType.LIMIT if ot_raw == "LIMIT" else (OrderType.STOP if ot_raw == "STOP" else OrderType.MARKET)
+        return BrokerOrder(
+            broker_order_ref=req.broker_order_ref,
+            broker_symbol=str(target.get("epic") or ""),
+            side=OrderSide.BUY if side_str == "BUY" else OrderSide.SELL,
+            order_type=ot,
+            quantity=to_dec(target.get("orderSize")) or Decimal("0"),
+            limit_price=new_level,
+            stop_loss=new_sl,
+            take_profit=new_tp,
+            status=_map_status(confirm.get("status")) or OrderStatus.WORKING,
+            currency=target.get("currency"),
+            raw=confirm,
+        )
 
     async def search_instrument(self, query: str) -> List[BrokerInstrument]:
         data = await self._request("GET", "/api/v1/markets", params={"searchTerm": query})

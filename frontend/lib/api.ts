@@ -477,6 +477,38 @@ export const api = {
   tgMyTrades: (limit = 50) =>
     request<TgTradeRow[]>(`/trading-bot/trades?limit=${limit}`),
 
+  // Bot positions screen — separate surface from the per-account positions
+  // endpoint because it's filtered to bot-originated positions only.
+  tgBotPositions: (params?: {
+    account_id?: number; signal_id?: number; refresh?: boolean;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params?.account_id != null) qs.set("account_id", String(params.account_id));
+    if (params?.signal_id  != null) qs.set("signal_id",  String(params.signal_id));
+    if (params?.refresh) qs.set("refresh", "true");
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request<TgBotPositionRow[]>(`/trading-bot/positions${suffix}`);
+  },
+  tgModifyPosition: (ref: string, body: { stop_loss?: number; take_profit?: number }) =>
+    request<any>(`/trading-bot/positions/${encodeURIComponent(ref)}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  tgMoveSlToEntry: (ref: string) =>
+    request<any>(`/trading-bot/positions/${encodeURIComponent(ref)}/move-sl-to-entry`, {
+      method: "POST",
+    }),
+  tgClosePosition: (ref: string) =>
+    request<any>(`/trading-bot/positions/${encodeURIComponent(ref)}`, {
+      method: "DELETE",
+    }),
+  tgCloseManyPositions: (body: {
+    account_id: number; signal_id?: number; refs?: string[];
+  }) =>
+    request<{ results: any[]; closed_count: number; failed_count: number }>(
+      `/trading-bot/positions/close-many`,
+      { method: "POST", body: JSON.stringify(body) }
+    ),
+
   // ===== Brokers / accounts =====
   listBrokers: () =>
     request<BrokerInfo[]>("/accounts/brokers"),
@@ -1174,5 +1206,40 @@ export interface TgTradeRow {
     rejection_reason: string | null;
     placed_at: string;
     filled_at: string | null;
+  } | null;
+}
+
+// ===== Trading Bot — Positions screen =====
+export interface TgBotPositionRow {
+  snapshot_id: number;
+  broker_position_ref: string | null;
+  broker_symbol: string;
+  quantity: number | null;
+  avg_open_price: number | null;
+  current_price: number | null;
+  unrealized_pl: number | null;
+  unrealized_pl_pct: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  currency: string | null;
+  direction: string | null;
+  opened_at: string | null;
+  fetched_at: string;
+  account: {
+    account_id: number;
+    broker_code: string;
+    broker_name: string;
+    label: string | null;
+  };
+  bot_trade: {
+    bot_trade_id: number;
+    tp_level: string | null;
+    risk_pct: number | null;
+  };
+  signal: {
+    id: number | null;
+    channel_title: string | null;
+    direction: string | null;
+    signal_time: string | null;
   } | null;
 }

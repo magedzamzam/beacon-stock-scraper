@@ -1,9 +1,10 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import useSWR from "swr";
 import {
-  Bot, ChevronRight, ArrowUp, ArrowDown, AlertCircle,
+  Activity, Bot, ChevronRight, ArrowUp, ArrowDown, AlertCircle,
   RefreshCw, MessageSquare, RadioTower, Zap, History,
 } from "lucide-react";
 import { api, type TgSignalRow, type TgTradeRow } from "@/lib/api";
@@ -59,9 +60,14 @@ export default function TradingBotPage() {
             Auto-refreshes every 10s.
           </p>
         </div>
-        <button onClick={() => mutate()} className="btn-ghost text-xs">
-          <RefreshCw className="size-3.5" /> Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <Link href="/trading-bot/positions" className="btn-ghost text-xs">
+            <Activity className="size-3.5" /> Bot positions
+          </Link>
+          <button onClick={() => mutate()} className="btn-ghost text-xs">
+            <RefreshCw className="size-3.5" /> Refresh
+          </button>
+        </div>
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-4">

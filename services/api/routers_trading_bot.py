@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from shared.db import (
     AppSetting, BotTrade, Broker, BrokerInstrument, BrokerOrder,
+    BrokerPositionSnapshot,
     TgChannel, TgRawMessage, TgSignal, TradingAccount, User,
 )
 
@@ -797,3 +798,294 @@ def list_my_trades(
         .limit(limit)
     ).all()
     return [_bot_trade_out(bt, order, sig) for (bt, order, sig) in rows]
+
+
+# ---------------------------------------------------------------------------
+# Bot positions screen — surfaces only positions opened by the bot.
+#
+# The /trading-bot/positions screen needs:
+#   - List bot-originated positions (= snapshot rows whose
+#     broker_position_ref appears in some BrokerOrder linked to a BotTrade
+#     owned by this user). Plain account snapshot would include manual
+#     positions the user doesn't want touched.
+#   - Modify SL (single position) — forwards to broker_gateway
+#   - Move SL to entry — same modify, sl = position's avg_open_price
+#   - Close one position — forwards
+#   - Close all positions for a signal — forwards with refs[] filter
+#
+# Refresh: clicking Refresh triggers a position-list pull from broker_gateway
+# (same as /accounts/{id}/positions does) — that's where the snapshot
+# rows get repopulated with the new SL/TP/dealId fields.
+# ---------------------------------------------------------------------------
+@trading_bot_router.get("/positions")
+async def list_bot_positions(
+    account_id: Optional[int] = None,
+    signal_id: Optional[int] = None,
+    refresh: bool = False,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Positions originating from bot-placed orders, joined with their signal."""
+
+    if refresh:
+        # Trigger a fresh pull from each account the user has, then re-read.
+        # If the gateway is slow we accept the latency — admin clicked refresh
+        # explicitly. We refresh each account in parallel since the user can
+        # have multiple Capital.com sub-accounts.
+        import asyncio
+        import os as _os
+        import httpx
+        gw = _os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
+        acct_q = select(TradingAccount.id).where(
+            TradingAccount.user_id == user.id,
+            TradingAccount.is_active.is_(True),
+        )
+        if account_id is not None:
+            acct_q = acct_q.where(TradingAccount.id == account_id)
+        acct_ids = [r for r in db.execute(acct_q).scalars().all()]
+
+        async def _refresh_one(aid: int):
+            try:
+                async with httpx.AsyncClient(timeout=20) as c:
+                    await c.get(f"{gw}/accounts/{aid}/positions")
+            except Exception:
+                pass  # best-effort; UI shows stale data on failure
+
+        if acct_ids:
+            await asyncio.gather(*[_refresh_one(a) for a in acct_ids])
+
+    # Build the bot-only filter — only positions whose ref appears in a
+    # BrokerOrder linked from a BotTrade row owned by this user.
+    bot_refs_q = (
+        select(BrokerOrder.broker_order_ref)
+        .join(BotTrade, BotTrade.order_id == BrokerOrder.id)
+        .where(BotTrade.user_id == user.id,
+               BrokerOrder.broker_order_ref.is_not(None))
+    )
+    if signal_id is not None:
+        bot_refs_q = bot_refs_q.where(BotTrade.signal_id == signal_id)
+    bot_refs = [r for r in db.execute(bot_refs_q).scalars().all()]
+
+    if not bot_refs:
+        return []
+
+    # Join snapshot with the bot_trade context (signal info).
+    q = (
+        select(BrokerPositionSnapshot, BotTrade, TgSignal, TradingAccount, Broker, BrokerOrder)
+        .join(BrokerOrder,
+              BrokerOrder.broker_order_ref == BrokerPositionSnapshot.broker_position_ref)
+        .join(BotTrade, BotTrade.order_id == BrokerOrder.id)
+        .outerjoin(TgSignal, TgSignal.id == BotTrade.signal_id)
+        .join(TradingAccount, TradingAccount.id == BrokerPositionSnapshot.account_id)
+        .join(Broker, Broker.id == TradingAccount.broker_id)
+        .where(BotTrade.user_id == user.id,
+               BrokerPositionSnapshot.broker_position_ref.in_(bot_refs))
+        .order_by(desc(BrokerPositionSnapshot.fetched_at))
+    )
+    if account_id is not None:
+        q = q.where(BrokerPositionSnapshot.account_id == account_id)
+    if signal_id is not None:
+        q = q.where(BotTrade.signal_id == signal_id)
+
+    out = []
+    for snap, bt, sig, acct, broker, order in db.execute(q).all():
+        out.append({
+            "snapshot_id":         snap.id,
+            "broker_position_ref": snap.broker_position_ref,
+            "broker_symbol":       snap.broker_symbol,
+            "quantity":            _dec(snap.quantity),
+            "avg_open_price":      _dec(snap.avg_open_price),
+            "current_price":       _dec(snap.current_price),
+            "unrealized_pl":       _dec(snap.unrealized_pl),
+            "unrealized_pl_pct":   _dec(snap.unrealized_pl_pct),
+            "stop_loss":           _dec(snap.stop_loss),
+            "take_profit":         _dec(snap.take_profit),
+            "currency":            snap.currency,
+            "direction":           snap.direction,
+            "opened_at":           snap.opened_at,
+            "fetched_at":          snap.fetched_at,
+            "account": {
+                "account_id":  acct.id,
+                "broker_code": broker.code,
+                "broker_name": broker.name,
+                "label":       acct.label,
+            },
+            "bot_trade": {
+                "bot_trade_id": bt.id,
+                "tp_level":     bt.tp_level,
+                "risk_pct":     _dec(bt.risk_pct),
+            },
+            "signal": {
+                "id":             sig.id if sig else None,
+                "channel_title":  sig.channel_title if sig else None,
+                "direction":      sig.direction if sig else None,
+                "signal_time":    sig.signal_time if sig else None,
+            } if sig else None,
+        })
+    return out
+
+
+class ModifyPositionIn(BaseModel):
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+
+
+@trading_bot_router.patch("/positions/{position_ref}")
+async def modify_bot_position(
+    position_ref: str,
+    body: ModifyPositionIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Forward modify request to broker_gateway after verifying ownership."""
+    snap, _broker = _verify_position_ownership(db, user, position_ref)
+    return await _gateway_call("PATCH",
+        f"/accounts/{snap.account_id}/positions/{position_ref}",
+        json={
+            "stop_loss":   str(body.stop_loss)   if body.stop_loss   is not None else None,
+            "take_profit": str(body.take_profit) if body.take_profit is not None else None,
+        })
+
+
+@trading_bot_router.post("/positions/{position_ref}/move-sl-to-entry")
+async def move_sl_to_entry(
+    position_ref: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Convenience: set SL to the position's avg_open_price (breakeven).
+
+    This is one of the most-common manual operations on running trades.
+    Doing it server-side avoids a round trip for the frontend to look up
+    avg_open_price first.
+    """
+    snap, _broker = _verify_position_ownership(db, user, position_ref)
+    if snap.avg_open_price is None:
+        raise HTTPException(409,
+            "Position has no avg_open_price — refresh positions first.")
+    return await _gateway_call("PATCH",
+        f"/accounts/{snap.account_id}/positions/{position_ref}",
+        json={"stop_loss": str(snap.avg_open_price), "take_profit": None})
+
+
+@trading_bot_router.delete("/positions/{position_ref}")
+async def close_bot_position(
+    position_ref: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Close a single bot position by ref."""
+    snap, _broker = _verify_position_ownership(db, user, position_ref)
+    return await _gateway_call("DELETE",
+        f"/accounts/{snap.account_id}/positions/{position_ref}")
+
+
+class CloseManyPositionsIn(BaseModel):
+    """Either signal_id (= close all positions for that signal) OR
+    explicit refs[]. Account_id is required either way (a request can't
+    close across multiple accounts atomically anyway).
+    """
+    account_id: int
+    signal_id: Optional[int] = None
+    refs: Optional[list[str]] = None
+
+
+@trading_bot_router.post("/positions/close-many")
+async def close_many_bot_positions(
+    body: CloseManyPositionsIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Close many bot positions at once.
+
+    Mode 1: pass `refs=[...]` directly — closes exactly those.
+    Mode 2: pass `signal_id=N` — closes every bot position linked to that
+            signal on the given account.
+    """
+    # Verify the account is the user's.
+    acct = db.get(TradingAccount, body.account_id)
+    if acct is None or acct.user_id != user.id:
+        raise HTTPException(404, "Account not found / not yours")
+
+    if body.refs:
+        refs = list(body.refs)
+    elif body.signal_id is not None:
+        # Resolve all bot-positions for the signal on this account.
+        rows = db.execute(
+            select(BrokerPositionSnapshot.broker_position_ref)
+            .join(BrokerOrder,
+                  BrokerOrder.broker_order_ref == BrokerPositionSnapshot.broker_position_ref)
+            .join(BotTrade, BotTrade.order_id == BrokerOrder.id)
+            .where(BotTrade.user_id == user.id,
+                   BotTrade.signal_id == body.signal_id,
+                   BrokerPositionSnapshot.account_id == body.account_id,
+                   BrokerPositionSnapshot.broker_position_ref.is_not(None))
+        ).scalars().all()
+        refs = [r for r in rows if r]
+    else:
+        raise HTTPException(400, "Pass either signal_id or refs[]")
+
+    if not refs:
+        return {"results": [], "closed_count": 0, "failed_count": 0}
+
+    # Sanity gate: every ref must belong to a position currently owned by
+    # the user on this account. Prevents an attacker from passing in an
+    # arbitrary deal_id and closing someone else's position.
+    valid_refs = set(db.execute(
+        select(BrokerPositionSnapshot.broker_position_ref)
+        .where(BrokerPositionSnapshot.account_id == body.account_id,
+               BrokerPositionSnapshot.broker_position_ref.in_(refs))
+    ).scalars().all())
+    safe_refs = [r for r in refs if r in valid_refs]
+    if len(safe_refs) != len(refs):
+        # Quiet — we don't echo back the rejected refs.
+        pass
+
+    if not safe_refs:
+        return {"results": [], "closed_count": 0, "failed_count": 0}
+
+    return await _gateway_call("POST",
+        f"/accounts/{body.account_id}/positions/close-all",
+        json={"refs": safe_refs})
+
+
+# Helpers shared by the routes above
+def _verify_position_ownership(db: Session, user: User, position_ref: str):
+    """Return (snapshot_row, broker) or raise 404. Verifies that the position
+    belongs to one of the user's bot trades — not just any position on the
+    account. Prevents a user from closing manual positions via the bot UI.
+    """
+    row = db.execute(
+        select(BrokerPositionSnapshot, Broker)
+        .join(TradingAccount, TradingAccount.id == BrokerPositionSnapshot.account_id)
+        .join(Broker, Broker.id == TradingAccount.broker_id)
+        .join(BrokerOrder,
+              BrokerOrder.broker_order_ref == BrokerPositionSnapshot.broker_position_ref)
+        .join(BotTrade, BotTrade.order_id == BrokerOrder.id)
+        .where(BotTrade.user_id == user.id,
+               BrokerPositionSnapshot.broker_position_ref == position_ref)
+    ).first()
+    if row is None:
+        raise HTTPException(404,
+            f"Bot position '{position_ref}' not found / not yours")
+    return row
+
+
+async def _gateway_call(method: str, path: str, json: Optional[dict] = None):
+    """Forward to broker_gateway and surface its error as our own."""
+    import os as _os
+    import httpx
+    base = _os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.request(method, f"{base}{path}", json=json)
+    except httpx.RequestError as exc:
+        raise HTTPException(502, f"broker_gateway unreachable: {exc}")
+    if r.status_code >= 400:
+        # Pass through gateway error verbatim so HTTP codes are meaningful.
+        try:
+            detail = r.json().get("detail") or r.text
+        except Exception:
+            detail = r.text
+        raise HTTPException(r.status_code, detail or "Gateway error")
+    return r.json()

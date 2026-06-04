@@ -74,6 +74,52 @@ class BrokerPosition:
     unrealized_pl_pct: Optional[Decimal]
     currency: Optional[str]
     direction: Direction
+    # Capital.com positions[].dealId (or equivalent on other brokers). The
+    # only way to target a SPECIFIC position when multiple positions exist
+    # on the same symbol — which is the default state of any signal-driven
+    # fanout. Optional only because manual-broker positions have no ref.
+    broker_position_ref: Optional[str] = None
+    # Live SL/TP as reported by the broker. Differs from order-time values
+    # once the user starts moving SL manually or partial closes happen.
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    opened_at: Optional[datetime] = None
+    raw: Optional[dict] = None
+
+
+@dataclass
+class ModifyPositionRequest:
+    """Change SL/TP on an OPEN position. None = leave unchanged.
+
+    The semantics are intentionally "leave unchanged" not "remove" — to
+    explicitly remove a stop, the caller passes Decimal('0') or a sentinel
+    the adapter recognises. Most use cases just want to move SL up.
+    """
+    broker_position_ref: str
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+
+
+@dataclass
+class ModifyOrderRequest:
+    """Change levels on a PENDING working order (not yet filled)."""
+    broker_order_ref: str
+    limit_price: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+
+
+@dataclass
+class ClosePositionResult:
+    """Outcome of a close operation. The boolean answer isn't enough — we
+    also want fill price + size so the UI can show "closed 0.5 lot @ 4452"
+    rather than just 'OK'.
+    """
+    broker_position_ref: str
+    closed: bool
+    closed_quantity: Optional[Decimal] = None
+    close_price: Optional[Decimal] = None
+    realized_pl: Optional[Decimal] = None
     raw: Optional[dict] = None
 
 

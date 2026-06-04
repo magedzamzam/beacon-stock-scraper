@@ -20,7 +20,8 @@ from brokers.adapter_base import BrokerAdapter
 from brokers.crypto import decrypt_credentials, CryptoIntegrityError, CryptoConfigError
 from brokers.registry import get_adapter_class
 from brokers.types import (
-    AuthError, BrokerError, NetworkError, NotFoundError, OrderSide, OrderStatus,
+    AuthError, BrokerError, ModifyOrderRequest, ModifyPositionRequest,
+    NetworkError, NotFoundError, OrderSide, OrderStatus,
     OrderType, PlaceOrderRequest, RateLimitError,
 )
 
@@ -245,9 +246,12 @@ async def list_positions(account_id: int):
             ).scalar_one_or_none()
             session.add(BrokerPositionSnapshot(
                 account_id=account_id, stock_id=mapping,
+                broker_position_ref=p.broker_position_ref or None,
                 broker_symbol=p.broker_symbol, quantity=p.quantity,
                 avg_open_price=p.avg_open_price, current_price=p.current_price,
                 unrealized_pl=p.unrealized_pl, unrealized_pl_pct=p.unrealized_pl_pct,
+                stop_loss=p.stop_loss, take_profit=p.take_profit,
+                opened_at=p.opened_at,
                 currency=p.currency, direction=p.direction.value, raw=p.raw,
                 fetched_at=datetime.utcnow(),
             ))
@@ -255,10 +259,14 @@ async def list_positions(account_id: int):
         _record_connect_status(account_id, ok=True, message=None)
 
     return [{
+        "broker_position_ref": p.broker_position_ref,
         "broker_symbol": p.broker_symbol, "quantity": str(p.quantity),
         "avg_open_price": str(p.avg_open_price) if p.avg_open_price else None,
         "current_price": str(p.current_price) if p.current_price else None,
         "unrealized_pl": str(p.unrealized_pl) if p.unrealized_pl else None,
+        "stop_loss": str(p.stop_loss) if p.stop_loss else None,
+        "take_profit": str(p.take_profit) if p.take_profit else None,
+        "opened_at": p.opened_at.isoformat() if p.opened_at else None,
         "currency": p.currency, "direction": p.direction.value,
     } for p in positions]
 
@@ -348,6 +356,211 @@ async def cancel_order(account_id: int, ref: str):
                 row.last_synced_at = datetime.utcnow()
                 session.commit()
         return {"cancelled": ok}
+    except BrokerError as exc:
+        raise HTTPException(_broker_error_to_status(exc), str(exc))
+    finally:
+        await adapter.aclose()
+
+
+# ----------------------------------------------------------------------------
+# Position MUTATION routes — modify SL/TP, close, close-all.
+#
+# These map 1:1 to BrokerAdapter abstract methods. Adapters that don't
+# implement them raise NotImplementedError -> we surface as HTTP 501.
+# ----------------------------------------------------------------------------
+class ModifyPositionIn(BaseModel):
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+
+
+@app.patch("/accounts/{account_id}/positions/{ref}")
+async def modify_position(account_id: int, ref: str, body: ModifyPositionIn):
+    """Update SL/TP on an open position. Updates the cached snapshot row
+    in-place so the UI immediately reflects the change without waiting for
+    the next refresh tick.
+    """
+    _, _, adapter = _build_adapter(account_id)
+    try:
+        req = ModifyPositionRequest(
+            broker_position_ref=ref,
+            stop_loss=body.stop_loss,
+            take_profit=body.take_profit,
+        )
+        try:
+            updated = await adapter.modify_position(req)
+        except NotImplementedError:
+            raise HTTPException(501, "This broker does not support modify_position")
+
+        # Mirror the change into the snapshot so the UI doesn't show stale
+        # SL/TP for the next 60s until the cache TTL expires.
+        with SessionLocal() as session:
+            snap = session.execute(
+                select(BrokerPositionSnapshot).where(
+                    BrokerPositionSnapshot.account_id == account_id,
+                    BrokerPositionSnapshot.broker_position_ref == ref,
+                )
+            ).scalar_one_or_none()
+            if snap is not None:
+                snap.stop_loss = updated.stop_loss
+                snap.take_profit = updated.take_profit
+                snap.fetched_at = datetime.utcnow()
+                session.commit()
+
+        return {
+            "broker_position_ref": updated.broker_position_ref,
+            "broker_symbol": updated.broker_symbol,
+            "stop_loss": str(updated.stop_loss) if updated.stop_loss else None,
+            "take_profit": str(updated.take_profit) if updated.take_profit else None,
+        }
+    except BrokerError as exc:
+        raise HTTPException(_broker_error_to_status(exc), str(exc))
+    finally:
+        await adapter.aclose()
+
+
+@app.delete("/accounts/{account_id}/positions/{ref}")
+async def close_position(account_id: int, ref: str):
+    """Close a single position by ref. Removes the cached snapshot row on
+    success so the UI immediately shows it gone.
+    """
+    _, _, adapter = _build_adapter(account_id)
+    try:
+        try:
+            result = await adapter.close_position(ref)
+        except NotImplementedError:
+            raise HTTPException(501, "This broker does not support close_position")
+
+        if result.closed:
+            with SessionLocal() as session:
+                session.query(BrokerPositionSnapshot).filter(
+                    BrokerPositionSnapshot.account_id == account_id,
+                    BrokerPositionSnapshot.broker_position_ref == ref,
+                ).delete()
+                session.commit()
+
+        return {
+            "broker_position_ref": result.broker_position_ref,
+            "closed": result.closed,
+            "closed_quantity": str(result.closed_quantity) if result.closed_quantity else None,
+            "close_price": str(result.close_price) if result.close_price else None,
+            "realized_pl": str(result.realized_pl) if result.realized_pl else None,
+        }
+    except BrokerError as exc:
+        raise HTTPException(_broker_error_to_status(exc), str(exc))
+    finally:
+        await adapter.aclose()
+
+
+class CloseAllPositionsIn(BaseModel):
+    broker_symbol: Optional[str] = None
+    # Optional filter: only close positions whose broker_position_ref is in
+    # this list. Used by the "close all bot positions for THIS SIGNAL"
+    # button so we don't accidentally close manual positions on the same
+    # symbol.
+    refs: Optional[list[str]] = None
+
+
+@app.post("/accounts/{account_id}/positions/close-all")
+async def close_all_positions(account_id: int, body: CloseAllPositionsIn):
+    """Close every open position (optionally filtered by symbol OR by an
+    explicit list of refs). The 'refs' filter is the safer mode and the
+    one the UI uses for "close all for this signal".
+    """
+    _, _, adapter = _build_adapter(account_id)
+    try:
+        if body.refs:
+            # Targeted: close exactly these refs, no more, no less.
+            # Faster than fetching the position list first and safer because
+            # it doesn't touch anything the caller didn't ask for.
+            results = []
+            for ref in body.refs:
+                try:
+                    r = await adapter.close_position(ref)
+                except NotImplementedError:
+                    raise HTTPException(501, "This broker does not support close_position")
+                except BrokerError as exc:
+                    r = type("ClosePositionResult", (), {
+                        "broker_position_ref": ref,
+                        "closed": False,
+                        "closed_quantity": None,
+                        "close_price": None,
+                        "realized_pl": None,
+                        "raw": {"error": str(exc)},
+                    })()
+                results.append(r)
+        else:
+            try:
+                results = await adapter.close_all_positions(body.broker_symbol)
+            except NotImplementedError:
+                raise HTTPException(501, "This broker does not support close_all_positions")
+
+        # Clear closed rows from the snapshot.
+        closed_refs = [r.broker_position_ref for r in results if r.closed and r.broker_position_ref]
+        if closed_refs:
+            with SessionLocal() as session:
+                session.query(BrokerPositionSnapshot).filter(
+                    BrokerPositionSnapshot.account_id == account_id,
+                    BrokerPositionSnapshot.broker_position_ref.in_(closed_refs),
+                ).delete(synchronize_session=False)
+                session.commit()
+
+        return {
+            "results": [{
+                "broker_position_ref": r.broker_position_ref,
+                "closed": r.closed,
+                "closed_quantity": str(r.closed_quantity) if r.closed_quantity else None,
+                "close_price": str(r.close_price) if r.close_price else None,
+                "realized_pl": str(r.realized_pl) if r.realized_pl else None,
+            } for r in results],
+            "closed_count": sum(1 for r in results if r.closed),
+            "failed_count": sum(1 for r in results if not r.closed),
+        }
+    except BrokerError as exc:
+        raise HTTPException(_broker_error_to_status(exc), str(exc))
+    finally:
+        await adapter.aclose()
+
+
+class ModifyOrderIn(BaseModel):
+    limit_price: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+
+
+@app.patch("/accounts/{account_id}/orders/{ref}")
+async def modify_order(account_id: int, ref: str, body: ModifyOrderIn):
+    """Update levels on a pending working order."""
+    _, _, adapter = _build_adapter(account_id)
+    try:
+        req = ModifyOrderRequest(
+            broker_order_ref=ref,
+            limit_price=body.limit_price,
+            stop_loss=body.stop_loss,
+            take_profit=body.take_profit,
+        )
+        try:
+            updated = await adapter.modify_order(req)
+        except NotImplementedError:
+            raise HTTPException(501, "This broker does not support modify_order")
+
+        with SessionLocal() as session:
+            row = session.execute(
+                select(BrokerOrderRow).where(BrokerOrderRow.broker_order_ref == ref)
+            ).scalar_one_or_none()
+            if row is not None:
+                row.limit_price = updated.limit_price
+                row.stop_loss = updated.stop_loss
+                row.take_profit = updated.take_profit
+                row.last_synced_at = datetime.utcnow()
+                session.commit()
+
+        return {
+            "broker_order_ref": updated.broker_order_ref,
+            "broker_symbol": updated.broker_symbol,
+            "limit_price": str(updated.limit_price) if updated.limit_price else None,
+            "stop_loss": str(updated.stop_loss) if updated.stop_loss else None,
+            "take_profit": str(updated.take_profit) if updated.take_profit else None,
+        }
     except BrokerError as exc:
         raise HTTPException(_broker_error_to_status(exc), str(exc))
     finally:
