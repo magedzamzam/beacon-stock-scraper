@@ -392,20 +392,65 @@ def update_bot_settings(
 #   - eligible trading accounts (active + Capital.com for now)
 #   - resolved broker_symbol per account (so we know if the symbol is mapped)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# FX helper — looks up rates from app_settings under 'fx.{ccy}_to_usd'.
+#
+# Direction convention is INTENTIONAL and explicit: keys ALWAYS store the
+# multiplier that converts FROM the named currency TO USD.
+#
+#     fx.aed_to_usd = 0.2723   →   usd = aed * 0.2723
+#     fx.eur_to_usd = 1.08     →   usd = eur * 1.08
+#     fx.usd_to_usd = 1.0      →   identity row, seeded too
+#
+# Multiplication-only, no division. Flipping the rate division-style is the
+# #1 way risk-sizing math accidentally produces positions 13x too large.
+# ---------------------------------------------------------------------------
+def _fx_to_usd(db: Session, currency: Optional[str]) -> tuple[Optional[float], Optional[str]]:
+    """Look up the multiplier that converts `currency` to USD.
+
+    Returns (rate, warning). On warning, the lot computation MUST refuse to
+    return a number; the UI surfaces the warning instead of silently
+    defaulting to a wrong lot size.
+    """
+    if not currency:
+        return None, "Account currency is null — set it on the broker account."
+    key = f"fx.{currency.lower()}_to_usd"
+    row = db.execute(
+        select(AppSetting).where(AppSetting.key == key)
+    ).scalar_one_or_none()
+    if row is None or row.value is None:
+        return None, (
+            f"No FX rate for {currency}. Add admin setting '{key}' "
+            f"(value = how many USD per 1 {currency})."
+        )
+    try:
+        rate = float(row.value)
+    except (TypeError, ValueError):
+        return None, f"Setting '{key}' is not a number: {row.value!r}"
+    if rate <= 0:
+        return None, f"Setting '{key}' must be positive, got {rate}"
+    return rate, None
+
+
 @trading_bot_router.get("/signals/{signal_id}/trade-options")
-def get_trade_options(
+async def get_trade_options(
     signal_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Single round trip for everything the trade modal needs.
+
+    On top of the static account/signal data, this also fetches live balance
+    from broker_gateway for each active account in parallel, plus the FX
+    rate from `app_settings` so the modal can compute lot size correctly
+    against an AED-denominated account trading USD-quoted XAU.
+    """
     sig = db.get(TgSignal, signal_id)
     if sig is None:
         raise HTTPException(404, "Signal not found")
 
     settings = _read_bot_settings(db)
 
-    # Active trading accounts owned by this user — keyed by broker for the
-    # frontend to group them under broker headings.
     accounts = db.execute(
         select(TradingAccount, Broker)
         .join(Broker, TradingAccount.broker_id == Broker.id)
@@ -414,27 +459,78 @@ def get_trade_options(
         .order_by(Broker.name, TradingAccount.label)
     ).all()
 
-    # Build the (account → resolved broker_symbol) map. The signal's symbol
-    # is something like 'XAUUSD' — each broker may use a different symbol
-    # (XAUUSD vs GOLD vs XAU/USD). We look it up via broker_instruments
-    # using a stock_id that matches by ticker if one exists; otherwise we
-    # pass the signal symbol through unchanged and let the broker reject it
-    # (the trade form lets the user override).
+    # Fetch balances in parallel via broker_gateway. We've seen the gateway
+    # tail-latency reach ~3s on cold Capital.com sessions, so serial would
+    # noticeably block modal open with multiple accounts. asyncio.gather
+    # keeps total wall time close to the slowest single call.
+    import asyncio
+    import httpx
+    import os as _os
+    gw_url = _os.environ.get("BROKER_GATEWAY_URL", "http://broker_gateway:8004")
+
+    async def _fetch_account_info(account_id: int) -> Optional[dict]:
+        """Best-effort balance lookup. Returns None on any failure — the
+        frontend then disables the lot-compute path for that account and
+        falls back to min_lot. We never block trade placement on this.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(f"{gw_url}/accounts/{account_id}/info")
+                if r.status_code >= 400:
+                    return None
+                return r.json()
+        except Exception:
+            return None
+
+    info_results = await asyncio.gather(
+        *[_fetch_account_info(acct.id) for acct, _ in accounts],
+        return_exceptions=False,
+    )
+
     account_options = []
-    for acct, broker in accounts:
-        # Best-effort symbol resolution. Currently the bot only handles XAU,
-        # which isn't in the stocks table. For now we just echo the signal's
-        # symbol. Future: instrument lookup by ticker/broker.
+    for (acct, broker), info in zip(accounts, info_results):
+        # AccountInfo from the adapter is {balance, available, currency, ...}.
+        # We treat the adapter's 'currency' as authoritative — the DB value on
+        # TradingAccount may be stale or unset. Fall back to DB if adapter null.
+        currency = (info or {}).get("currency") or getattr(acct, "currency", None)
+        balance_raw = (info or {}).get("balance")
+        available_raw = (info or {}).get("available")
+
+        def _f(x):
+            if x is None:
+                return None
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+
+        balance = _f(balance_raw)
+        available = _f(available_raw)
+
+        # Convert to USD for the modal's lot math. Missing FX is non-fatal:
+        # we surface a clear warning and the modal disables auto-lot.
+        fx_rate, fx_warn = _fx_to_usd(db, currency)
+        balance_usd = (balance * fx_rate) if (balance is not None and fx_rate is not None) else None
+
         account_options.append({
-            "account_id": acct.id,
-            "broker_id": broker.id,
-            "broker_code": broker.code,
-            "broker_name": broker.name,
-            "account_label": acct.label or f"Account {acct.id}",
-            "account_type": getattr(acct, "account_type", None),
-            "currency": getattr(acct, "currency", None),
-            "is_active": acct.is_active,
-            "resolved_symbol": sig.symbol,  # placeholder mapping
+            "account_id":      acct.id,
+            "broker_id":       broker.id,
+            "broker_code":     broker.code,
+            "broker_name":     broker.name,
+            "account_label":   acct.label or f"Account {acct.id}",
+            "account_type":    getattr(acct, "account_type", None),
+            "currency":        currency,
+            "is_active":       acct.is_active,
+            "resolved_symbol": sig.symbol,
+            # New fields for risk-based lot sizing:
+            "balance":         balance,
+            "available":       available,
+            "fx_rate":         fx_rate,
+            "balance_usd":     balance_usd,
+            "fx_warning":      fx_warn,
+            # info_fetched is the simple signal "did broker_gateway respond
+            # for this account?" — frontend uses it to grey out lot field.
+            "info_fetched":    info is not None,
         })
 
     return {
@@ -453,8 +549,6 @@ def get_trade_options(
         },
         "settings": settings,
         "accounts": account_options,
-        # Also include the channel's strategy params — the frontend uses
-        # `order_position_type` to pre-fill the order type radio.
         "channel_strategy": _channel_strategy_for(db, sig.channel_id),
     }
 
@@ -479,20 +573,14 @@ def _channel_strategy_for(db: Session, channel_id: int) -> Optional[dict[str, An
 # ---------------------------------------------------------------------------
 # Trade endpoint — fans out a SIGNAL into N (or 2N) orders.
 #
-# Fanout rules (from your spec):
+# Fanout rules:
 #   entry_from == entry_to  → N orders (one per TP), same entry for all
 #   entry_from != entry_to  → 2N orders (each entry × each TP)
 #
 # All children share the SAME stop_loss. They differ only in take_profit
-# (and entry, in the range case). Because the distance from entry to SL is
-# identical for every child within one entry, the per-order RISK in account
-# currency is identical for all children at that entry — so we split the
-# user's chosen total risk_pct evenly across the children.
-#
-#   per_order_risk_pct = total_risk_pct / child_count
-#
-# The client computes the lot size per child from per_order_risk_pct so the
-# total account exposure equals the user's total_risk_pct figure.
+# (and entry, in the range case). The frontend computes the per-leg
+# quantity from the chosen total_risk_pct split across the leg count;
+# the server merely places each leg via the existing /orders code path.
 # ---------------------------------------------------------------------------
 class TradeOrderLeg(BaseModel):
     """One child in the fanout. Computed by the client; validated here."""
@@ -503,19 +591,19 @@ class TradeOrderLeg(BaseModel):
     limit_price:     Optional[Decimal] = None
     stop_loss:       Decimal
     take_profit:     Decimal
-    tp_level:        str       = Field(..., max_length=8)   # 'TP1' | 'TP2' …
+    tp_level:        str       = Field(..., max_length=8)
 
 
 class TradeSignalRequest(BaseModel):
-    """Fanout request: one ACCOUNT + N order legs.
+    """Fanout request: one account + N order legs.
 
-    The client computes per-leg quantity from the chosen total_risk_pct
-    (split evenly across legs). The server places each leg via the existing
-    /orders code path and links every resulting BrokerOrder to the same
-    signal via bot_trades. ATOMIC SEMANTICS: if any leg fails, we DO NOT
-    roll back already-placed legs — that would be impossible (you can't
-    un-place an order at the broker). Instead we record what succeeded
-    and surface failures back to the UI so the user can see + retry.
+    Per-leg quantity is computed client-side from the chosen total_risk_pct
+    split across `len(legs)` orders. Server records each leg's own
+    risk_pct = total / N on bot_trades for auditability.
+
+    If any leg fails at the broker, the others are NOT rolled back — broker
+    orders aren't atomic. The response carries placed[] and failed[] so the
+    UI can show what landed and let the user retry the failures.
     """
     account_id:     int
     total_risk_pct: Decimal     = Field(..., ge=0, le=100)
@@ -530,12 +618,7 @@ async def trade_signal(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Place N child orders against a Telegram signal.
-
-    All children share the same account + same stop_loss. They differ in
-    take_profit (per TP level) and possibly entry/limit_price (when the
-    signal has an entry range).
-    """
+    """Place N child orders against a Telegram signal."""
     sig = db.get(TgSignal, signal_id)
     if sig is None:
         raise HTTPException(404, "Signal not found")
@@ -544,13 +627,8 @@ async def trade_signal(
     if acct is None or acct.user_id != user.id or not acct.is_active:
         raise HTTPException(404, "Trading account not found / not yours / inactive")
 
-    # Per-order risk pct — recorded on each bot_trades row so the audit log
-    # shows how the total was split. We use Decimal division to avoid
-    # float drift (totals must reconcile to total_risk_pct exactly).
-    per_order_risk = (body.total_risk_pct / Decimal(len(body.legs)))
+    per_order_risk = body.total_risk_pct / Decimal(len(body.legs))
 
-    # We import lazily so this module doesn't depend on routers_orders at
-    # import time (avoids any circular-import surprises).
     from .routers_orders import place_order, PlaceOrderIn
 
     placed: list[dict[str, Any]] = []
@@ -571,7 +649,6 @@ async def trade_signal(
                    f"Bot signal #{signal_id} ({sig.channel_title}) "
                    f"leg {idx + 1}/{len(body.legs)} @ {leg.tp_level}"),
         )
-
         try:
             order_response = await place_order(order_in, user=user, db=db)
         except HTTPException as exc:
@@ -584,9 +661,6 @@ async def trade_signal(
                 "error":       exc.detail,
                 "status":      exc.status_code,
             })
-            # Carry on — placing the remaining legs is the right call.
-            # An "all-or-nothing" semantic isn't achievable when legs land
-            # at the broker one at a time.
             continue
         except Exception as exc:
             failed.append({
@@ -620,30 +694,29 @@ async def trade_signal(
             notes=order_in.notes,
         )
         db.add(bt)
-        db.flush()         # need bt.id before commit
+        db.flush()
 
         placed.append({
-            "bot_trade_id": bt.id,
-            "order_id":     order_id,
-            "leg_index":    idx,
-            "tp_level":     leg.tp_level,
-            "limit_price":  str(leg.limit_price) if leg.limit_price is not None else None,
-            "take_profit":  str(leg.take_profit),
-            "quantity":     str(leg.quantity),
-            "status":       order_response.get("status"),
+            "bot_trade_id":     bt.id,
+            "order_id":         order_id,
+            "leg_index":        idx,
+            "tp_level":         leg.tp_level,
+            "limit_price":      str(leg.limit_price) if leg.limit_price is not None else None,
+            "take_profit":      str(leg.take_profit),
+            "quantity":         str(leg.quantity),
+            "status":           order_response.get("status"),
             "broker_order_ref": order_response.get("broker_order_ref"),
         })
 
     db.commit()
-
     return {
-        "signal_id":       signal_id,
-        "account_id":      body.account_id,
-        "total_risk_pct":  str(body.total_risk_pct),
+        "signal_id":          signal_id,
+        "account_id":         body.account_id,
+        "total_risk_pct":     str(body.total_risk_pct),
         "per_order_risk_pct": str(per_order_risk),
-        "placed":          placed,
-        "failed":          failed,
-        "all_ok":          len(failed) == 0,
+        "placed":             placed,
+        "failed":             failed,
+        "all_ok":             len(failed) == 0,
     }
 
 

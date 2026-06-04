@@ -1100,6 +1100,12 @@ export interface TgTradeAccountOption {
   currency: string | null;
   is_active: boolean;
   resolved_symbol: string;
+  balance:      number | null;
+  available:    number | null;
+  fx_rate:      number | null;
+  balance_usd:  number | null;
+  fx_warning:   string | null;
+  info_fetched: boolean;
 }
 
 export interface TgChannelStrategy {

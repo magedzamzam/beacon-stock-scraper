@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 import {
   X, Loader2, AlertCircle, CheckCircle2, ArrowUp, ArrowDown,
-  TrendingUp, Shield, Calculator,
+  TrendingUp, Shield, Calculator, RotateCcw,
 } from "lucide-react";
 import {
   api,
@@ -76,11 +76,29 @@ export default function TradeSignalModal({
 }
 
 
-
-
 // ---------------------------------------------------------------------------
 // Form
 // ---------------------------------------------------------------------------
+//
+// Capital.com XAU specifics — hard-coded in this file:
+//   - Contract size: 100 oz per 1.00 lot
+//   - Pricing: USD per ounce
+//   - Account balance may be in any currency; conversion uses fx.{ccy}_to_usd
+//     from app_settings (multiplier, multiplication-only — see backend).
+//
+// Lot formula per leg:
+//   risk_usd_per_leg = balance_usd × total_risk_pct/100 / leg_count
+//   lot              = risk_usd_per_leg / (sl_distance × 100)
+//
+// Reasoning:
+//   For a XAU position of L lots: USD lost if SL hits = L × 100 × sl_distance.
+//   Solve for L given risk_usd: L = risk_usd / (sl_distance × 100).
+//
+// When balance_usd OR fx_rate is missing, we DISPLAY a warning and fall back
+// to min_lot. We do NOT silently default — that's how accounts get blown up.
+// ---------------------------------------------------------------------------
+const CAPITAL_XAU_CONTRACT_OZ = 100;
+
 function TradeForm({
   data, signalId, onClose, onPlaced,
 }: {
@@ -92,17 +110,12 @@ function TradeForm({
   const { signal, settings, accounts, channel_strategy } = data;
   const tps = signal.tps || [];
 
-  // Determine the fanout shape.
-  //   entry_from == entry_to → 1 × N orders (one per TP, single entry)
-  //   entry_from != entry_to → 2 × N orders (each entry × each TP)
-  // The fanout is computed BEFORE the user makes any choices so they see
-  // exactly how many orders will be placed.
+  // ---- Fanout shape (independent of user choices) -----------------------
   const entries = signal.entry_from === signal.entry_to
     ? [signal.entry_from]
     : [signal.entry_from, signal.entry_to];
-  const orderCount = entries.length * tps.length;
 
-  // Pre-fill from channel strategy + settings + defaults.
+  // ---- Pre-fills --------------------------------------------------------
   const defaultAccount =
     accounts.find(a => a.broker_code === "capital_com" && a.is_active)
     ?? accounts[0] ?? null;
@@ -115,19 +128,13 @@ function TradeForm({
   const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "STOP">(
     channel_strategy?.order_position_type ?? "LIMIT",
   );
+  const side = signal.direction;
 
-  const side = signal.direction;  // BUY/SELL — never user-overridden
-
-  // total_risk_pct is the TOTAL across the whole fanout (your spec).
-  // The backend will divide it evenly across orderCount children.
   const [totalRiskPct, setTotalRiskPct] = useState<number>(
     settings["tgbot.risk_pct_per_trade"],
   );
-
-  // SL is identical for every child. Editable so the user can adjust.
   const [stopLoss, setStopLoss] = useState<number>(signal.sl);
 
-  // Broker symbol — editable per account.
   const [brokerSymbol, setBrokerSymbol] = useState<string>(
     account?.resolved_symbol ?? signal.symbol,
   );
@@ -135,45 +142,119 @@ function TradeForm({
     setBrokerSymbol(account?.resolved_symbol ?? signal.symbol);
   }, [account?.account_id]);
 
-  // SL-side sanity (#1 copy-paste error).
-  const slWrongSide =
-    (side === "BUY"  && stopLoss >= Math.min(...entries)) ||
-    (side === "SELL" && stopLoss <= Math.max(...entries));
-
-  // Build the fanout legs. Lot per leg = total_risk / N. We don't have live
-  // account balance here, so the displayed lot is a placeholder min_lot for
-  // now and the backend recomputes from total_risk_pct on its end. See note
-  // in useComputedLot.
-  const minLot = settings["tgbot.min_lot_size"];
-  const lotStep = settings["tgbot.lot_step"];
-  const perOrderRiskPct = orderCount > 0 ? totalRiskPct / orderCount : 0;
-
-  const legs = useMemo(() => {
+  // ---- Per-leg removal (user can drop legs from the review) -------------
+  // Build the "full fanout" first so we have stable ids, then track which
+  // ids the user has dropped. We DON'T derive ids from array index — index
+  // shifts when items are removed, leading to flicker / wrong-leg removals.
+  const fullLegs = useMemo(() => {
     const out: Array<{
+      id: string;
       entry: number;
       tp: number;
       tpLevel: string;
-      orderType: "MARKET" | "LIMIT" | "STOP";
-      limitPrice: number | null;
-      quantity: number;
     }> = [];
     for (const entry of entries) {
       tps.forEach((tp, i) => {
         out.push({
+          id:      `e${entry}-t${i}`,
           entry,
           tp,
           tpLevel: `TP${i + 1}`,
-          orderType,
-          limitPrice: orderType === "MARKET" ? null : entry,
-          // Per-leg lot. Placeholder math — see useComputedLot note.
-          quantity: minLot,
         });
       });
     }
     return out;
-  }, [entries, tps, orderType, minLot]);
+  }, [entries.join(","), tps.join(",")]);
 
-  // Place button state machine
+  const [removedLegIds, setRemovedLegIds] = useState<Set<string>>(new Set());
+  const activeLegs = useMemo(
+    () => fullLegs.filter(l => !removedLegIds.has(l.id)),
+    [fullLegs, removedLegIds],
+  );
+  const orderCount = activeLegs.length;
+
+  function toggleLeg(id: string) {
+    setRemovedLegIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+  function resetLegs() {
+    setRemovedLegIds(new Set());
+  }
+
+  // ---- Risk math --------------------------------------------------------
+  const minLot = settings["tgbot.min_lot_size"];
+  const perOrderRiskPct = orderCount > 0 ? totalRiskPct / orderCount : 0;
+
+  // Sanity checks for the user before we even attempt to size.
+  const slWrongSide =
+    (side === "BUY"  && stopLoss >= Math.min(...entries)) ||
+    (side === "SELL" && stopLoss <= Math.max(...entries));
+
+  // Honest lot sizing — see formula in the file-top comment.
+  // Returns { lot, explanation, warning } per leg. The warning, if set,
+  // is shown PROMINENTLY and the place button stays disabled.
+  type LotResult = { lot: number; explanation: string; warning: string | null };
+  function sizeLeg(entry: number): LotResult {
+    if (!account) {
+      return { lot: minLot, explanation: "", warning: "Pick an account." };
+    }
+    if (account.fx_warning) {
+      return { lot: minLot, explanation: "", warning: account.fx_warning };
+    }
+    if (!account.info_fetched) {
+      return {
+        lot: minLot, explanation: "",
+        warning: `Couldn't fetch balance from ${account.broker_name}. ` +
+                 `Lot disabled — set manually or retry.`,
+      };
+    }
+    if (account.balance_usd == null) {
+      return {
+        lot: minLot, explanation: "",
+        warning: `Account balance unavailable. Lot defaulted to min lot — ` +
+                 `verify before placing.`,
+      };
+    }
+    if (orderCount === 0) {
+      return { lot: minLot, explanation: "", warning: "No legs selected." };
+    }
+    const slDist = Math.abs(entry - stopLoss);
+    if (slDist <= 0) {
+      return {
+        lot: minLot, explanation: "",
+        warning: `SL distance is zero or invalid for entry ${entry}.`,
+      };
+    }
+    const riskUsdPerLeg =
+      (account.balance_usd * totalRiskPct / 100) / orderCount;
+    const rawLot = riskUsdPerLeg / (slDist * CAPITAL_XAU_CONTRACT_OZ);
+    // Round DOWN to lot_step — overshooting risk by even one step compounds.
+    const step = settings["tgbot.lot_step"] || 0.01;
+    const stepped = Math.max(minLot, Math.floor(rawLot / step) * step);
+    return {
+      lot: Number(stepped.toFixed(2)),
+      explanation:
+        `${account.balance_usd.toFixed(0)} USD × ${totalRiskPct}% ÷ ${orderCount} ` +
+        `÷ (${slDist.toFixed(2)} × ${CAPITAL_XAU_CONTRACT_OZ}) = ${rawLot.toFixed(4)}`,
+      warning: null,
+    };
+  }
+
+  const legsWithLot = activeLegs.map(l => ({
+    ...l,
+    orderType,
+    limitPrice: orderType === "MARKET" ? null : l.entry,
+    sizing: sizeLeg(l.entry),
+  }));
+
+  // First non-null warning across legs (they usually share the same one).
+  const lotWarning = legsWithLot.find(l => l.sizing.warning)?.sizing.warning ?? null;
+  const lotsValid = legsWithLot.length > 0 && legsWithLot.every(l => !l.sizing.warning && l.sizing.lot > 0);
+
+  // ---- Place state machine ---------------------------------------------
   const [stage, setStage] = useState<"edit" | "confirm" | "placing" | "done">("edit");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<any>(null);
@@ -181,10 +262,11 @@ function TradeForm({
   const canSubmit = !!(
     account &&
     brokerSymbol.trim() &&
-    legs.length > 0 &&
+    legsWithLot.length > 0 &&
     !slWrongSide &&
     totalRiskPct > 0 &&
-    totalRiskPct <= settings["tgbot.max_risk_pct_per_trade"]
+    totalRiskPct <= settings["tgbot.max_risk_pct_per_trade"] &&
+    lotsValid
   );
 
   async function place() {
@@ -195,11 +277,11 @@ function TradeForm({
         account_id:     account.account_id,
         total_risk_pct: totalRiskPct,
         notes: `From signal #${signalId} (${signal.channel_title || signal.channel_id})`,
-        legs: legs.map(l => ({
+        legs: legsWithLot.map(l => ({
           broker_symbol: brokerSymbol.trim(),
           side,
           order_type:    l.orderType,
-          quantity:      l.quantity,
+          quantity:      l.sizing.lot,
           limit_price:   l.limitPrice,
           stop_loss:     stopLoss,
           take_profit:   l.tp,
@@ -285,47 +367,79 @@ function TradeForm({
 
       {accounts.length > 0 && (
         <>
-          {/* Fanout banner — front and centre so user sees the order count */}
+          {/* Fanout banner */}
           <div className="border border-brand/30 bg-brand/5 rounded p-3 text-sm">
-            <div className="flex items-center gap-2">
-              <TrendingUp className="size-4 text-brand" />
-              <span className="font-medium">{orderCount} orders</span>
-              <span className="text-ink-muted text-xs">
-                {entries.length === 1
-                  ? `${tps.length} TPs × 1 entry`
-                  : `${tps.length} TPs × 2 entries`}
-              </span>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <TrendingUp className="size-4 text-brand" />
+                <span className="font-medium">{orderCount} orders</span>
+                {orderCount !== fullLegs.length && (
+                  <span className="text-[11px] text-ink-muted">
+                    ({fullLegs.length - orderCount} removed)
+                  </span>
+                )}
+              </div>
+              {removedLegIds.size > 0 && (
+                <button onClick={resetLegs}
+                        className="text-[11px] text-brand hover:underline">
+                  Restore all
+                </button>
+              )}
             </div>
-            <div className="text-[11px] text-ink-muted mt-1">
-              Total {totalRiskPct.toFixed(2)}% risk → split evenly
-              ({perOrderRiskPct.toFixed(3)}% per order)
-            </div>
+            {orderCount > 0 && (
+              <div className="text-[11px] text-ink-muted mt-1">
+                Total {totalRiskPct.toFixed(2)}% risk → split evenly
+                ({perOrderRiskPct.toFixed(3)}% per order)
+              </div>
+            )}
           </div>
 
-          {/* Account selector */}
           <Field label="Account">
             <select className="input w-full"
                     value={accountId ?? ""}
                     onChange={e => setAccountId(Number(e.target.value))}>
-              {accounts.map(a => (
-                <option key={a.account_id} value={a.account_id}>
-                  {a.broker_name} · {a.account_label}
-                  {a.currency ? ` (${a.currency})` : ""}
-                </option>
-              ))}
+              {accounts.map(a => {
+                const bal = a.balance_usd != null
+                  ? ` · ${Math.round(a.balance_usd).toLocaleString()} USD`
+                  : a.balance != null
+                    ? ` · ${Math.round(a.balance).toLocaleString()} ${a.currency}`
+                    : "";
+                return (
+                  <option key={a.account_id} value={a.account_id}>
+                    {a.broker_name} · {a.account_label}{bal}
+                  </option>
+                );
+              })}
             </select>
+            {account && (
+              <div className="mt-1 text-[11px] text-ink-dim">
+                {account.balance != null && account.currency && (
+                  <>
+                    Balance:{" "}
+                    <span className="font-mono">
+                      {account.balance.toLocaleString()} {account.currency}
+                    </span>
+                    {account.balance_usd != null && account.currency !== "USD" && (
+                      <> ≈ <span className="font-mono">
+                        {account.balance_usd.toFixed(2)} USD
+                      </span>{" "}
+                      (fx {account.fx_rate?.toFixed(4)})</>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
           </Field>
 
           <Field label="Broker symbol"
-                 help="The symbol as the broker knows it (e.g. GOLD vs XAUUSD). Override if needed.">
+                 help="The symbol as the broker knows it (Capital.com XAU is usually 'GOLD').">
             <input type="text" className="input w-full font-mono"
                    value={brokerSymbol}
                    onChange={e => setBrokerSymbol(e.target.value)} />
           </Field>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Field label="Order type"
-                   help="Applied to every order in the fanout.">
+            <Field label="Order type" help="Applied to every order in the fanout.">
               <div className="flex gap-1">
                 {(["MARKET", "LIMIT", "STOP"] as const).map(t => (
                   <button key={t}
@@ -342,7 +456,8 @@ function TradeForm({
             </Field>
 
             <Field label="Total risk %"
-                   help={`Across all ${orderCount} orders. Max ${settings["tgbot.max_risk_pct_per_trade"]}%.`}>
+                   help={`Across ${orderCount || "all"} order${orderCount === 1 ? "" : "s"}. ` +
+                         `Max ${settings["tgbot.max_risk_pct_per_trade"]}%.`}>
               <input type="number" step="0.1"
                      min={0.01}
                      max={settings["tgbot.max_risk_pct_per_trade"]}
@@ -364,10 +479,10 @@ function TradeForm({
                    onChange={e => setStopLoss(Number(e.target.value))} />
           </Field>
 
-          {/* Fanout preview table */}
+          {/* Fanout preview — with × button per leg */}
           <div>
             <div className="text-xs text-ink-muted mb-1">
-              Preview ({orderCount} orders)
+              Preview ({orderCount} orders) — click × to skip a leg
             </div>
             <div className="border border-border rounded overflow-hidden">
               <table className="w-full text-xs">
@@ -379,36 +494,57 @@ function TradeForm({
                     <th className="text-right px-2 py-1.5">SL</th>
                     <th className="text-right px-2 py-1.5">Lot</th>
                     <th className="text-right px-2 py-1.5">Risk</th>
+                    <th className="px-2 py-1.5"></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {legs.map((l, i) => (
-                    <tr key={i} className="border-t border-border">
-                      <td className="px-2 py-1.5 text-ink-muted">{i + 1}</td>
-                      <td className="px-2 py-1.5 text-right font-mono">{fmt(l.entry)}</td>
-                      <td className="px-2 py-1.5 text-right font-mono text-emerald-400">
-                        {l.tpLevel}: {fmt(l.tp)}
-                      </td>
-                      <td className="px-2 py-1.5 text-right font-mono text-rose-400">
-                        {fmt(stopLoss)}
-                      </td>
-                      <td className="px-2 py-1.5 text-right font-mono">
-                        {l.quantity.toFixed(2)}
-                      </td>
-                      <td className="px-2 py-1.5 text-right font-mono text-ink-muted">
-                        {perOrderRiskPct.toFixed(3)}%
-                      </td>
-                    </tr>
-                  ))}
+                  {fullLegs.map((l, i) => {
+                    const removed = removedLegIds.has(l.id);
+                    const sizing = removed ? null : sizeLeg(l.entry);
+                    return (
+                      <tr key={l.id}
+                          className={`border-t border-border ${
+                            removed ? "opacity-40 line-through" : ""
+                          }`}>
+                        <td className="px-2 py-1.5 text-ink-muted">{i + 1}</td>
+                        <td className="px-2 py-1.5 text-right font-mono">{fmt(l.entry)}</td>
+                        <td className="px-2 py-1.5 text-right font-mono text-emerald-400">
+                          {l.tpLevel}: {fmt(l.tp)}
+                        </td>
+                        <td className="px-2 py-1.5 text-right font-mono text-rose-400">
+                          {fmt(stopLoss)}
+                        </td>
+                        <td className="px-2 py-1.5 text-right font-mono">
+                          {sizing ? sizing.lot.toFixed(2) : "—"}
+                        </td>
+                        <td className="px-2 py-1.5 text-right font-mono text-ink-muted">
+                          {removed ? "—" : `${perOrderRiskPct.toFixed(3)}%`}
+                        </td>
+                        <td className="px-2 py-1.5 text-right">
+                          <button onClick={() => toggleLeg(l.id)}
+                                  title={removed ? "Restore" : "Remove from fanout"}
+                                  className="text-ink-muted hover:text-rose-500 p-0.5">
+                            {removed ? <RotateCcw className="size-3" /> : <X className="size-3" />}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
-            <div className="text-[11px] text-ink-dim mt-1 flex items-start gap-1">
-              <Calculator className="size-3 mt-0.5 shrink-0" />
-              Per-leg lot is a placeholder — risk-based sizing needs broker
-              balance which isn't wired in this milestone. The server splits
-              total risk evenly across orders.
-            </div>
+            {lotWarning && (
+              <div className="text-[11px] text-amber-500 mt-1 flex items-start gap-1">
+                <AlertCircle className="size-3 mt-0.5 shrink-0" />
+                {lotWarning}
+              </div>
+            )}
+            {!lotWarning && lotsValid && legsWithLot[0] && (
+              <div className="text-[11px] text-ink-dim mt-1 flex items-start gap-1">
+                <Calculator className="size-3 mt-0.5 shrink-0" />
+                Per-leg formula: {legsWithLot[0].sizing.explanation}
+              </div>
+            )}
           </div>
 
           {error && (
@@ -441,6 +577,7 @@ function TradeForm({
                 onClick={() => setStage("confirm")}
                 disabled={!canSubmit}
                 className="btn-primary text-xs flex-1"
+                title={!canSubmit ? "Fix warnings above before placing" : ""}
               >
                 Review →
               </button>
@@ -471,8 +608,6 @@ function TradeForm({
 }
 
 
-
-// ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
 function SignalSummary({ signal }: { signal: TgSignalRow }) {
