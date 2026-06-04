@@ -159,7 +159,7 @@ function SignalGroup({ group, onAction }: {
   }
 
   return (
-    <section className="card overflow-hidden">
+    <section className="card overflow-hidden flex flex-col min-h-[calc(100vh-200px)]">
       <header className="flex items-center justify-between p-3 border-b border-border bg-bg-subtle/40">
         <div>
           <div className="text-sm font-medium">{group.label}</div>
@@ -187,7 +187,7 @@ function SignalGroup({ group, onAction }: {
         </div>
       )}
 
-      <div className="overflow-x-auto overflow-y-visible">
+      <div className="overflow-x-auto overflow-y-visible flex-1">
 		<table className="w-full text-sm">
           <thead className="text-xs text-ink-muted bg-bg-subtle">
             <tr>
@@ -293,7 +293,7 @@ function PositionRow({ p, onAction }: {
           Actions
         </button>
         {menuOpen && (
-		  <div className="absolute right-3 bottom-9 z-30 bg-bg-card border border-border rounded shadow-lg text-xs min-w-[180px]">
+		  <div className="absolute right-3 top-9 z-30 bg-bg-card border border-border rounded shadow-lg text-xs min-w-[180px]">
             <button onClick={moveToEntry} disabled={busy}
                     className="w-full text-left px-3 py-2 hover:bg-bg-subtle flex items-center gap-2">
               <Target className="size-3.5" /> Move SL to entry
