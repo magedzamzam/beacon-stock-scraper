@@ -204,6 +204,35 @@ async def test_connection(account_id: int):
         await adapter.aclose()
 
 
+@app.get("/accounts/{account_id}/stream_session")
+async def stream_session(account_id: int):
+    """Hand the price_stream service the WebSocket session tokens.
+
+    The gateway is the only service allowed to decrypt broker credentials, so
+    streaming auth is brokered here: we ensure a live Capital.com session and
+    return its CST / security token (the same ones the WebSocket needs) plus
+    whether this is a demo account. Tokens are valid for ~10 idle minutes.
+    """
+    _, broker, adapter = _build_adapter(account_id)
+    try:
+        await adapter._ensure_session()  # populates _cst / _sec_token
+        cst = getattr(adapter, "_cst", None)
+        sec = getattr(adapter, "_sec_token", None)
+        if not cst or not sec:
+            raise HTTPException(502, "Broker did not return streaming session tokens")
+        _record_connect_status(account_id, ok=True, message=None)
+        return {
+            "cst": cst,
+            "security_token": sec,
+            "is_demo": bool(adapter.credentials.get("is_demo")),
+        }
+    except BrokerError as exc:
+        _record_connect_status(account_id, ok=False, message=str(exc))
+        raise HTTPException(_broker_error_to_status(exc), str(exc))
+    finally:
+        await adapter.aclose()
+
+
 @app.get("/accounts/{account_id}/info")
 async def account_info(account_id: int):
     _, _, adapter = _build_adapter(account_id)

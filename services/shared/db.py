@@ -862,6 +862,45 @@ class BotTrade(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+# =============================================================================
+# Intraday streaming — Capital.com WebSocket (migration 019)
+# =============================================================================
+class IntradayBar(Base):
+    """Streamed OHLC candle per (symbol, resolution, price_type, bar_ts).
+
+    `symbol` is a Capital.com epic (e.g. 'GOLD') — NOT a FK to stocks, since
+    streamed instruments (gold/FX/indices) aren't in the MENA screener. The
+    forming bar is upserted on every ws event; it becomes "closed" once a
+    newer bar_ts arrives.
+    """
+    __tablename__ = "intraday_bar"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    resolution: Mapped[str] = mapped_column(String(16), nullable=False)
+    price_type: Mapped[str] = mapped_column(String(8), nullable=False, default="bid")
+    bar_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    open_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    high_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    low_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    close_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    volume: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("symbol", "resolution", "price_type", "bar_ts",
+                                       name="uq_intraday_bar"),)
+
+
+class StreamQuote(Base):
+    """Latest bid/offer tick per streamed symbol (live display)."""
+    __tablename__ = "stream_quote"
+    symbol: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    offer: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6))
+    bid_qty: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    ofr_qty: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    quote_ts: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
 # ---------- Engine factory ----------
 _settings = get_settings()
 _engine = create_engine(_settings.database_url_sync, pool_pre_ping=True, pool_size=10)

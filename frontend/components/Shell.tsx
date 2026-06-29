@@ -3,7 +3,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import {
-  LayoutDashboard, Search, Briefcase, Star, Shield, LogOut, User as UserIcon, Bot,
+  LayoutDashboard, Search, Briefcase, Star, Shield, LogOut, User as UserIcon, Bot, Radar,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-store";
 import { cn } from "@/lib/utils";
@@ -69,6 +69,9 @@ export default function Shell({ children }: { children: React.ReactNode }) {
               </Link>
             );
           })}
+          <Link href="/signals" className={cn("nav-link", pathname?.startsWith("/signals") && "nav-link-active")}>
+            <Radar className="size-4" /> Signals
+          </Link>
           {user.is_admin && (
             <Link href="/admin" className={cn("nav-link", pathname?.startsWith("/admin") && "nav-link-active")}>
               <Shield className="size-4" /> Admin

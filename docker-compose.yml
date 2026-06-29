@@ -128,6 +128,23 @@ services:
       <<: *python-env
     networks: [beacon-net]
 
+  price_stream:
+    build:
+      context: .
+      dockerfile: services/price_stream/Dockerfile
+    image: beacon-price-stream:latest
+    restart: unless-stopped
+    # Streams from Capital.com's WebSocket (external) — keep the dns override.
+    dns: [1.1.1.1, 8.8.8.8]
+    environment:
+      <<: *python-env
+      BROKER_GATEWAY_URL: http://broker_gateway:8004
+      STREAM_ACCOUNT_ID: ${STREAM_ACCOUNT_ID}
+      STREAM_EPICS: ${STREAM_EPICS:-GOLD}
+      STREAM_RESOLUTION: ${STREAM_RESOLUTION:-MINUTE_5}
+    networks: [beacon-net]
+    depends_on: [broker_gateway]
+
   sentiment:
     build:
       context: .

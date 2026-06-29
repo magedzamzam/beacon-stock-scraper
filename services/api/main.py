@@ -22,6 +22,7 @@ from .routers_ai import router as ai_router
 from .routers_alerts import alerts_router
 from .routers_trading_bot import trading_bot_router
 from .routers_broker_quotes import broker_quotes_router
+from .routers_signals import signals_router
 
 log = configure_logging("api")
 settings = get_settings()
@@ -59,5 +60,6 @@ app.include_router(stats_router)
 app.include_router(settings_router)
 app.include_router(ai_router)
 app.include_router(alerts_router)
+app.include_router(signals_router)
 app.include_router(trading_bot_router)
 app.include_router(admin_router)

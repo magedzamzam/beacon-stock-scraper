@@ -282,8 +282,88 @@ export interface AIProviderUpsert {
   base_url?: string | null;
 }
 
+// ---------------- Move-signal (volatility monitor) ----------------
+export interface MoveSignalParams {
+  target_mode?: "absolute" | "atr" | "percent";
+  target_value?: number;
+  atr_period?: number;
+  lookback?: number;
+  fire_threshold?: number;
+  exchange?: string;
+  min_price?: number;
+  only_fired?: boolean;
+  limit?: number;
+}
+export interface MoveSignalRow {
+  stock_id: number;
+  ticker: string;
+  company_name: string;
+  exchange_code: string;
+  currency: string | null;
+  last_close: number;
+  fired: boolean;
+  score: number;
+  target_abs: number;
+  atr: number;
+  p_base: number;
+  range_expansion: number;
+  vol_surge: number;
+  rsi: number | null;
+  reason: string;
+}
+export interface MoveSignalScan {
+  config: Record<string, unknown>;
+  scanned: number;
+  count: number;
+  signals: MoveSignalRow[];
+}
+export interface MoveSignalConfigResp {
+  defaults: Record<string, unknown>;
+  schema: {
+    name: string; type: string; label: string; required?: boolean;
+    default?: unknown; options?: string[]; min?: number; max?: number; step?: number;
+  }[];
+}
+
+export interface LiveMoveSignal {
+  symbol: string;
+  resolution: string;
+  price_type: string;
+  config: Record<string, unknown>;
+  bars_used: number;
+  last_closed_bar_ts: string | null;
+  forming_bar_ts: string | null;
+  quote: { bid: number | null; offer: number | null; quote_ts: string | null; received_at: string | null } | null;
+  signal: {
+    fired: boolean; score: number; target_abs: number; atr: number; p_base: number;
+    range_expansion: number; vol_surge: number; rsi: number | null; reason: string;
+    insufficient_data: boolean;
+  };
+}
+
 // ---------------- Endpoints ----------------
 export const api = {
+  // signals — configurable "next bar may move >= $X" monitor
+  getMoveSignalConfig: () => request<MoveSignalConfigResp>("/signals/move/config"),
+  scanMoveSignals: (p: MoveSignalParams = {}) => {
+    const q = new URLSearchParams();
+    Object.entries(p).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
+    });
+    const qs = q.toString();
+    return request<MoveSignalScan>(`/signals/move${qs ? `?${qs}` : ""}`);
+  },
+  getLiveMoveSignal: (p: MoveSignalParams & { symbol?: string; resolution?: string; price_type?: string } = {}) => {
+    const q = new URLSearchParams();
+    Object.entries(p).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "" && k !== "exchange" && k !== "min_price" && k !== "only_fired" && k !== "limit")
+        q.set(k, String(v));
+    });
+    const qs = q.toString();
+    return request<LiveMoveSignal>(`/signals/move/live${qs ? `?${qs}` : ""}`);
+  },
+
+
   // auth
   register: (email: string, password: string, display_name?: string) =>
     request<AuthResponse>("/auth/register", { method: "POST", body: JSON.stringify({ email, password, display_name }) }, false),
